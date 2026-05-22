@@ -2,6 +2,12 @@
 name: RepoPrompt Deep Plan
 description: Use RepoPrompt builder/export to create a grounded implementation plan before broad code changes.
 tags: [repoprompt, plan, codex, context]
+task_type: implementation
+capabilities: [context-building, planning, handoff]
+required_tools: [RepoPrompt]
+preferred_backend: repoprompt
+autonomous_safe: true
+blast_radius: medium
 ---
 
 # RepoPrompt Deep Plan

@@ -21,7 +21,7 @@ The first version intentionally keeps the kernel small:
 - first real LLM call path through OpenAI Responses
 - multi-turn LLM planner loop for choosing local tools
 - Codex app-server as the preferred execution backend
-- RepoPrompt skill routing for Codex delegate tasks
+- RepoPrompt skill routing for Codex delegate tasks, with searchable execution metadata
 
 The workspace is split so future features can grow without reshaping the core:
 
@@ -69,14 +69,18 @@ seed skill search repoprompt
 seed rp status
 seed rp tools
 seed rp windows
+seed rp bind --create-if-missing
 seed rp call file_search --args '{"pattern":"TODO","max_results":5}'
 seed tool repoprompt-tools
 seed tool repoprompt-call bind_context --args '{"op":"list"}'
 seed plan create --title "Demo" --task "Implement demo" --step "Inspect context" --step "Run tests"
 seed plan next
 seed plan complete --item 1 --note "context inspected"
+seed plan record-artifact --kind context-export --path prompt-exports/context.md --note "RepoPrompt selected context"
+seed plan record-handoff --backend repoprompt --role engineer --run-id agent-run-123 --artifact-path prompt-exports/context.md --status completed --summary "implemented the selected step"
 seed plan verify --dry-run
 seed tool plan-create --title "Tool Demo" --task "Planner-visible plan" --step "Do one thing"
+seed tool plan-record-artifact --kind verification-report --path reports/verify.md --note "independent verifier output"
 ```
 
 `run --llm` defaults to the local Codex app-server planner, so it uses your existing Codex login
@@ -123,6 +127,16 @@ are complete, `plan_verify` writes `verify_context.json` and can launch an indep
 `agent_run` verifier with the `pair` Codex role by default. `VERDICT: PASS` marks the plan
 verified; `VERDICT: FAIL` appends a `[FIX]` item and keeps the plan from finishing.
 
+Each plan also carries an orchestration ledger for RepoPrompt-led execution. `plan_record_artifact`
+records selected context exports, RepoPrompt exports, verification contexts, and verifier reports.
+`plan_record_handoff` records who executed a step, which backend or role ran it, any run/thread id,
+the artifact used, and the outcome summary. This keeps Seed as the durable state machine while
+RepoPrompt does the context building, handoff, review, and verification work.
+Planner prompts and `plan_next` now treat this as protocol, not optional bookkeeping: RepoPrompt
+exports should be followed by `plan_record_artifact`, and RepoPrompt `agent_run` or Codex delegated
+work should be followed by `plan_record_handoff`. `plan_verify` records its RepoPrompt verifier
+handoff automatically.
+
 `codex` and `run --codex` use the local `codex app-server` transport and your existing Codex
 login/config. Passing `--model` is optional; when omitted, Codex chooses from local config. By
 default the delegate starts Codex with plugins disabled and only `RepoPrompt` allowed. Use
@@ -136,7 +150,10 @@ to a local RepoPrompt SOP skill and injects that skill body into the delegated p
 implementation prompts route to `skills/repoprompt-deep-plan/SKILL.md`; review prompts route to
 `skills/repoprompt-review/SKILL.md`; investigation prompts route to
 `skills/repoprompt-investigate/SKILL.md`. This makes RepoPrompt usage explicit instead of relying
-on Codex to infer the right skill from MCP availability alone.
+on Codex to infer the right skill from MCP availability alone. Skill discovery also indexes
+frontmatter fields such as `task_type`, `capabilities`, `required_tools`, `preferred_backend`,
+`autonomous_safe`, and `blast_radius`, so planners can choose skills by execution fit rather than
+name alone.
 
 RepoPrompt is also available as a first-class SeedAgent backend. The `agent-repoprompt` crate wraps
 the RepoPrompt CLI and knows the full 18-tool MCP surface: exploration, context selection, oracle
@@ -144,4 +161,7 @@ conversations, editing, git, workspace routing, settings, and agent control. It 
 `REPOPROMPT_CLI` when set, otherwise `$HOME/RepoPrompt/repoprompt_cli` when present, otherwise
 `repoprompt_cli` from `PATH`. The local planner can call `repoprompt_tools` to inspect the surface,
 `repoprompt_exec` for RepoPrompt shorthand commands, and `repoprompt_call` for any specific
-RepoPrompt MCP tool with JSON args. The CLI mirrors this through `seed rp ...`.
+RepoPrompt MCP tool with JSON args. Workspace-scoped RepoPrompt calls default to the current cwd
+when no window, context id, or working directory is supplied; discovery calls such as window or
+workspace listing stay unbound. The CLI mirrors this through `seed rp ...`, and `seed rp bind`
+defaults to binding the current directory when no `--working-dir` is given.

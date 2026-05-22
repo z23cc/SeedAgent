@@ -589,7 +589,7 @@ pub fn planner_request_with_state_and_memory(
 Return only JSON, with no markdown.\n\
 Every JSON object must include summary: a short working-memory snapshot of new facts and current intent.\n\
 Use update_working_checkpoint for verified short-term context that should anchor later turns.\n\
-For multi-step implementation, create or follow a durable plan with plan_create/plan_next/plan_complete. When all non-verify plan items are complete, call plan_verify and do not finish until the independent verification gate returns PASS.\n\
+For multi-step implementation, create or follow a durable plan with plan_create/plan_next/plan_complete. When a plan uses RepoPrompt, keep its orchestration ledger current: after any RepoPrompt builder/context/oracle export, call plan_record_artifact with the exported path; after any RepoPrompt agent_run or Codex delegate executes plan work, call plan_record_handoff with backend, role/run/thread id when known, artifact_path when used, status, and summary. When all non-verify plan items are complete, call plan_verify and do not finish until the independent verification gate returns PASS.\n\
 Use start_long_term_update only when successful evidence should be distilled into durable memory; skip it for guesses or one-off facts.\n\
 When WORKING MEMORY contains <long_term_update>, you are in phase 2 settlement. Choose exactly one branch: update L2 global facts, update an existing L3 skill, or skip with a reason. Read/fetch the target before patching or writing. For L3, always memory_search first, memory_fetch the existing skill, then patch that existing SKILL.md; do not create duplicate skills.\n\
 After a phase 2 write or skip decision, call complete_long_term_update before finish so the settlement is auditable.\n\
@@ -912,6 +912,34 @@ mod tests {
         assert!(prompt.contains("### [L0 META RULES]"));
         assert!(prompt.contains("id=global-facts"));
         assert!(prompt.contains("Use memory_search before memory_fetch"));
+    }
+
+    #[test]
+    fn planner_request_requires_repoprompt_plan_ledger_updates() {
+        let state = AgentLoopState::new(4);
+        let prompt = planner_prompt_with_state(
+            "implement with RepoPrompt",
+            &[
+                ToolInfo {
+                    name: "repoprompt_call".to_string(),
+                    description: "call RepoPrompt".to_string(),
+                },
+                ToolInfo {
+                    name: "plan_record_artifact".to_string(),
+                    description: "record artifact".to_string(),
+                },
+                ToolInfo {
+                    name: "plan_record_handoff".to_string(),
+                    description: "record handoff".to_string(),
+                },
+            ],
+            &state,
+        );
+
+        assert!(prompt.contains("plan_record_artifact"));
+        assert!(prompt.contains("plan_record_handoff"));
+        assert!(prompt.contains("RepoPrompt agent_run"));
+        assert!(prompt.contains("orchestration ledger"));
     }
 
     #[test]

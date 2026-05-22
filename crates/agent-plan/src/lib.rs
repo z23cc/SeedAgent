@@ -25,10 +25,130 @@ pub struct PlanState {
     pub verify_context_path: PathBuf,
     pub repoprompt_export_path: Option<PathBuf>,
     pub source_export_path: Option<PathBuf>,
+    #[serde(default)]
+    pub orchestration: PlanOrchestration,
     pub verification_report: Option<String>,
     pub verify_attempts: usize,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanBackend {
+    Local,
+    RepoPrompt,
+    Codex,
+    Mixed,
+}
+
+impl Default for PlanBackend {
+    fn default() -> Self {
+        Self::RepoPrompt
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanArtifactKind {
+    RepoPromptExport,
+    ContextExport,
+    VerificationContext,
+    VerificationReport,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanArtifact {
+    pub kind: PlanArtifactKind,
+    pub path: PathBuf,
+    pub note: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanHandoff {
+    pub backend: String,
+    pub role: Option<String>,
+    pub run_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub artifact_path: Option<PathBuf>,
+    pub status: String,
+    pub summary: String,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanVerificationRecord {
+    pub attempt: usize,
+    pub verdict: String,
+    pub report: String,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanOrchestration {
+    pub preferred_backend: PlanBackend,
+    pub source_export_path: Option<PathBuf>,
+    pub repoprompt_export_path: Option<PathBuf>,
+    pub artifacts: Vec<PlanArtifact>,
+    pub handoffs: Vec<PlanHandoff>,
+    pub verification_records: Vec<PlanVerificationRecord>,
+}
+
+impl Default for PlanOrchestration {
+    fn default() -> Self {
+        Self {
+            preferred_backend: PlanBackend::RepoPrompt,
+            source_export_path: None,
+            repoprompt_export_path: None,
+            artifacts: Vec::new(),
+            handoffs: Vec::new(),
+            verification_records: Vec::new(),
+        }
+    }
+}
+
+impl PlanOrchestration {
+    fn from_exports(
+        source_export_path: Option<PathBuf>,
+        repoprompt_export_path: Option<PathBuf>,
+    ) -> Self {
+        let mut orchestration = Self {
+            source_export_path,
+            repoprompt_export_path: repoprompt_export_path.clone(),
+            ..Self::default()
+        };
+        if let Some(path) = repoprompt_export_path {
+            orchestration.record_artifact_once(
+                PlanArtifactKind::RepoPromptExport,
+                path,
+                Some("initial RepoPrompt export copied or referenced at plan creation".to_string()),
+            );
+        }
+        orchestration
+    }
+
+    fn record_artifact_once(
+        &mut self,
+        kind: PlanArtifactKind,
+        path: PathBuf,
+        note: Option<String>,
+    ) {
+        if self
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == kind && artifact.path == path)
+        {
+            return;
+        }
+        self.artifacts.push(PlanArtifact {
+            kind,
+            path,
+            note,
+            recorded_at: Utc::now(),
+        });
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +184,7 @@ pub struct VerificationContext {
     pub plan_file: PathBuf,
     pub state_file: PathBuf,
     pub repoprompt_export_path: Option<PathBuf>,
+    pub orchestration: PlanOrchestration,
     pub required_checks: Vec<String>,
     pub instructions: String,
 }
@@ -74,6 +195,24 @@ pub struct CreatePlan {
     pub task: String,
     pub steps: Vec<String>,
     pub source_export_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordPlanArtifact {
+    pub kind: PlanArtifactKind,
+    pub path: PathBuf,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordPlanHandoff {
+    pub backend: String,
+    pub role: Option<String>,
+    pub run_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub artifact_path: Option<PathBuf>,
+    pub status: String,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone)]
@@ -101,7 +240,12 @@ impl PlanStore {
         let plan_path = dir.join("plan.md");
         let state_path = dir.join("state.json");
         let verify_context_path = dir.join("verify_context.json");
-        let repoprompt_export_path = copy_export(&dir, input.source_export_path.as_deref())?;
+        let source_export_path = input.source_export_path;
+        let repoprompt_export_path = copy_export(&dir, source_export_path.as_deref())?;
+        let orchestration = PlanOrchestration::from_exports(
+            source_export_path.clone(),
+            repoprompt_export_path.clone(),
+        );
         let now = Utc::now();
         let state = PlanState {
             id,
@@ -112,7 +256,8 @@ impl PlanStore {
             state_path,
             verify_context_path,
             repoprompt_export_path,
-            source_export_path: input.source_export_path,
+            source_export_path,
+            orchestration,
             verification_report: None,
             verify_attempts: 0,
             created_at: now,
@@ -193,20 +338,62 @@ impl PlanStore {
         self.snapshot(Some(&state.id))
     }
 
+    pub fn record_artifact(
+        &self,
+        id: Option<&str>,
+        input: RecordPlanArtifact,
+    ) -> Result<PlanSnapshot> {
+        let mut snapshot = self.snapshot(id)?;
+        snapshot
+            .state
+            .orchestration
+            .record_artifact_once(input.kind, input.path, input.note);
+        snapshot.state.updated_at = Utc::now();
+        self.write_state(&snapshot.state)?;
+        self.snapshot(Some(&snapshot.state.id))
+    }
+
+    pub fn record_handoff(
+        &self,
+        id: Option<&str>,
+        input: RecordPlanHandoff,
+    ) -> Result<PlanSnapshot> {
+        let mut snapshot = self.snapshot(id)?;
+        snapshot.state.orchestration.handoffs.push(PlanHandoff {
+            backend: input.backend,
+            role: input.role,
+            run_id: input.run_id,
+            thread_id: input.thread_id,
+            artifact_path: input.artifact_path,
+            status: input.status,
+            summary: input.summary,
+            recorded_at: Utc::now(),
+        });
+        snapshot.state.updated_at = Utc::now();
+        self.write_state(&snapshot.state)?;
+        self.snapshot(Some(&snapshot.state.id))
+    }
+
     pub fn write_verify_context(&self, id: Option<&str>) -> Result<VerificationContext> {
-        let snapshot = self.snapshot(id)?;
+        let mut snapshot = self.snapshot(id)?;
         if snapshot.task_unchecked_count > 0 {
             bail!(
                 "plan still has {} unfinished non-verify item(s)",
                 snapshot.task_unchecked_count
             );
         }
+        snapshot.state.orchestration.record_artifact_once(
+            PlanArtifactKind::VerificationContext,
+            snapshot.state.verify_context_path.clone(),
+            Some("verification context emitted for independent verifier".to_string()),
+        );
         let context = VerificationContext {
             plan_id: snapshot.state.id.clone(),
             task: snapshot.state.task.clone(),
             plan_file: snapshot.state.plan_path.clone(),
             state_file: snapshot.state.state_path.clone(),
             repoprompt_export_path: snapshot.state.repoprompt_export_path.clone(),
+            orchestration: snapshot.state.orchestration.clone(),
             required_checks: vec![
                 "Read plan.md and verify every checked task against the repository.".to_string(),
                 "Run or inspect the narrow checks named by the plan when possible.".to_string(),
@@ -233,6 +420,23 @@ impl PlanStore {
         snapshot.state.verification_report = Some(report.clone());
         let verify_attempts = snapshot.state.verify_attempts;
         let verdict = verdict_from_report(&report);
+        let verdict_label = match verdict {
+            VerificationVerdict::Pass => "pass",
+            VerificationVerdict::Fail => "fail",
+            VerificationVerdict::Unknown => "unknown",
+        }
+        .to_string();
+        snapshot
+            .state
+            .orchestration
+            .verification_records
+            .push(PlanVerificationRecord {
+                attempt: verify_attempts,
+                verdict: verdict_label,
+                report: report.clone(),
+                recorded_at: Utc::now(),
+            });
+        let orchestration = snapshot.state.orchestration.clone();
         match verdict {
             VerificationVerdict::Pass => {
                 snapshot.state.status = PlanStatus::Verified;
@@ -251,6 +455,7 @@ impl PlanStore {
                     snapshot.state.verify_attempts = verify_attempts;
                     snapshot.state.verification_report = Some(report.clone());
                     snapshot.state.status = PlanStatus::Verified;
+                    snapshot.state.orchestration = orchestration.clone();
                 }
             }
             VerificationVerdict::Fail => {
@@ -261,6 +466,7 @@ impl PlanStore {
                 snapshot.state.status = PlanStatus::PendingVerification;
             }
         }
+        snapshot.state.orchestration = orchestration;
         snapshot.state.updated_at = Utc::now();
         self.write_state(&snapshot.state)?;
         self.snapshot(Some(&snapshot.state.id))
@@ -376,6 +582,12 @@ fn render_plan_markdown(state: &PlanState, steps: &[String]) -> String {
     if let Some(path) = &state.repoprompt_export_path {
         out.push_str("\n## RepoPrompt Export\n");
         out.push_str(&format!("- {}\n", path.display()));
+    }
+    out.push_str("\n## Orchestration Ledger\n");
+    out.push_str("- preferred_backend: repoprompt\n");
+    out.push_str("- executor: RepoPrompt performs context, planning, review, and verification work; Seed records artifacts, handoffs, and verdicts.\n");
+    if let Some(path) = &state.repoprompt_export_path {
+        out.push_str(&format!("- repoprompt_export: {}\n", path.display()));
     }
     out.push_str("\n## Notes\n");
     out
@@ -527,7 +739,93 @@ mod tests {
 
         assert_eq!(context.plan_id, snapshot.state.id);
         assert!(context.plan_file.is_file());
+        assert!(
+            context
+                .orchestration
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == PlanArtifactKind::VerificationContext)
+        );
         assert!(snapshot.state.verify_context_path.is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn records_repoprompt_artifacts_and_handoffs_in_plan_ledger() {
+        let root = temp_root();
+        let store = PlanStore::new(root.join("plans"));
+        let export_path = root.join("oracle-export.md");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&export_path, "# RepoPrompt Export\n").unwrap();
+        let snapshot = store
+            .create(CreatePlan {
+                title: "Ledger Demo".to_string(),
+                task: "Task".to_string(),
+                steps: vec!["Do work".to_string()],
+                source_export_path: Some(export_path.clone()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            snapshot.state.orchestration.preferred_backend,
+            PlanBackend::RepoPrompt
+        );
+        assert!(
+            snapshot
+                .state
+                .orchestration
+                .repoprompt_export_path
+                .is_some()
+        );
+        assert!(
+            snapshot
+                .state
+                .orchestration
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == PlanArtifactKind::RepoPromptExport)
+        );
+
+        let context_path = root.join("context-export.md");
+        fs::write(&context_path, "# Context\n").unwrap();
+        let snapshot = store
+            .record_artifact(
+                Some(&snapshot.state.id),
+                RecordPlanArtifact {
+                    kind: PlanArtifactKind::ContextExport,
+                    path: context_path.clone(),
+                    note: Some("selection for implementation".to_string()),
+                },
+            )
+            .unwrap();
+        let snapshot = store
+            .record_handoff(
+                Some(&snapshot.state.id),
+                RecordPlanHandoff {
+                    backend: "repoprompt".to_string(),
+                    role: Some("engineer".to_string()),
+                    run_id: Some("agent-run-1".to_string()),
+                    thread_id: None,
+                    artifact_path: Some(context_path),
+                    status: "completed".to_string(),
+                    summary: "implemented selected plan item".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            snapshot
+                .state
+                .orchestration
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == PlanArtifactKind::ContextExport)
+        );
+        assert_eq!(snapshot.state.orchestration.handoffs.len(), 1);
+        assert_eq!(
+            snapshot.state.orchestration.handoffs[0].run_id.as_deref(),
+            Some("agent-run-1")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -558,6 +856,11 @@ mod tests {
         assert_eq!(
             snapshot.state.verification_report.as_deref(),
             Some("VERDICT: PASS\nLooks good.")
+        );
+        assert_eq!(snapshot.state.orchestration.verification_records.len(), 1);
+        assert_eq!(
+            snapshot.state.orchestration.verification_records[0].verdict,
+            "pass"
         );
         assert!(snapshot.items.iter().all(|item| item.checked));
 

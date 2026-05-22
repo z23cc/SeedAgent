@@ -2,6 +2,12 @@
 name: RepoPrompt Investigate
 description: Use RepoPrompt to investigate repository structure, execution flow, and design boundaries with compact context.
 tags: [repoprompt, investigate, codex, context]
+task_type: investigation
+capabilities: [context-building, code-archaeology, synthesis]
+required_tools: [RepoPrompt]
+preferred_backend: repoprompt
+autonomous_safe: true
+blast_radius: low
 ---
 
 # RepoPrompt Investigate

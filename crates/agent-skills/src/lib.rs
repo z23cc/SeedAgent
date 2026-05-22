@@ -14,6 +14,18 @@ pub struct SkillInfo {
     pub description: String,
     pub tags: Vec<String>,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_backend: Option<String>,
+    #[serde(default = "default_autonomous_safe")]
+    pub autonomous_safe: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blast_radius: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,8 +279,7 @@ pub fn search_skill_infos(
     let mut scored = list_skill_infos(skills_dir)?
         .into_iter()
         .filter_map(|info| {
-            let haystack = format!("{} {} {}", info.name, info.description, info.tags.join(" "))
-                .to_ascii_lowercase();
+            let haystack = skill_search_haystack(&info).to_ascii_lowercase();
             let score = query_terms
                 .iter()
                 .filter(|term| haystack.contains(term.as_str()))
@@ -461,14 +472,42 @@ fn skill_info_from_body(skills_dir: &Path, path: PathBuf, body: &str) -> SkillIn
                 .map(ToString::to_string)
         })
         .unwrap_or_else(|| "No description recorded.".to_string());
+    let task_type =
+        front_matter.and_then(|front_matter| front_matter_value(front_matter, "task_type"));
+    let capabilities = front_matter
+        .map(|front_matter| front_matter_list(front_matter, "capabilities"))
+        .unwrap_or_default();
+    let required_tools = front_matter
+        .map(|front_matter| {
+            let mut tools = front_matter_list(front_matter, "required_tools");
+            tools.extend(front_matter_list(front_matter, "tools"));
+            dedupe_sorted(tools)
+        })
+        .unwrap_or_default();
+    let preferred_backend =
+        front_matter.and_then(|front_matter| front_matter_value(front_matter, "preferred_backend"));
+    let autonomous_safe = front_matter
+        .and_then(|front_matter| front_matter_bool(front_matter, "autonomous_safe"))
+        .unwrap_or_else(default_autonomous_safe);
+    let blast_radius =
+        front_matter.and_then(|front_matter| front_matter_value(front_matter, "blast_radius"));
     let mut tags = BTreeSet::new();
     if let Some(front_matter) = front_matter {
-        for tag in front_matter_tags(front_matter) {
+        for tag in front_matter_list(front_matter, "tags") {
             tags.insert(tag);
         }
     }
     for term in terms(&name) {
         tags.insert(term);
+    }
+    if let Some(task_type) = &task_type {
+        tags.insert(task_type.to_ascii_lowercase());
+    }
+    if let Some(preferred_backend) = &preferred_backend {
+        tags.insert(preferred_backend.to_ascii_lowercase());
+    }
+    for value in capabilities.iter().chain(required_tools.iter()) {
+        tags.insert(value.to_ascii_lowercase());
     }
     for tool in tools_used(content) {
         tags.insert(tool);
@@ -487,6 +526,12 @@ fn skill_info_from_body(skills_dir: &Path, path: PathBuf, body: &str) -> SkillIn
         description,
         tags: tags.into_iter().collect(),
         source,
+        task_type,
+        capabilities,
+        required_tools,
+        preferred_backend,
+        autonomous_safe,
+        blast_radius,
     }
 }
 
@@ -515,13 +560,14 @@ fn front_matter_value(front_matter: &str, key: &str) -> Option<String> {
     })
 }
 
-fn front_matter_tags(front_matter: &str) -> Vec<String> {
-    let mut tags = Vec::new();
-    let mut in_tags = false;
+fn front_matter_list(front_matter: &str, key: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut in_list = false;
+    let prefix = format!("{key}:");
     for line in front_matter.lines() {
         let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("tags:") {
-            in_tags = true;
+        if let Some(value) = trimmed.strip_prefix(&prefix) {
+            in_list = true;
             let value = value.trim();
             if value.starts_with('[') && value.ends_with(']') {
                 for tag in value
@@ -529,29 +575,66 @@ fn front_matter_tags(front_matter: &str) -> Vec<String> {
                     .trim_end_matches(']')
                     .split(',')
                 {
-                    push_tag(&mut tags, tag);
+                    push_metadata_value(&mut values, tag);
                 }
             } else if !value.is_empty() {
-                push_tag(&mut tags, value);
+                push_metadata_value(&mut values, value);
             }
             continue;
         }
-        if in_tags && trimmed.starts_with("- ") {
-            push_tag(&mut tags, trimmed.trim_start_matches("- "));
+        if in_list && trimmed.starts_with("- ") {
+            push_metadata_value(&mut values, trimmed.trim_start_matches("- "));
             continue;
         }
-        if in_tags && trimmed.contains(':') {
-            in_tags = false;
+        if in_list && trimmed.contains(':') {
+            in_list = false;
         }
     }
-    tags
+    dedupe_sorted(values)
 }
 
-fn push_tag(tags: &mut Vec<String>, value: &str) {
-    let tag = value.trim().trim_matches('"').trim_matches('\'');
-    if !tag.is_empty() {
-        tags.push(tag.to_string());
+fn front_matter_bool(front_matter: &str, key: &str) -> Option<bool> {
+    let value = front_matter_value(front_matter, key)?;
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" => Some(true),
+        "false" | "no" | "0" => Some(false),
+        _ => None,
     }
+}
+
+fn push_metadata_value(values: &mut Vec<String>, value: &str) {
+    let value = value.trim().trim_matches('"').trim_matches('\'');
+    if !value.is_empty() {
+        values.push(value.to_string());
+    }
+}
+
+fn dedupe_sorted(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn default_autonomous_safe() -> bool {
+    true
+}
+
+fn skill_search_haystack(info: &SkillInfo) -> String {
+    format!(
+        "{} {} {} {} {} {} {} {}",
+        info.name,
+        info.description,
+        info.tags.join(" "),
+        info.task_type.as_deref().unwrap_or_default(),
+        info.capabilities.join(" "),
+        info.required_tools.join(" "),
+        info.preferred_backend.as_deref().unwrap_or_default(),
+        info.blast_radius.as_deref().unwrap_or_default(),
+    )
 }
 
 fn contains_any(task: &str, lower: &str, needles: &[&str]) -> bool {
@@ -674,12 +757,7 @@ fn best_skill_match(
         .iter()
         .filter_map(|info| {
             let mut terms = BTreeSet::new();
-            for term in meaningful_terms(&format!(
-                "{} {} {}",
-                info.name,
-                info.description,
-                info.tags.join(" ")
-            )) {
+            for term in meaningful_terms(&skill_search_haystack(info)) {
                 terms.insert(term);
             }
             let overlap = run.key_terms.intersection(&terms).count();
@@ -873,7 +951,7 @@ mod tests {
         fs::create_dir_all(root.join("repoprompt-deep-plan")).unwrap();
         fs::write(
             root.join("repoprompt-deep-plan").join("SKILL.md"),
-            "---\nname: RepoPrompt Deep Plan\ndescription: Use RepoPrompt builder for grounded implementation plans.\ntags: [repoprompt, plan]\n---\n\n# RepoPrompt Deep Plan\n\nUse this skill for planning.\n",
+            "---\nname: RepoPrompt Deep Plan\ndescription: Use RepoPrompt builder for grounded implementation plans.\ntask_type: implementation\ncapabilities: [context-build, planning]\nrequired_tools:\n  - RepoPrompt\npreferred_backend: repoprompt\nautonomous_safe: true\nblast_radius: low\ntags: [repoprompt, plan]\n---\n\n# RepoPrompt Deep Plan\n\nUse this skill for planning.\n",
         )
         .unwrap();
 
@@ -886,6 +964,16 @@ mod tests {
         );
         assert!(infos[0].tags.contains(&"repoprompt".to_string()));
         assert!(infos[0].tags.contains(&"plan".to_string()));
+        assert_eq!(infos[0].task_type.as_deref(), Some("implementation"));
+        assert_eq!(infos[0].preferred_backend.as_deref(), Some("repoprompt"));
+        assert_eq!(infos[0].blast_radius.as_deref(), Some("low"));
+        assert!(infos[0].autonomous_safe);
+        assert!(infos[0].capabilities.contains(&"context-build".to_string()));
+        assert!(infos[0].required_tools.contains(&"RepoPrompt".to_string()));
+        assert!(infos[0].tags.contains(&"context-build".to_string()));
+        assert!(infos[0].tags.contains(&"implementation".to_string()));
+        let results = search_skill_infos(&root, "context-build repoprompt", 5).unwrap();
+        assert_eq!(results[0].name, "RepoPrompt Deep Plan");
         let _ = fs::remove_dir_all(&root);
     }
 

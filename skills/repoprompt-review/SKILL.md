@@ -2,6 +2,12 @@
 name: RepoPrompt Review
 description: Use RepoPrompt review/export to inspect a diff or code path for bugs, regressions, and missing tests.
 tags: [repoprompt, review, codex, context]
+task_type: review
+capabilities: [context-building, risk-analysis, verification]
+required_tools: [RepoPrompt]
+preferred_backend: repoprompt
+autonomous_safe: true
+blast_radius: low
 ---
 
 # RepoPrompt Review

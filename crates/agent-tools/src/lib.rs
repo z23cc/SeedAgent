@@ -1,7 +1,8 @@
 use agent_core::{Tool, ToolCall, ToolContext, ToolError, ToolRegistry, ToolResult};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -21,6 +22,8 @@ pub fn seed_registry() -> ToolRegistry {
     registry.register(PlanStatusTool);
     registry.register(PlanNextTool);
     registry.register(PlanCompleteTool);
+    registry.register(PlanRecordArtifactTool);
+    registry.register(PlanRecordHandoffTool);
     registry.register(PlanVerifyTool);
     registry.register(RepoPromptToolsTool);
     registry.register(RepoPromptExecTool);
@@ -270,7 +273,8 @@ impl Tool for PlanCreateTool {
             json!({
                 "status": "success",
                 "plan": snapshot,
-                "next_prompt": "PLAN_MODE: execute only the next unchecked item from plan_next. After each meaningful change, call plan_complete for the completed item. When only [VERIFY] remains, call plan_verify; do not finish until verification returns PASS.",
+                "ledger_summary": plan_ledger_summary(&snapshot),
+                "next_prompt": plan_mode_next_prompt(&snapshot),
             }),
         ))
     }
@@ -333,6 +337,8 @@ impl Tool for PlanNextTool {
                 "next_item": snapshot.next_item,
                 "unchecked_count": snapshot.unchecked_count,
                 "task_unchecked_count": snapshot.task_unchecked_count,
+                "ledger_summary": plan_ledger_summary(&snapshot),
+                "next_prompt": plan_mode_next_prompt(&snapshot),
             }),
         ))
     }
@@ -367,17 +373,115 @@ impl Tool for PlanCompleteTool {
         let snapshot = plan_store(ctx)
             .complete(args.id.as_deref(), args.item, args.note.as_deref())
             .map_err(|err| ToolError::Failed(err.to_string()))?;
-        let next_prompt = if snapshot.task_unchecked_count == 0 && snapshot.next_item.is_some() {
-            "PLAN_VERIFY_REQUIRED: all non-verify plan items are complete. Call plan_verify now; do not finish until the independent verification gate returns PASS."
-        } else {
-            "PLAN_MODE: call plan_next and continue with the next unchecked item. Do not skip verification."
-        };
         Ok(ToolResult::ok(
             call,
             json!({
                 "status": "success",
                 "plan": snapshot,
-                "next_prompt": next_prompt,
+                "ledger_summary": plan_ledger_summary(&snapshot),
+                "next_prompt": plan_mode_next_prompt(&snapshot),
+            }),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanRecordArtifactArgs {
+    id: Option<String>,
+    kind: agent_plan::PlanArtifactKind,
+    path: PathBuf,
+    note: Option<String>,
+}
+
+pub struct PlanRecordArtifactTool;
+
+impl Tool for PlanRecordArtifactTool {
+    fn name(&self) -> &'static str {
+        "plan_record_artifact"
+    }
+
+    fn description(&self) -> &'static str {
+        "Record a RepoPrompt/context/verification artifact path in the plan orchestration ledger."
+    }
+
+    fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        let args: PlanRecordArtifactArgs =
+            serde_json::from_value(call.args.clone()).map_err(|source| {
+                ToolError::InvalidArguments {
+                    tool: call.name.clone(),
+                    source,
+                }
+            })?;
+        let snapshot = plan_store(ctx)
+            .record_artifact(
+                args.id.as_deref(),
+                agent_plan::RecordPlanArtifact {
+                    kind: args.kind,
+                    path: absolutize(&ctx.cwd, args.path),
+                    note: args.note,
+                },
+            )
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        Ok(ToolResult::ok(
+            call,
+            json!({
+                "status": "success",
+                "plan": snapshot,
+            }),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanRecordHandoffArgs {
+    id: Option<String>,
+    backend: String,
+    role: Option<String>,
+    run_id: Option<String>,
+    thread_id: Option<String>,
+    artifact_path: Option<PathBuf>,
+    status: Option<String>,
+    summary: String,
+}
+
+pub struct PlanRecordHandoffTool;
+
+impl Tool for PlanRecordHandoffTool {
+    fn name(&self) -> &'static str {
+        "plan_record_handoff"
+    }
+
+    fn description(&self) -> &'static str {
+        "Record a RepoPrompt/Codex/local execution handoff, run id, artifact, status, and summary in the plan ledger."
+    }
+
+    fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        let args: PlanRecordHandoffArgs =
+            serde_json::from_value(call.args.clone()).map_err(|source| {
+                ToolError::InvalidArguments {
+                    tool: call.name.clone(),
+                    source,
+                }
+            })?;
+        let snapshot = plan_store(ctx)
+            .record_handoff(
+                args.id.as_deref(),
+                agent_plan::RecordPlanHandoff {
+                    backend: args.backend,
+                    role: args.role,
+                    run_id: args.run_id,
+                    thread_id: args.thread_id,
+                    artifact_path: args.artifact_path.map(|path| absolutize(&ctx.cwd, path)),
+                    status: args.status.unwrap_or_else(|| "recorded".to_string()),
+                    summary: args.summary,
+                },
+            )
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        Ok(ToolResult::ok(
+            call,
+            json!({
+                "status": "success",
+                "plan": snapshot,
             }),
         ))
     }
@@ -432,6 +536,7 @@ impl Tool for PlanVerifyTool {
         }
 
         let timeout_secs = args.timeout_secs.unwrap_or(300).max(1);
+        let model_id = args.model_id.unwrap_or_else(|| "pair".to_string());
         let message = format!(
             "Independent verification gate for SeedAgent plan `{}`.\n\
 Read the verify context JSON first: `{}`.\n\
@@ -454,20 +559,43 @@ Do not edit files during verification unless the user explicitly asked for a fix
             raw_json: Some(true),
             ..Default::default()
         };
-        let output = repoprompt_client(ctx, routing)
+        let output = repoprompt_client(ctx, routing, true)?
             .call_tool(
                 agent_repoprompt::RepoPromptTool::AgentRun,
                 &json!({
                     "op": "start",
-                    "model_id": args.model_id.unwrap_or_else(|| "pair".to_string()),
+                    "model_id": model_id.clone(),
                     "message": message,
                     "timeout": timeout_secs,
                 }),
             )
             .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let output_status = output.status().to_string();
+        let run_id = repoprompt_output_string(&output, &["run_id", "runId", "agent_run_id"]);
+        let thread_id =
+            repoprompt_output_string(&output, &["thread_id", "threadId", "chat_id", "chatId"]);
         let report = repoprompt_report_text(&output);
-        let snapshot = store
+        store
             .record_verification(Some(&verify_context.plan_id), &report)
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let verify_context_path = verify_context
+            .plan_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("verify_context.json");
+        let snapshot = store
+            .record_handoff(
+                Some(&verify_context.plan_id),
+                agent_plan::RecordPlanHandoff {
+                    backend: "repoprompt".to_string(),
+                    role: Some(model_id),
+                    run_id,
+                    thread_id,
+                    artifact_path: Some(verify_context_path),
+                    status: output_status,
+                    summary: compact_single_line(&report, 500),
+                },
+            )
             .map_err(|err| ToolError::Failed(err.to_string()))?;
         let next_prompt = match snapshot.state.status {
             agent_plan::PlanStatus::Verified => {
@@ -542,7 +670,7 @@ impl Tool for RepoPromptExecTool {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a RepoPrompt CLI command chain such as windows, tree, search, select, context, builder, plan, or review."
+        "Execute a RepoPrompt CLI command chain such as windows, tree, search, select, context, builder, plan, or review. Workspace commands default to the current cwd when no routing is supplied."
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -553,11 +681,18 @@ impl Tool for RepoPromptExecTool {
                     source,
                 }
             })?;
-        let client = repoprompt_client(ctx, args.routing);
+        let default_cwd = default_cwd_for_repoprompt_exec(&args.command);
+        let client = repoprompt_client(ctx, args.routing, default_cwd)?;
         let output = client
             .exec(&args.command)
             .map_err(|err| ToolError::Failed(err.to_string()))?;
-        Ok(ToolResult::ok(call, repoprompt_output_json(output)))
+        let mut content = repoprompt_output_json(output);
+        attach_repoprompt_protocol_hint(
+            &mut content,
+            repoprompt_ledger_prompt_for_exec(&args.command),
+            client.config(),
+        );
+        Ok(ToolResult::ok(call, content))
     }
 }
 
@@ -578,7 +713,7 @@ impl Tool for RepoPromptCallTool {
     }
 
     fn description(&self) -> &'static str {
-        "Call any wrapped RepoPrompt MCP tool by name with JSON args; use repoprompt_tools to inspect supported tools."
+        "Call any wrapped RepoPrompt MCP tool by name with JSON args; workspace tools default to the current cwd when no routing is supplied."
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -595,11 +730,17 @@ impl Tool for RepoPromptCallTool {
             .map_err(|err| ToolError::Failed(err.to_string()))?;
         let mut routing = args.routing;
         routing.raw_json = Some(routing.raw_json.unwrap_or(true));
-        let client = repoprompt_client(ctx, routing);
+        let client = repoprompt_client(ctx, routing, default_cwd_for_repoprompt_tool(tool))?;
         let output = client
             .call_tool(tool, &args.args)
             .map_err(|err| ToolError::Failed(err.to_string()))?;
-        Ok(ToolResult::ok(call, repoprompt_output_json(output)))
+        let mut content = repoprompt_output_json(output);
+        attach_repoprompt_protocol_hint(
+            &mut content,
+            repoprompt_ledger_prompt_for_tool(tool),
+            client.config(),
+        );
+        Ok(ToolResult::ok(call, content))
     }
 }
 
@@ -1220,12 +1361,86 @@ fn plan_store(ctx: &ToolContext) -> agent_plan::PlanStore {
     agent_plan::PlanStore::new(ctx.cwd.join("plans"))
 }
 
+const REPOPROMPT_LEDGER_PROMPT: &str = "REPOPROMPT_LEDGER: if RepoPrompt produces an export path, call plan_record_artifact before using it; if RepoPrompt agent_run or Codex performs plan work, call plan_record_handoff with backend, role/run/thread id when known, artifact_path, status, and summary.";
+
+fn plan_mode_next_prompt(snapshot: &agent_plan::PlanSnapshot) -> String {
+    let phase = if snapshot.task_unchecked_count == 0 && snapshot.next_item.is_some() {
+        "PLAN_VERIFY_REQUIRED: all non-verify plan items are complete. Call plan_verify now; do not finish until the independent verification gate returns PASS."
+    } else {
+        "PLAN_MODE: execute only the next unchecked item from plan_next. After each meaningful change, call plan_complete for the completed item. Do not skip verification."
+    };
+    format!("{phase} {REPOPROMPT_LEDGER_PROMPT}")
+}
+
+fn plan_ledger_summary(snapshot: &agent_plan::PlanSnapshot) -> Value {
+    let orchestration = &snapshot.state.orchestration;
+    json!({
+        "preferred_backend": orchestration.preferred_backend,
+        "artifact_count": orchestration.artifacts.len(),
+        "handoff_count": orchestration.handoffs.len(),
+        "verification_record_count": orchestration.verification_records.len(),
+        "has_repoprompt_export": orchestration.repoprompt_export_path.is_some()
+            || orchestration.artifacts.iter().any(|artifact| artifact.kind == agent_plan::PlanArtifactKind::RepoPromptExport),
+        "has_context_export": orchestration.artifacts.iter().any(|artifact| artifact.kind == agent_plan::PlanArtifactKind::ContextExport),
+        "latest_artifact": orchestration.artifacts.last(),
+        "latest_handoff": orchestration.handoffs.last(),
+        "latest_verification": orchestration.verification_records.last(),
+    })
+}
+
 fn absolutize(cwd: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
-        cwd.join(path)
+        absolute_base(cwd).join(path)
     }
+}
+
+fn absolute_base(cwd: &Path) -> PathBuf {
+    if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(cwd)
+    }
+}
+
+fn default_repoprompt_working_dirs(
+    ctx: &ToolContext,
+    working_dirs: Option<Vec<PathBuf>>,
+    default_cwd: bool,
+) -> Vec<PathBuf> {
+    let mut working_dirs = working_dirs.unwrap_or_default();
+    if working_dirs.is_empty() && default_cwd {
+        working_dirs.push(ctx.cwd.clone());
+    }
+    working_dirs
+        .into_iter()
+        .map(|path| absolutize(&ctx.cwd, path))
+        .collect()
+}
+
+fn default_cwd_for_repoprompt_exec(command: &str) -> bool {
+    let command = command.trim().to_ascii_lowercase();
+    !(command == "windows"
+        || command.starts_with("windows ")
+        || command == "workspace list"
+        || command.starts_with("workspace list ")
+        || command == "workspaces"
+        || command.starts_with("bind_context")
+        || command.starts_with("app_settings"))
+}
+
+fn default_cwd_for_repoprompt_tool(tool: agent_repoprompt::RepoPromptTool) -> bool {
+    !matches!(
+        tool,
+        agent_repoprompt::RepoPromptTool::BindContext
+            | agent_repoprompt::RepoPromptTool::ManageWorkspaces
+            | agent_repoprompt::RepoPromptTool::AppSettings
+            | agent_repoprompt::RepoPromptTool::OracleUtils
+            | agent_repoprompt::RepoPromptTool::AgentManage
+    )
 }
 
 fn repoprompt_report_text(output: &agent_repoprompt::RepoPromptOutput) -> String {
@@ -1239,9 +1454,28 @@ fn repoprompt_report_text(output: &agent_repoprompt::RepoPromptOutput) -> String
 }
 
 fn repoprompt_client(
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
     routing: RepoPromptRoutingArgs,
+    default_cwd: bool,
+) -> Result<agent_repoprompt::RepoPromptClient, ToolError> {
+    let mut cfg = repoprompt_config(ctx, routing, default_cwd);
+    resolve_repoprompt_window(&mut cfg)?;
+    Ok(agent_repoprompt::RepoPromptClient::new(cfg))
+}
+
+fn repoprompt_client_without_bind(
+    ctx: &ToolContext,
+    routing: RepoPromptRoutingArgs,
+    default_cwd: bool,
 ) -> agent_repoprompt::RepoPromptClient {
+    agent_repoprompt::RepoPromptClient::new(repoprompt_config(ctx, routing, default_cwd))
+}
+
+fn repoprompt_config(
+    ctx: &ToolContext,
+    routing: RepoPromptRoutingArgs,
+    default_cwd: bool,
+) -> agent_repoprompt::RepoPromptClientConfig {
     let mut cfg = agent_repoprompt::RepoPromptClientConfig::default();
     if let Some(cli_path) = routing.cli_path {
         cfg.cli_path = cli_path;
@@ -1252,9 +1486,50 @@ fn repoprompt_client(
     cfg.window_id = routing.window_id;
     cfg.tab = routing.tab;
     cfg.context_id = routing.context_id;
-    cfg.working_dirs = routing.working_dirs.unwrap_or_default();
+    cfg.working_dirs = default_repoprompt_working_dirs(ctx, routing.working_dirs, default_cwd);
     cfg.raw_json = routing.raw_json.unwrap_or(false);
-    agent_repoprompt::RepoPromptClient::new(cfg)
+    cfg
+}
+
+fn resolve_repoprompt_window(
+    cfg: &mut agent_repoprompt::RepoPromptClientConfig,
+) -> Result<(), ToolError> {
+    if cfg.window_id.is_some() || cfg.context_id.is_some() || cfg.working_dirs.is_empty() {
+        return Ok(());
+    }
+    let bind_cfg = agent_repoprompt::RepoPromptClientConfig {
+        cli_path: cfg.cli_path.clone(),
+        timeout_secs: cfg.timeout_secs,
+        raw_json: true,
+        ..Default::default()
+    };
+    let output = agent_repoprompt::RepoPromptClient::new(bind_cfg)
+        .call_tool(
+            agent_repoprompt::RepoPromptTool::BindContext,
+            &json!({
+                "op": "bind",
+                "working_dirs": cfg
+                    .working_dirs
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+                "create_if_missing": false,
+            }),
+        )
+        .map_err(|err| ToolError::Failed(format!("RepoPrompt bind failed: {err}")))?;
+    if output.timed_out || output.exit_code != Some(0) {
+        return Err(ToolError::Failed(format!(
+            "RepoPrompt bind failed before routed call: {}",
+            compact_single_line(&repoprompt_report_text(&output), 800)
+        )));
+    }
+    if let Some(window_id) = repoprompt_output_u32(&output, &["window_id", "windowID"]) {
+        cfg.window_id = Some(window_id);
+        return Ok(());
+    }
+    Err(ToolError::Failed(
+        "RepoPrompt bind succeeded but did not return a window_id".to_string(),
+    ))
 }
 
 fn repoprompt_output_json(output: agent_repoprompt::RepoPromptOutput) -> serde_json::Value {
@@ -1266,6 +1541,141 @@ fn repoprompt_output_json(output: agent_repoprompt::RepoPromptOutput) -> serde_j
         "stderr": truncate_middle(&output.stderr, 6_000),
         "json": output.json,
     })
+}
+
+fn repoprompt_ledger_prompt_for_exec(command: &str) -> &'static str {
+    let command = command.to_ascii_lowercase();
+    if command.contains("builder")
+        || command.contains("oracle")
+        || command.contains("--export")
+        || command.contains("workspace_context")
+        || command.contains("context")
+    {
+        "REPOPROMPT_OUTPUT: if stdout/json includes an export path and a plan is active, call plan_record_artifact with kind context_export or repo_prompt_export before continuing."
+    } else {
+        REPOPROMPT_LEDGER_PROMPT
+    }
+}
+
+fn repoprompt_ledger_prompt_for_tool(tool: agent_repoprompt::RepoPromptTool) -> &'static str {
+    match tool {
+        agent_repoprompt::RepoPromptTool::AgentRun => {
+            "REPOPROMPT_AGENT_RUN: if this agent_run executed or verified plan work, call plan_record_handoff with backend=repoprompt, role/model, run/thread id when known, artifact_path when used, status, and summary."
+        }
+        agent_repoprompt::RepoPromptTool::ContextBuilder
+        | agent_repoprompt::RepoPromptTool::OracleSend
+        | agent_repoprompt::RepoPromptTool::WorkspaceContext
+        | agent_repoprompt::RepoPromptTool::Prompt => {
+            "REPOPROMPT_EXPORT: if the output includes oracle_export_path, context export path, or prompt export path and a plan is active, call plan_record_artifact before using it as handoff evidence."
+        }
+        _ => REPOPROMPT_LEDGER_PROMPT,
+    }
+}
+
+fn attach_repoprompt_protocol_hint(
+    content: &mut Value,
+    next_prompt: &'static str,
+    cfg: &agent_repoprompt::RepoPromptClientConfig,
+) {
+    if let Value::Object(map) = content {
+        map.insert("next_prompt".to_string(), json!(next_prompt));
+        map.insert(
+            "routing".to_string(),
+            json!({
+                "window_id": cfg.window_id,
+                "tab": cfg.tab,
+                "context_id": cfg.context_id,
+                "working_dirs": &cfg.working_dirs,
+            }),
+        );
+    }
+}
+
+fn repoprompt_output_string(
+    output: &agent_repoprompt::RepoPromptOutput,
+    keys: &[&str],
+) -> Option<String> {
+    output
+        .json
+        .as_ref()
+        .and_then(|json| find_string_by_key(json, keys))
+}
+
+fn repoprompt_output_u32(
+    output: &agent_repoprompt::RepoPromptOutput,
+    keys: &[&str],
+) -> Option<u32> {
+    output
+        .json
+        .as_ref()
+        .and_then(|json| find_u32_by_key(json, keys))
+}
+
+fn find_string_by_key(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(value) = map.get(*key).and_then(value_to_non_empty_string) {
+                    return Some(value);
+                }
+            }
+            map.values()
+                .find_map(|value| find_string_by_key(value, keys))
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_string_by_key(value, keys)),
+        _ => None,
+    }
+}
+
+fn find_u32_by_key(value: &Value, keys: &[&str]) -> Option<u32> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(value) = map.get(*key).and_then(value_to_u32) {
+                    return Some(value);
+                }
+            }
+            map.values().find_map(|value| find_u32_by_key(value, keys))
+        }
+        Value::Array(values) => values.iter().find_map(|value| find_u32_by_key(value, keys)),
+        _ => None,
+    }
+}
+
+fn value_to_non_empty_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn value_to_u32(value: &Value) -> Option<u32> {
+    match value {
+        Value::Number(value) => value.as_u64().and_then(|value| u32::try_from(value).ok()),
+        Value::String(value) => value.parse::<u32>().ok(),
+        _ => None,
+    }
+}
+
+fn compact_single_line(input: &str, max_len: usize) -> String {
+    let text = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= max_len {
+        return text;
+    }
+    let keep = max_len / 2;
+    let head = text.chars().take(keep).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head} ...[omitted]... {tail}")
 }
 
 fn read_pipe(pipe: Option<impl Read>) -> String {
@@ -1307,6 +1717,8 @@ mod tests {
         assert!(names.contains(&"plan_status"));
         assert!(names.contains(&"plan_next"));
         assert!(names.contains(&"plan_complete"));
+        assert!(names.contains(&"plan_record_artifact"));
+        assert!(names.contains(&"plan_record_handoff"));
         assert!(names.contains(&"plan_verify"));
         assert!(names.contains(&"repoprompt_tools"));
         assert!(names.contains(&"repoprompt_exec"));
@@ -1328,6 +1740,55 @@ mod tests {
                 .iter()
                 .any(|tool| tool["name"] == "agent_run")
         );
+    }
+
+    #[test]
+    fn plan_next_returns_ledger_summary_and_protocol_prompt() {
+        let root = temp_root();
+        let ctx = temp_ctx(&root);
+        let create = ToolCall::new(
+            "plan_create",
+            json!({
+                "title": "Ledger Protocol",
+                "task": "Task",
+                "steps": ["Inspect context"]
+            }),
+        );
+        PlanCreateTool.execute(&ctx, &create).unwrap();
+        let next = ToolCall::new("plan_next", json!({}));
+        let result = PlanNextTool.execute(&ctx, &next).unwrap();
+
+        assert!(result.ok);
+        assert_eq!(result.content["ledger_summary"]["artifact_count"], json!(0));
+        assert!(
+            result.content["next_prompt"]
+                .as_str()
+                .unwrap()
+                .contains("REPOPROMPT_LEDGER")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repoprompt_routing_defaults_to_cwd_for_workspace_tools() {
+        let root = temp_root();
+        let ctx = temp_ctx(&root);
+        let client = repoprompt_client_without_bind(&ctx, RepoPromptRoutingArgs::default(), true);
+
+        assert_eq!(client.config().working_dirs, vec![root.clone()]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repoprompt_routing_skips_cwd_for_discovery_tools() {
+        assert!(!default_cwd_for_repoprompt_tool(
+            agent_repoprompt::RepoPromptTool::BindContext
+        ));
+        assert!(default_cwd_for_repoprompt_tool(
+            agent_repoprompt::RepoPromptTool::ContextBuilder
+        ));
+        assert!(!default_cwd_for_repoprompt_exec("workspace list"));
+        assert!(default_cwd_for_repoprompt_exec("search \"TODO\""));
     }
 
     #[test]
