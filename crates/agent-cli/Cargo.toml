@@ -1,0 +1,27 @@
+[package]
+name = "agent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "seed"
+path = "src/main.rs"
+
+[dependencies]
+agent-core.workspace = true
+agent-delegate.workspace = true
+agent-llm.workspace = true
+agent-memory.workspace = true
+agent-plan.workspace = true
+agent-repoprompt.workspace = true
+agent-runtime.workspace = true
+agent-session.workspace = true
+agent-skills.workspace = true
+agent-tools.workspace = true
+agent-tui.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true

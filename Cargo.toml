@@ -1,0 +1,46 @@
+[workspace]
+members = [
+  "crates/agent-cli",
+  "crates/agent-core",
+  "crates/agent-delegate",
+  "crates/agent-llm",
+  "crates/agent-memory",
+  "crates/agent-plan",
+  "crates/agent-repoprompt",
+  "crates/agent-runtime",
+  "crates/agent-session",
+  "crates/agent-skills",
+  "crates/agent-tools",
+  "crates/agent-tui",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["duange"]
+rust-version = "1.95"
+
+[workspace.dependencies]
+agent-core = { path = "crates/agent-core" }
+agent-delegate = { path = "crates/agent-delegate" }
+agent-llm = { path = "crates/agent-llm" }
+agent-memory = { path = "crates/agent-memory" }
+agent-plan = { path = "crates/agent-plan" }
+agent-repoprompt = { path = "crates/agent-repoprompt" }
+agent-runtime = { path = "crates/agent-runtime" }
+agent-session = { path = "crates/agent-session" }
+agent-skills = { path = "crates/agent-skills" }
+agent-tools = { path = "crates/agent-tools" }
+agent-tui = { path = "crates/agent-tui" }
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+toml = "0.8"
+uuid = { version = "1.8", features = ["v4", "serde"] }
+wait-timeout = "0.2"

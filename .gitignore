@@ -1,0 +1,16 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+
+# Runtime traces are useful locally but noisy in git.
+/sessions/*.jsonl
+
+# Generated memory/search artifacts can contain local paths and session summaries.
+/memory/index.json
+/memory/l1_insight.md
+/memory/session_archive.jsonl
+
+# Local smoke skills generated from one-off sessions.
+/skills/first-shell-smoke/
+/skills/find-a-shell-related-skill-fetch-it-then-summarize-it-in-one-sen/
