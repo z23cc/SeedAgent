@@ -74,12 +74,14 @@ seed rp call file_search --args '{"pattern":"TODO","max_results":5}'
 seed tool repoprompt-tools
 seed tool repoprompt-call bind_context --args '{"op":"list"}'
 seed plan create --title "Demo" --task "Implement demo" --step "Inspect context" --step "Run tests"
+seed plan list
 seed plan next
 seed plan complete --item 1 --note "context inspected"
 seed plan record-artifact --kind context-export --path prompt-exports/context.md --note "RepoPrompt selected context"
 seed plan record-handoff --backend repoprompt --role engineer --run-id agent-run-123 --artifact-path prompt-exports/context.md --status completed --summary "implemented the selected step"
 seed plan verify --dry-run
 seed tool plan-create --title "Tool Demo" --task "Planner-visible plan" --step "Do one thing"
+seed tool plan-list
 seed tool plan-record-artifact --kind verification-report --path reports/verify.md --note "independent verifier output"
 ```
 
@@ -88,6 +90,64 @@ instead of `OPENAI_API_KEY`. Pass `--provider openai` or another provider only w
 want the HTTP provider path. `llm ask` is still a raw provider smoke command and reads
 `OPENAI_API_KEY` for the built-in OpenAI provider. Compatible endpoints can use `OPENAI_BASE_URL`
 with the `openai_responses_compatible` provider.
+
+Set `--provider repoprompt_oracle` to route each planner turn through RepoPrompt's `ask_oracle`
+instead of Codex directly. The oracle inherits whatever workspace and selection RepoPrompt has
+curated, so prompts come pre-grounded and answers stay aware of the selection. Pass
+`--model chat|plan|edit|review` to pick the oracle mode (default `chat`). The run will refuse to
+start if the RepoPrompt CLI cannot be located; fall back to `--provider codex` for offline work.
+
+A RepoPrompt builder plan export (`builder ... --response-type plan --export`) imports straight
+into a durable seed plan, including auto-applied `[D]`/`[P]` step markers and an entry in the
+plan's RepoPrompt artifact ledger:
+
+```bash
+repoprompt_cli -e 'builder "create an implementation plan for: ..." --response-type plan --export'
+# -> writes plan-export.md
+
+seed plan import --path plan-export.md
+# or, from the planner: plan_create_from_repoprompt({"export_path": "plan-export.md"})
+```
+
+When you don't already have an export, `seed plan build` does the whole loop in one shot —
+RepoPrompt's discovery agent explores the codebase, drafts the plan, exports it, and seed
+imports the result:
+
+```bash
+seed plan build \
+    --task "split the auth middleware into JWT + session layers" \
+    --context "session storage must satisfy the new compliance spec in docs/auth-spec.md" \
+    --working-dir /Users/me/repo
+# planner equivalent: plan_create_via_repoprompt({"task":"...","context":"..."})
+```
+
+After a plan exists (built any way), `seed plan refine` asks RepoPrompt's oracle to review it
+and appends concrete improvements as numbered `[FIX]` items before the `[VERIFY]` gate. The
+reviewer chat_id is preserved so subsequent `--chat-id` invocations continue the same review
+session instead of starting fresh.
+
+```bash
+seed plan refine                            # refine latest active plan
+seed plan refine <plan-id> --focus "look for race conditions in step 4-6"
+# planner equivalent: plan_refine_via_repoprompt({"focus":"..."})
+```
+
+Skills can declare a RepoPrompt binding in their frontmatter:
+
+```yaml
+---
+name: My Skill
+repoprompt_working_dirs:
+  - /abs/path/to/repo
+repoprompt_oracle_mode: plan
+---
+```
+
+When `skill_fetch` returns a skill with this block, seed transparently calls
+`bind_context op=bind working_dirs=...` so the right workspace is active before the planner uses
+the skill. `seed skill create` and `run --learn` query `bind_context op=status` and embed the
+current binding into any new skill they emit, closing the loop between RepoPrompt sessions and
+the durable skill tree.
 
 Every planner turn asks for a short `summary`, stores it in the JSONL session, and feeds a
 GenericAgent-style `### [WORKING MEMORY]` anchor into the next planner prompt. The anchor includes

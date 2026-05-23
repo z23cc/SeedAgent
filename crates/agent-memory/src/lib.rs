@@ -6,6 +6,31 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+/// Library error surface for `agent-memory`. The forge-domain pattern:
+/// callers can pattern-match the named variants when they want to recover
+/// (e.g. retry on a transient IO failure, surface a useful "edit a different
+/// file" message on a generated-file write attempt); everything else flows
+/// through `Other(anyhow::Error)` so internal `?` keeps working.
+#[derive(Debug, thiserror::Error)]
+pub enum MemoryError {
+    /// Caller tried to write to a generated path (memory/l1_insight.md or
+    /// memory/index.json). These are rebuilt from L2/L3 — see SOP.
+    #[error("write to generated memory path is forbidden: {path}")]
+    GeneratedPathWrite { path: PathBuf },
+
+    /// Validation of durable memory text rejected the content (e.g. detected
+    /// secret-like material, unverified speculation). Body contains the
+    /// individual violation messages.
+    #[error("durable memory validation failed:\n  - {}", .violations.join("\n  - "))]
+    Validation { violations: Vec<String> },
+
+    /// Escape hatch — internal anyhow::Error from IO / serde paths.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+pub type MemoryResult<T> = std::result::Result<T, MemoryError>;
+
 pub const DEFAULT_META_RULES: &str = r#"# Meta Rules
 
 - Keep the active context small: load L0 meta rules and L1 index by default, fetch deeper memory on demand.
@@ -80,7 +105,7 @@ impl MemoryPaths {
     }
 }
 
-pub fn ensure_memory_layout(paths: &MemoryPaths) -> Result<()> {
+pub fn ensure_memory_layout(paths: &MemoryPaths) -> MemoryResult<()> {
     fs::create_dir_all(&paths.memory_dir)
         .with_context(|| format!("create {}", paths.memory_dir.display()))?;
     fs::create_dir_all(&paths.skills_dir)
@@ -101,7 +126,7 @@ pub fn ensure_memory_layout(paths: &MemoryPaths) -> Result<()> {
     Ok(())
 }
 
-pub fn rebuild_index(paths: &MemoryPaths) -> Result<MemoryIndex> {
+pub fn rebuild_index(paths: &MemoryPaths) -> MemoryResult<MemoryIndex> {
     ensure_memory_layout(paths)?;
     let mut entries = Vec::new();
     collect_memory_file(
@@ -139,7 +164,7 @@ pub fn rebuild_index(paths: &MemoryPaths) -> Result<MemoryIndex> {
     Ok(index)
 }
 
-pub fn load_or_rebuild_index(paths: &MemoryPaths) -> Result<MemoryIndex> {
+pub fn load_or_rebuild_index(paths: &MemoryPaths) -> MemoryResult<MemoryIndex> {
     ensure_memory_layout(paths)?;
     let path = paths.index_path();
     if !path.is_file() {
@@ -151,14 +176,19 @@ pub fn load_or_rebuild_index(paths: &MemoryPaths) -> Result<MemoryIndex> {
         .or_else(|_| rebuild_index(paths))
 }
 
-pub fn write_index(paths: &MemoryPaths, index: &MemoryIndex) -> Result<()> {
-    fs::write(paths.index_path(), serde_json::to_string_pretty(index)?)
-        .with_context(|| format!("write {}", paths.index_path().display()))
+pub fn write_index(paths: &MemoryPaths, index: &MemoryIndex) -> MemoryResult<()> {
+    fs::write(
+        paths.index_path(),
+        serde_json::to_string_pretty(index).context("serialize memory index")?,
+    )
+    .with_context(|| format!("write {}", paths.index_path().display()))?;
+    Ok(())
 }
 
-pub fn write_l1_insight(paths: &MemoryPaths, index: &MemoryIndex) -> Result<()> {
+pub fn write_l1_insight(paths: &MemoryPaths, index: &MemoryIndex) -> MemoryResult<()> {
     fs::write(paths.l1_insight_path(), render_l1_insight(index, 18))
-        .with_context(|| format!("write {}", paths.l1_insight_path().display()))
+        .with_context(|| format!("write {}", paths.l1_insight_path().display()))?;
+    Ok(())
 }
 
 pub fn durable_memory_violations(text: &str) -> Vec<String> {
@@ -174,12 +204,12 @@ pub fn durable_memory_violations(text: &str) -> Vec<String> {
     violations
 }
 
-pub fn validate_durable_memory_text(text: &str) -> Result<()> {
+pub fn validate_durable_memory_text(text: &str) -> MemoryResult<()> {
     let violations = durable_memory_violations(text);
     if violations.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!("{}", violations.join("; "))
+        Err(MemoryError::Validation { violations })
     }
 }
 
@@ -241,13 +271,13 @@ pub fn fetch_memory(
     let mut body = fs::read_to_string(&entry.path)
         .with_context(|| format!("read {}", entry.path.display()))?;
     if body.len() > max_bytes {
-        body.truncate(max_bytes);
+        truncate_utf8(&mut body, max_bytes);
         body.push_str("\n...[truncated]...");
     }
     Ok(MemoryDocument { entry, body })
 }
 
-pub fn planner_memory_context(paths: &MemoryPaths) -> Result<String> {
+pub fn planner_memory_context(paths: &MemoryPaths) -> MemoryResult<String> {
     let index = load_or_rebuild_index(paths)?;
     let meta_rules = fs::read_to_string(paths.meta_rules_path())
         .unwrap_or_else(|_| DEFAULT_META_RULES.to_string());
@@ -525,6 +555,36 @@ fn collect_skills(entries: &mut Vec<MemoryIndexEntry>, paths: &MemoryPaths) -> R
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionArchiveRecord {
+    pub session_id: String,
+    pub session_path: PathBuf,
+    pub goal: String,
+    pub status: String,
+    pub summary: String,
+    pub turns: usize,
+    pub key_facts: Vec<String>,
+    pub related_skills: Vec<String>,
+    pub finished_at: DateTime<Utc>,
+}
+
+pub fn append_session_archive_record(
+    paths: &MemoryPaths,
+    record: &SessionArchiveRecord,
+) -> Result<()> {
+    ensure_memory_layout(paths)?;
+    let archive_path = paths.memory_dir.join("session_archive.jsonl");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&archive_path)
+        .with_context(|| format!("open {}", archive_path.display()))?;
+    let line = serde_json::to_string(record).context("serialize session archive record")?;
+    use std::io::Write;
+    writeln!(file, "{line}").context("write session archive line")?;
+    Ok(())
+}
+
 fn collect_session_archive(entries: &mut Vec<MemoryIndexEntry>, paths: &MemoryPaths) -> Result<()> {
     let archive_path = paths.memory_dir.join("session_archive.jsonl");
     if archive_path.is_file() {
@@ -687,10 +747,21 @@ fn slug(text: &str) -> String {
 fn compact_text(text: &str, limit: usize) -> String {
     let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if text.len() > limit {
-        text.truncate(limit);
+        truncate_utf8(&mut text, limit);
         text.push_str(" ...");
     }
     text
+}
+
+fn truncate_utf8(text: &mut String, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 #[cfg(test)]
@@ -792,6 +863,50 @@ mod tests {
         assert!(durable_memory_violations("token: sk-1234567890abcdef").len() == 1);
         assert!(durable_memory_violations("Probably useful later.").len() == 1);
         assert!(durable_memory_violations("Verified by cargo test on 2026-05-22.").is_empty());
+    }
+
+    #[test]
+    fn compact_text_does_not_split_utf8() {
+        let text = compact_text("优化 当前 的 项目 优化 当前 的 项目", 13);
+
+        assert!(text.ends_with(" ..."));
+    }
+
+    #[test]
+    fn fetch_memory_truncates_utf8_safely() {
+        let root = temp_root();
+        let paths = MemoryPaths::new(
+            root.join("memory"),
+            root.join("skills"),
+            root.join("sessions"),
+        );
+        fs::create_dir_all(root.join("memory")).unwrap();
+        let memory_path = root.join("memory/chinese.md");
+        fs::write(
+            &memory_path,
+            "# 中文记忆\n\n优化当前的项目优化当前的项目优化当前的项目",
+        )
+        .unwrap();
+        fs::write(
+            paths.index_path(),
+            serde_json::to_string(&MemoryIndex {
+                entries: vec![MemoryIndexEntry {
+                    id: "chinese".to_string(),
+                    layer: MemoryLayer::L2GlobalFacts,
+                    title: "中文记忆".to_string(),
+                    keywords: vec!["优化".to_string()],
+                    path: memory_path,
+                    summary: "中文".to_string(),
+                    updated_at: None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let doc = fetch_memory(&paths, "chinese", 17).unwrap();
+        assert!(doc.body.ends_with("\n...[truncated]..."));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_root() -> PathBuf {

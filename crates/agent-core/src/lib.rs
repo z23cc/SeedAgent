@@ -79,6 +79,11 @@ pub struct ToolContext {
     pub skills_dir: PathBuf,
     pub memory_dir: PathBuf,
     pub sessions_dir: PathBuf,
+    /// Current planner turn (1-indexed) when invoked from the runtime loop.
+    /// Used by tools to scale default output limits so working memory does not
+    /// blow up on long runs. `0` means "not in a loop" — tools use their
+    /// natural defaults.
+    pub current_turn: usize,
 }
 
 impl ToolContext {
@@ -89,6 +94,7 @@ impl ToolContext {
             sessions_dir: cwd.join("sessions"),
             cwd,
             skills_dir: skills_dir.into(),
+            current_turn: 0,
         }
     }
 
@@ -99,6 +105,7 @@ impl ToolContext {
             memory_dir: cwd.join("memory"),
             sessions_dir: cwd.join("sessions"),
             cwd,
+            current_turn: 0,
         }
     }
 
@@ -113,7 +120,24 @@ impl ToolContext {
             skills_dir: skills_dir.into(),
             memory_dir: memory_dir.into(),
             sessions_dir: sessions_dir.into(),
+            current_turn: 0,
         }
+    }
+
+    pub fn with_turn(mut self, turn: usize) -> Self {
+        self.current_turn = turn;
+        self
+    }
+
+    /// Returns a soft default cap scaled by current turn pressure.
+    /// `base` is the natural default for the tool (count, bytes, etc.).
+    /// `floor` caps how small it can shrink.
+    pub fn scaled_default(&self, base: usize, floor: usize) -> usize {
+        if self.current_turn < 5 {
+            return base;
+        }
+        let divisor = 1 + self.current_turn / 5;
+        (base / divisor).max(floor.min(base))
     }
 }
 
@@ -151,6 +175,12 @@ pub enum AgentEvent {
     },
     Reflection {
         summary: String,
+    },
+    TurnTimings {
+        turn: usize,
+        planner_ms: u64,
+        exec_ms: u64,
+        planner_chars: usize,
     },
     RunFinished {
         status: String,
@@ -220,6 +250,41 @@ impl ToolRegistry {
             .get(&call.name)
             .ok_or_else(|| ToolError::UnknownTool(call.name.clone()))?;
         tool.execute(ctx, call)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaled_default_keeps_base_under_pressure_threshold() {
+        let ctx = ToolContext::with_cwd(".").with_turn(3);
+        assert_eq!(ctx.scaled_default(200, 60), 200);
+    }
+
+    #[test]
+    fn scaled_default_shrinks_with_turn_growth() {
+        let ctx5 = ToolContext::with_cwd(".").with_turn(5);
+        let ctx12 = ToolContext::with_cwd(".").with_turn(12);
+        let ctx30 = ToolContext::with_cwd(".").with_turn(30);
+        assert_eq!(ctx5.scaled_default(200, 60), 100);
+        assert_eq!(ctx12.scaled_default(200, 60), 66);
+        assert_eq!(ctx30.scaled_default(200, 60), 60); // floor reached
+    }
+
+    #[test]
+    fn scaled_default_respects_floor_only_when_below_base() {
+        let ctx = ToolContext::with_cwd(".").with_turn(100);
+        // floor=4_000, base=16_000 → divisor=21 → 16000/21 = 761; max(floor.min(base)=4000) = 4000
+        assert_eq!(ctx.scaled_default(16_000, 4_000), 4_000);
+    }
+
+    #[test]
+    fn current_turn_zero_acts_as_disabled() {
+        let ctx = ToolContext::with_cwd(".");
+        assert_eq!(ctx.current_turn, 0);
+        assert_eq!(ctx.scaled_default(200, 60), 200);
     }
 }
 

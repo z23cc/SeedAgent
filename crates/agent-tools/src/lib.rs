@@ -8,8 +8,16 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use wait_timeout::ChildExt;
+
+mod subagent;
+pub use subagent::{
+    SEED_SUBAGENT_DEPTH_ENV, SEED_SUBAGENT_MAX_DEPTH, SEED_SUBAGENT_WATCH_DIR_ENV,
+    SUBAGENT_SIGNAL_INTERVENE, SUBAGENT_SIGNAL_KEYINFO, SUBAGENT_SIGNAL_STOP, SpawnSubagentMapTool,
+    SpawnSubagentTool, SubagentNudgeTool, SubagentSignals, consume_subagent_signals,
+    write_subagent_signals,
+};
 
 pub fn seed_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -19,6 +27,10 @@ pub fn seed_registry() -> ToolRegistry {
     registry.register(SkillSearchTool);
     registry.register(SkillFetchTool);
     registry.register(PlanCreateTool);
+    registry.register(PlanCreateFromRepoPromptTool);
+    registry.register(PlanCreateViaRepoPromptTool);
+    registry.register(PlanRefineViaRepoPromptTool);
+    registry.register(PlanListTool);
     registry.register(PlanStatusTool);
     registry.register(PlanNextTool);
     registry.register(PlanCompleteTool);
@@ -29,12 +41,17 @@ pub fn seed_registry() -> ToolRegistry {
     registry.register(RepoPromptExecTool);
     registry.register(RepoPromptCallTool);
     registry.register(ReadFileTool);
+    registry.register(ReadFilesTool);
     registry.register(PatchFileTool);
     registry.register(WriteFileTool);
     registry.register(ShellTool);
     registry.register(WorkingCheckpointTool);
     registry.register(LongTermUpdateTool);
     registry.register(CompleteLongTermUpdateTool);
+    registry.register(SpawnSubagentTool);
+    registry.register(SpawnSubagentMapTool);
+    registry.register(SubagentNudgeTool);
+    registry.register(AskUserTool);
     registry
 }
 
@@ -104,10 +121,11 @@ impl Tool for MemoryFetchTool {
                     source,
                 }
             })?;
+        let default_bytes = ctx.scaled_default(16_000, 4_000);
         let doc = agent_memory::fetch_memory(
             &memory_paths(ctx),
             &args.id,
-            args.max_bytes.unwrap_or(16_000),
+            args.max_bytes.unwrap_or(default_bytes),
         )
         .map_err(|err| ToolError::Failed(err.to_string()))?;
         Ok(ToolResult::ok(
@@ -221,22 +239,88 @@ impl Tool for SkillFetchTool {
         })?;
         let document = agent_skills::fetch_skill(&ctx.skills_dir, &args.name)
             .map_err(|err| ToolError::Failed(err.to_string()))?;
-        Ok(ToolResult::ok(
-            call,
-            json!({
-                "status": "success",
-                "skill": document.info,
-                "body": document.body,
-            }),
-        ))
+        let auto_bind = document
+            .info
+            .repoprompt
+            .as_ref()
+            .map(|binding| autobind_repoprompt(ctx, binding));
+        let mut content = json!({
+            "status": "success",
+            "skill": document.info,
+            "body": document.body,
+        });
+        if let Some(outcome) = auto_bind {
+            content["repoprompt_autobind"] = outcome;
+        }
+        Ok(ToolResult::ok(call, content))
     }
+}
+
+fn autobind_repoprompt(ctx: &ToolContext, binding: &agent_skills::RepoPromptBinding) -> Value {
+    let routing = RepoPromptRoutingArgs {
+        raw_json: Some(true),
+        ..Default::default()
+    };
+    let client = match repoprompt_client(ctx, routing, false) {
+        Ok(client) => client,
+        Err(err) => {
+            return json!({ "status": "skipped", "reason": format!("RepoPrompt unavailable: {err}") });
+        }
+    };
+    let mut payload = serde_json::Map::new();
+    payload.insert("op".to_string(), Value::String("bind".to_string()));
+    if !binding.working_dirs.is_empty() {
+        payload.insert(
+            "working_dirs".to_string(),
+            Value::Array(
+                binding
+                    .working_dirs
+                    .iter()
+                    .map(|path| Value::String(path.display().to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(context_id) = &binding.context_id {
+        payload.insert(
+            "context_id".to_string(),
+            Value::String(context_id.clone()),
+        );
+    }
+    let result = match client.call_tool(
+        agent_repoprompt::RepoPromptTool::BindContext,
+        &Value::Object(payload),
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            return json!({ "status": "error", "reason": format!("bind_context call failed: {err}") });
+        }
+    };
+    let status = if result.timed_out {
+        "timeout"
+    } else if result.exit_code == Some(0) {
+        "bound"
+    } else {
+        "error"
+    };
+    json!({
+        "status": status,
+        "exit_code": result.exit_code,
+        "stdout_tail": truncate_text(result.stdout.trim(), 400),
+        "working_dirs": binding.working_dirs,
+        "context_id": binding.context_id,
+    })
 }
 
 #[derive(Debug, Deserialize)]
 struct PlanCreateArgs {
-    title: String,
-    task: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, alias = "goal")]
+    task: Option<String>,
+    #[serde(default, alias = "items")]
     steps: Option<Vec<String>>,
+    #[serde(default)]
     source_export_path: Option<PathBuf>,
 }
 
@@ -248,7 +332,7 @@ impl Tool for PlanCreateTool {
     }
 
     fn description(&self) -> &'static str {
-        "Create a durable GenericAgent-style plan under plans/<id>/ with plan.md, state.json, and a required verification gate."
+        "Create a durable GenericAgent-style plan under plans/<id>/ with plan.md, state.json, and a required verification gate. Args JSON: {\"title\":\"short title\",\"task\":\"full task\",\"steps\":[\"step 1\"]}. Accepted aliases: goal->task, items->steps. Do not pass plan_id or verification_gate."
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -258,10 +342,17 @@ impl Tool for PlanCreateTool {
                 source,
             }
         })?;
+        let Some(task) = non_empty(args.task) else {
+            return Ok(ToolResult::error(
+                call,
+                "plan_create requires `task` (or alias `goal`)",
+            ));
+        };
+        let title = non_empty(args.title).unwrap_or_else(|| plan_title_from_task(&task));
         let snapshot = plan_store(ctx)
             .create(agent_plan::CreatePlan {
-                title: args.title,
-                task: args.task,
+                title,
+                task,
                 steps: args.steps.unwrap_or_default(),
                 source_export_path: args
                     .source_export_path
@@ -281,7 +372,449 @@ impl Tool for PlanCreateTool {
 }
 
 #[derive(Debug, Deserialize)]
+struct PlanCreateFromRepoPromptArgs {
+    #[serde(alias = "path")]
+    export_path: PathBuf,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, alias = "goal")]
+    task: Option<String>,
+}
+
+pub struct PlanCreateFromRepoPromptTool;
+
+impl Tool for PlanCreateFromRepoPromptTool {
+    fn name(&self) -> &'static str {
+        "plan_create_from_repoprompt"
+    }
+
+    fn description(&self) -> &'static str {
+        "Import a RepoPrompt builder plan export (`builder ... --response-type plan --export`) into a durable seed plan. Parses the export's `## Plan/Steps/Implementation` section into checked items, applies [D]/[P] markers via keyword heuristics, creates the plan, and records the export under the plan's RepoPromptExport artifact ledger. Args: {\"export_path\":\"path/to/export.md\", \"title\":\"optional\", \"task\":\"optional\"}."
+    }
+
+    fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        let args: PlanCreateFromRepoPromptArgs = serde_json::from_value(call.args.clone())
+            .map_err(|source| ToolError::InvalidArguments {
+                tool: call.name.clone(),
+                source,
+            })?;
+        let export_path = absolutize(&ctx.cwd, args.export_path);
+        if !export_path.is_file() {
+            return Ok(ToolResult::error(
+                call,
+                format!("export file not found: {}", export_path.display()),
+            ));
+        }
+        let text = fs::read_to_string(&export_path)
+            .map_err(|err| ToolError::Failed(format!("read {}: {err}", export_path.display())))?;
+        let imported = agent_plan::import_repoprompt_plan(&text);
+        if imported.steps.is_empty() {
+            return Ok(ToolResult::error(
+                call,
+                "no plan steps detected in export; expected a `## Plan` (or Steps/Tasks/Implementation) section with list items",
+            ));
+        }
+        let title = non_empty(args.title).unwrap_or(imported.title);
+        let task = non_empty(args.task).unwrap_or(imported.task);
+        let store = plan_store(ctx);
+        let snapshot = store
+            .create(agent_plan::CreatePlan {
+                title,
+                task,
+                steps: imported.steps.clone(),
+                source_export_path: Some(export_path.clone()),
+            })
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let snapshot = store
+            .record_artifact(
+                Some(&snapshot.state.id),
+                agent_plan::RecordPlanArtifact {
+                    kind: agent_plan::PlanArtifactKind::RepoPromptExport,
+                    path: export_path.clone(),
+                    note: Some(format!(
+                        "Imported {} steps from RepoPrompt export ({} delegated, {} parallel)",
+                        imported.steps.len(),
+                        imported.delegated_count,
+                        imported.parallel_count
+                    )),
+                },
+            )
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        Ok(ToolResult::ok(
+            call,
+            json!({
+                "status": "success",
+                "plan": snapshot,
+                "ledger_summary": plan_ledger_summary(&snapshot),
+                "next_prompt": plan_mode_next_prompt(&snapshot),
+                "import_stats": {
+                    "steps_total": imported.steps.len(),
+                    "delegated": imported.delegated_count,
+                    "parallel": imported.parallel_count,
+                    "export_path": export_path,
+                },
+            }),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanRefineArgs {
+    #[serde(default, alias = "id", alias = "plan_id")]
+    plan: Option<String>,
+    #[serde(default)]
+    focus: Option<String>,
+    #[serde(default)]
+    max_fixes: Option<usize>,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    working_dirs: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+pub struct PlanRefineViaRepoPromptTool;
+
+impl Tool for PlanRefineViaRepoPromptTool {
+    fn name(&self) -> &'static str {
+        "plan_refine_via_repoprompt"
+    }
+
+    fn description(&self) -> &'static str {
+        "Ask RepoPrompt's oracle to review the current plan and append concrete [FIX] items. Args: plan (id; default=latest active), focus (optional string), max_fixes (default 8), chat_id (continue a prior review chat), working_dirs (override binding), timeout_secs. The oracle returns markdown with a `## Recommended Fixes` section; each item gets appended as a numbered [FIX] step before the [VERIFY] gate and a reviewer handoff is logged on the plan."
+    }
+
+    fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        let args: PlanRefineArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
+            ToolError::InvalidArguments {
+                tool: call.name.clone(),
+                source,
+            }
+        })?;
+        let store = plan_store(ctx);
+        let snapshot = store
+            .snapshot(args.plan.as_deref())
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let plan_body = fs::read_to_string(&snapshot.state.plan_path).map_err(|err| {
+            ToolError::Failed(format!(
+                "read {}: {err}",
+                snapshot.state.plan_path.display()
+            ))
+        })?;
+        let max_fixes = args.max_fixes.unwrap_or(8).clamp(1, 30);
+        let focus_block = args
+            .focus
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|focus| format!("\n<focus>{}</focus>", escape_xml(focus)))
+            .unwrap_or_default();
+        let message = format!(
+            "You are reviewing an implementation plan that an autonomous agent will execute. \
+Look for gaps (missing steps, missing verification), risks (steps that could break things, \
+untested assumptions), ambiguity (steps too vague to execute), and ordering issues.\n\n\
+<plan>\n{plan_body}\n</plan>{focus_block}\n\n\
+Respond with EXACTLY this structure:\n\n\
+## Findings\n- 2-5 bullets naming specific concerns.\n\n\
+## Recommended Fixes\n- Up to {max_fixes} one-line action items. Each MUST start with an imperative verb \
+(Add, Remove, Change, Replace, Investigate, Verify, Update, Refactor). These will be appended verbatim as new \
+[FIX] plan steps. Make them executable, not philosophical. Do not repeat existing plan steps. \
+If the plan is already complete and needs no fixes, write `- (none)` in this section."
+        );
+
+        let timeout = args.timeout_secs.unwrap_or(600).clamp(60, 3600);
+        let routing = RepoPromptRoutingArgs {
+            timeout_secs: Some(timeout),
+            working_dirs: args.working_dirs.clone(),
+            raw_json: Some(true),
+            ..Default::default()
+        };
+        let client = repoprompt_client(ctx, routing, true)?;
+        let new_chat = args.chat_id.is_none();
+        let response = client
+            .send_oracle(
+                &message,
+                agent_repoprompt::OracleMode::Chat,
+                args.chat_id.as_deref(),
+                new_chat,
+            )
+            .map_err(|err| ToolError::Failed(format!("oracle_send failed: {err}")))?;
+        if !response.is_success() {
+            return Ok(ToolResult::error(
+                call,
+                format!(
+                    "oracle_send returned exit_code={:?}; stderr: {}",
+                    response.raw_output.exit_code,
+                    truncate_text(response.raw_output.stderr.trim(), 800)
+                ),
+            ));
+        }
+
+        let mut fixes = agent_plan::parse_plan_review(&response.response_text);
+        if fixes.len() > max_fixes {
+            fixes.truncate(max_fixes);
+        }
+        if fixes.is_empty() {
+            return Ok(ToolResult::ok(
+                call,
+                json!({
+                    "status": "no_fixes",
+                    "plan_id": snapshot.state.id,
+                    "reviewer_chat_id": response.chat_id,
+                    "review_summary": truncate_text(&response.response_text, 1200),
+                }),
+            ));
+        }
+
+        let updated = store
+            .append_items(Some(&snapshot.state.id), fixes.clone())
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let summary = format!(
+            "Appended {} [FIX] items via RepoPrompt oracle review.",
+            fixes.len()
+        );
+        let updated = store
+            .record_handoff(
+                Some(&updated.state.id),
+                agent_plan::RecordPlanHandoff {
+                    backend: "repoprompt".to_string(),
+                    role: Some("reviewer".to_string()),
+                    run_id: response.chat_id.clone(),
+                    thread_id: response.chat_id.clone(),
+                    artifact_path: response.oracle_export_path.clone(),
+                    status: "completed".to_string(),
+                    summary: summary.clone(),
+                },
+            )
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+
+        Ok(ToolResult::ok(
+            call,
+            json!({
+                "status": "success",
+                "plan": updated,
+                "ledger_summary": plan_ledger_summary(&updated),
+                "next_prompt": plan_mode_next_prompt(&updated),
+                "fixes_appended": fixes,
+                "fix_count": fixes.len(),
+                "reviewer_chat_id": response.chat_id,
+                "review_summary": truncate_text(&response.response_text, 1200),
+            }),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanCreateViaRepoPromptArgs {
+    task: String,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    hints: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    working_dirs: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    context_id: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+pub struct PlanCreateViaRepoPromptTool;
+
+impl Tool for PlanCreateViaRepoPromptTool {
+    fn name(&self) -> &'static str {
+        "plan_create_via_repoprompt"
+    }
+
+    fn description(&self) -> &'static str {
+        "One-shot: ask RepoPrompt's context_builder to draft an implementation plan for `task`, then import the export into a durable seed plan. Args: task (required), optional context (background/constraints), hints (discovery agent guidance), title, working_dirs, context_id, timeout_secs (default 900). Use this when you have a fresh task; use plan_create_from_repoprompt when you already have a builder export on disk."
+    }
+
+    fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        let args: PlanCreateViaRepoPromptArgs = serde_json::from_value(call.args.clone())
+            .map_err(|source| ToolError::InvalidArguments {
+                tool: call.name.clone(),
+                source,
+            })?;
+        let task_text = args.task.trim();
+        if task_text.is_empty() {
+            return Ok(ToolResult::error(call, "task must not be empty"));
+        }
+
+        let mut instructions = format!("<task>{}</task>", escape_xml(task_text));
+        if let Some(context) = args.context.as_deref()
+            && !context.trim().is_empty()
+        {
+            instructions.push('\n');
+            instructions.push_str(&format!("<context>{}</context>", escape_xml(context)));
+        }
+        if let Some(hints) = args.hints.as_deref()
+            && !hints.trim().is_empty()
+        {
+            instructions.push('\n');
+            instructions.push_str(&format!(
+                "<discovery_agent-guidelines>{}</discovery_agent-guidelines>",
+                escape_xml(hints)
+            ));
+        }
+
+        let timeout = args.timeout_secs.unwrap_or(900).clamp(60, 3600);
+        let routing = RepoPromptRoutingArgs {
+            timeout_secs: Some(timeout),
+            working_dirs: args.working_dirs.clone(),
+            context_id: args.context_id.clone(),
+            raw_json: Some(true),
+            ..Default::default()
+        };
+        let client = repoprompt_client(ctx, routing, true)?;
+        let response = client
+            .build_context(
+                &instructions,
+                agent_repoprompt::BuilderResponseType::Plan,
+                true,
+            )
+            .map_err(|err| ToolError::Failed(format!("context_builder failed: {err}")))?;
+        if !response.is_success() {
+            return Ok(ToolResult::error(
+                call,
+                format!(
+                    "context_builder returned exit_code={:?} timed_out={}; stderr: {}",
+                    response.raw_output.exit_code,
+                    response.raw_output.timed_out,
+                    truncate_text(response.raw_output.stderr.trim(), 800)
+                ),
+            ));
+        }
+
+        let export_path = match response.oracle_export_path.clone() {
+            Some(path) => path,
+            None => {
+                return Ok(ToolResult::error(
+                    call,
+                    format!(
+                        "context_builder did not return oracle_export_path; raw stdout tail: {}",
+                        truncate_text(response.raw_output.stdout.trim(), 600)
+                    ),
+                ));
+            }
+        };
+        let export_text = fs::read_to_string(&export_path).map_err(|err| {
+            ToolError::Failed(format!(
+                "read context_builder export {}: {err}",
+                export_path.display()
+            ))
+        })?;
+        let imported = agent_plan::import_repoprompt_plan(&export_text);
+        if imported.steps.is_empty() {
+            return Ok(ToolResult::error(
+                call,
+                format!(
+                    "context_builder export at {} contained no recognizable plan steps; raw response: {}",
+                    export_path.display(),
+                    truncate_text(&response.response_text, 600)
+                ),
+            ));
+        }
+        let title = non_empty(args.title)
+            .or_else(|| non_empty(Some(imported.title.clone())))
+            .unwrap_or_else(|| plan_title_from_task(task_text));
+        let task = non_empty(Some(imported.task.clone())).unwrap_or_else(|| task_text.to_string());
+        let store = plan_store(ctx);
+        let snapshot = store
+            .create(agent_plan::CreatePlan {
+                title,
+                task,
+                steps: imported.steps.clone(),
+                source_export_path: Some(export_path.clone()),
+            })
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let snapshot = store
+            .record_artifact(
+                Some(&snapshot.state.id),
+                agent_plan::RecordPlanArtifact {
+                    kind: agent_plan::PlanArtifactKind::RepoPromptExport,
+                    path: export_path.clone(),
+                    note: Some(format!(
+                        "Built via context_builder; {} steps ({} delegated, {} parallel)",
+                        imported.steps.len(),
+                        imported.delegated_count,
+                        imported.parallel_count
+                    )),
+                },
+            )
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        Ok(ToolResult::ok(
+            call,
+            json!({
+                "status": "success",
+                "plan": snapshot,
+                "ledger_summary": plan_ledger_summary(&snapshot),
+                "next_prompt": plan_mode_next_prompt(&snapshot),
+                "import_stats": {
+                    "steps_total": imported.steps.len(),
+                    "delegated": imported.delegated_count,
+                    "parallel": imported.parallel_count,
+                    "export_path": export_path,
+                    "builder_chat_id": response.chat_id,
+                },
+            }),
+        ))
+    }
+}
+
+fn escape_xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanListArgs {
+    limit: Option<usize>,
+}
+
+pub struct PlanListTool;
+
+impl Tool for PlanListTool {
+    fn name(&self) -> &'static str {
+        "plan_list"
+    }
+
+    fn description(&self) -> &'static str {
+        "List durable plans newest-first so an agent can resume, inspect, or choose a plan by id. Args JSON: {\"limit\":20}; empty args are allowed."
+    }
+
+    fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        let args: PlanListArgs =
+            serde_json::from_value(call.args.clone()).unwrap_or(PlanListArgs { limit: Some(20) });
+        let limit = args.limit.unwrap_or(20);
+        let plans = plan_store(ctx)
+            .list()
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let shown = if limit == 0 {
+            plans.clone()
+        } else {
+            plans.iter().take(limit).cloned().collect()
+        };
+        Ok(ToolResult::ok(
+            call,
+            json!({
+                "status": "success",
+                "total_count": plans.len(),
+                "shown_count": shown.len(),
+                "plans": shown,
+                "next_prompt": "Choose a plan id, then call plan_status or plan_next with that id before continuing plan work.",
+            }),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct PlanIdArgs {
+    #[serde(default, alias = "plan_id")]
     id: Option<String>,
 }
 
@@ -293,7 +826,7 @@ impl Tool for PlanStatusTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read the current or selected plan state, checkbox items, and next unchecked item."
+        "Read the current or selected plan state, checkbox items, and next unchecked item. Args JSON: {\"id\":\"plan-...\"}; alias plan_id is accepted; empty args read the active plan."
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -320,7 +853,7 @@ impl Tool for PlanNextTool {
     }
 
     fn description(&self) -> &'static str {
-        "Return the next unchecked plan item; use this before continuing a plan-mode task."
+        "Return the next unchecked plan item; use this before continuing a plan-mode task. Args JSON: {\"id\":\"plan-...\"}; alias plan_id is accepted; empty args use the active plan."
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -346,8 +879,11 @@ impl Tool for PlanNextTool {
 
 #[derive(Debug, Deserialize)]
 struct PlanCompleteArgs {
+    #[serde(default, alias = "plan_id")]
     id: Option<String>,
+    #[serde(default, alias = "index", alias = "item_index")]
     item: Option<usize>,
+    #[serde(default)]
     note: Option<String>,
 }
 
@@ -359,7 +895,7 @@ impl Tool for PlanCompleteTool {
     }
 
     fn description(&self) -> &'static str {
-        "Mark one plan item complete by item index, or mark the current next item when omitted."
+        "Mark one plan item complete by item index, or mark the current next item when omitted. Args JSON: {\"id\":\"plan-...\",\"item\":1,\"note\":\"done\"}. Aliases: plan_id->id, item_index/index->item."
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -387,9 +923,11 @@ impl Tool for PlanCompleteTool {
 
 #[derive(Debug, Deserialize)]
 struct PlanRecordArtifactArgs {
+    #[serde(default, alias = "plan_id")]
     id: Option<String>,
     kind: agent_plan::PlanArtifactKind,
     path: PathBuf,
+    #[serde(default)]
     note: Option<String>,
 }
 
@@ -401,7 +939,7 @@ impl Tool for PlanRecordArtifactTool {
     }
 
     fn description(&self) -> &'static str {
-        "Record a RepoPrompt/context/verification artifact path in the plan orchestration ledger."
+        "Record a RepoPrompt/context/verification artifact path in the plan orchestration ledger. Args JSON: {\"id\":\"plan-...\",\"kind\":\"repoprompt_export\",\"path\":\"/abs/file.md\",\"note\":\"optional\"}. Alias plan_id is accepted."
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -434,12 +972,18 @@ impl Tool for PlanRecordArtifactTool {
 
 #[derive(Debug, Deserialize)]
 struct PlanRecordHandoffArgs {
+    #[serde(default, alias = "plan_id")]
     id: Option<String>,
     backend: String,
+    #[serde(default)]
     role: Option<String>,
+    #[serde(default)]
     run_id: Option<String>,
+    #[serde(default)]
     thread_id: Option<String>,
+    #[serde(default)]
     artifact_path: Option<PathBuf>,
+    #[serde(default)]
     status: Option<String>,
     summary: String,
 }
@@ -452,7 +996,7 @@ impl Tool for PlanRecordHandoffTool {
     }
 
     fn description(&self) -> &'static str {
-        "Record a RepoPrompt/Codex/local execution handoff, run id, artifact, status, and summary in the plan ledger."
+        "Record a RepoPrompt/Codex/local execution handoff, run id, artifact, status, and summary in the plan ledger. Args JSON: {\"id\":\"plan-...\",\"backend\":\"repoprompt|codex|local\",\"summary\":\"what happened\",\"status\":\"done\"}. Alias plan_id is accepted."
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -489,12 +1033,19 @@ impl Tool for PlanRecordHandoffTool {
 
 #[derive(Debug, Deserialize)]
 struct PlanVerifyArgs {
+    #[serde(default, alias = "plan_id")]
     id: Option<String>,
+    #[serde(default)]
     model_id: Option<String>,
+    #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
     dry_run: Option<bool>,
+    #[serde(default)]
     window_id: Option<u32>,
+    #[serde(default)]
     context_id: Option<String>,
+    #[serde(default)]
     working_dirs: Option<Vec<PathBuf>>,
 }
 
@@ -506,7 +1057,7 @@ impl Tool for PlanVerifyTool {
     }
 
     fn description(&self) -> &'static str {
-        "Create verify_context.json and run an independent RepoPrompt agent_run verifier; PASS marks the plan verified, FAIL appends a [FIX] item."
+        "Create verify_context.json and run an independent RepoPrompt agent_run verifier; PASS marks the plan verified, FAIL appends a [FIX] item. Args JSON: {\"id\":\"plan-...\",\"dry_run\":false,\"timeout_secs\":300}. Alias plan_id is accepted."
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -657,6 +1208,7 @@ struct RepoPromptRoutingArgs {
 
 #[derive(Debug, Deserialize)]
 struct RepoPromptExecArgs {
+    #[serde(alias = "cmd")]
     command: String,
     #[serde(flatten)]
     routing: RepoPromptRoutingArgs,
@@ -670,7 +1222,7 @@ impl Tool for RepoPromptExecTool {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a RepoPrompt CLI command chain such as windows, tree, search, select, context, builder, plan, or review. Workspace commands default to the current cwd when no routing is supplied."
+        "Execute a RepoPrompt CLI command chain such as windows, tree, search, select, context, builder, plan, or review. Args JSON: {\"command\":\"tree --mode folders\"}; alias cmd is accepted. Workspace commands default to the current cwd when no routing is supplied."
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -698,8 +1250,12 @@ impl Tool for RepoPromptExecTool {
 
 #[derive(Debug, Deserialize)]
 struct RepoPromptCallArgs {
+    // The planner frequently bleeds its own `PlannedAction.tool_name` field
+    // into the inner envelope — accept both spellings so we don't waste a
+    // retry turn on what is just a naming conflict.
+    #[serde(alias = "tool_name", alias = "name")]
     tool: String,
-    #[serde(default)]
+    #[serde(default, alias = "args_json", alias = "params")]
     args: serde_json::Value,
     #[serde(flatten)]
     routing: RepoPromptRoutingArgs,
@@ -773,7 +1329,8 @@ impl Tool for ReadFileTool {
         })?;
         let path = resolve_path(&ctx.cwd, &args.path);
         let start = args.start.unwrap_or(1).max(1);
-        let count = args.count.unwrap_or(200).clamp(1, 1000);
+        let default_count = ctx.scaled_default(200, 60);
+        let count = args.count.unwrap_or(default_count).clamp(1, 1000);
         let show_line_numbers = args.show_line_numbers.unwrap_or(true);
         let content = read_file_window(
             &path,
@@ -789,6 +1346,97 @@ impl Tool for ReadFileTool {
                 "status": "success",
                 "path": path,
                 "content": content,
+            }),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadFilesArgs {
+    paths: Vec<String>,
+    #[serde(default)]
+    start: Option<usize>,
+    #[serde(default)]
+    count: Option<usize>,
+    #[serde(default)]
+    keyword: Option<String>,
+    #[serde(default)]
+    show_line_numbers: Option<bool>,
+}
+
+pub struct ReadFilesTool;
+
+impl Tool for ReadFilesTool {
+    fn name(&self) -> &'static str {
+        "read_files"
+    }
+
+    fn description(&self) -> &'static str {
+        "Batch-read up to 8 UTF-8 files in one tool call. Prefer this over multiple sequential read_file turns when you already know the paths you need (e.g. surveying several crate entry points). Args: paths (string[], required), start/count/keyword/show_line_numbers (applied to every file). Returns { files: [{path, status, content?, error?}], succeeded, failed }."
+    }
+
+    fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        let args: ReadFilesArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
+            ToolError::InvalidArguments {
+                tool: call.name.clone(),
+                source,
+            }
+        })?;
+        if args.paths.is_empty() {
+            return Ok(ToolResult::error(call, "paths must not be empty"));
+        }
+        let paths = if args.paths.len() > 8 {
+            return Ok(ToolResult::error(
+                call,
+                format!(
+                    "read_files capped at 8 paths per call; got {}. Split the request.",
+                    args.paths.len()
+                ),
+            ));
+        } else {
+            args.paths
+        };
+
+        let start = args.start.unwrap_or(1).max(1);
+        // Per-file scaling: as we read more files in one turn, shrink each
+        // file's window so total output stays bounded.
+        let base_default = ctx.scaled_default(200, 60);
+        let per_file_default = (base_default / paths.len().max(1)).max(40);
+        let count = args.count.unwrap_or(per_file_default).clamp(1, 1000);
+        let show_line_numbers = args.show_line_numbers.unwrap_or(true);
+
+        let mut files: Vec<Value> = Vec::with_capacity(paths.len());
+        let mut succeeded = 0usize;
+        for raw_path in &paths {
+            let path = resolve_path(&ctx.cwd, raw_path);
+            match read_file_window(&path, start, count, args.keyword.as_deref(), show_line_numbers)
+            {
+                Ok(content) => {
+                    succeeded += 1;
+                    files.push(json!({
+                        "path": path,
+                        "status": "ok",
+                        "content": content,
+                    }));
+                }
+                Err(err) => {
+                    files.push(json!({
+                        "path": path,
+                        "status": "error",
+                        "error": err.to_string(),
+                    }));
+                }
+            }
+        }
+        let total = files.len();
+        Ok(ToolResult::ok(
+            call,
+            json!({
+                "status": if succeeded == total { "success" } else { "partial" },
+                "succeeded": succeeded,
+                "failed": total - succeeded,
+                "count_per_file": count,
+                "files": files,
             }),
         ))
     }
@@ -1304,7 +1952,7 @@ fn read_file_window(
     );
     for (line_no, mut line) in rows.into_iter().take(count) {
         if line.len() > 8_000 {
-            line.truncate(8_000);
+            truncate_utf8(&mut line, 8_000);
             line.push_str(" ... [TRUNCATED]");
         }
         if show_line_numbers {
@@ -1463,6 +2111,7 @@ fn repoprompt_client(
     Ok(agent_repoprompt::RepoPromptClient::new(cfg))
 }
 
+#[cfg(test)]
 fn repoprompt_client_without_bind(
     ctx: &ToolContext,
     routing: RepoPromptRoutingArgs,
@@ -1687,6 +2336,31 @@ fn read_pipe(pipe: Option<impl Read>) -> String {
     buf
 }
 
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn plan_title_from_task(task: &str) -> String {
+    let mut title = task
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .unwrap_or("Untitled plan")
+        .to_string();
+    truncate_utf8(&mut title, 80);
+    while title.ends_with(['-', ':', ' ', '，', '。']) {
+        title.pop();
+    }
+    if title.is_empty() {
+        "Untitled plan".to_string()
+    } else {
+        title
+    }
+}
+
 fn truncate_middle(input: &str, max_len: usize) -> String {
     if input.len() <= max_len {
         return input.to_string();
@@ -1694,9 +2368,147 @@ fn truncate_middle(input: &str, max_len: usize) -> String {
     let keep = max_len / 2;
     format!(
         "{}\n...[omitted long output]...\n{}",
-        &input[..keep],
-        &input[input.len() - keep..]
+        safe_prefix(input, keep),
+        safe_suffix(input, keep)
     )
+}
+
+fn truncate_utf8(text: &mut String, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
+fn safe_prefix(text: &str, limit: usize) -> &str {
+    let mut end = limit.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn safe_suffix(text: &str, limit: usize) -> &str {
+    let mut start = text.len().saturating_sub(limit);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+
+#[derive(Debug, Deserialize)]
+struct AskUserArgs {
+    question: String,
+    #[serde(default)]
+    candidates: Vec<String>,
+}
+
+pub struct AskUserTool;
+
+impl Tool for AskUserTool {
+    fn name(&self) -> &'static str {
+        "ask_user"
+    }
+
+    fn description(&self) -> &'static str {
+        "Prompt the human operator via stdin when the task cannot proceed without clarification or a decision. Args: question (string), optional candidates (list of suggested answers). Fails on non-interactive stdin so it cannot deadlock CI."
+    }
+
+    fn execute(&self, _ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        let args: AskUserArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
+            ToolError::InvalidArguments {
+                tool: call.name.clone(),
+                source,
+            }
+        })?;
+        use std::io::IsTerminal;
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            return Ok(ToolResult::error(
+                call,
+                "stdin is not a terminal; ask_user cannot collect a response in non-interactive mode",
+            ));
+        }
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "\nseed asks: {}", args.question);
+        if !args.candidates.is_empty() {
+            for (idx, candidate) in args.candidates.iter().enumerate() {
+                let _ = writeln!(stderr, "  {}) {}", idx + 1, candidate);
+            }
+            let _ = writeln!(stderr, "  reply with a number or your own answer.");
+        }
+        let _ = write!(stderr, "> ");
+        let _ = stderr.flush();
+
+        let mut line = String::new();
+        stdin
+            .lock()
+            .read_line(&mut line)
+            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() {
+            return Ok(ToolResult::error(call, "user replied with an empty line"));
+        }
+
+        let resolved = if !args.candidates.is_empty()
+            && let Ok(idx) = trimmed.parse::<usize>()
+            && idx >= 1
+            && idx <= args.candidates.len()
+        {
+            args.candidates[idx - 1].clone()
+        } else {
+            trimmed.clone()
+        };
+
+        Ok(ToolResult::ok(
+            call,
+            json!({
+                "status": "success",
+                "question": args.question,
+                "answer": resolved,
+                "raw_input": trimmed,
+            }),
+        ))
+    }
+}
+
+pub(crate) fn simple_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{nanos:x}")
+}
+
+pub(crate) fn find_latest_session(dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut latest: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "jsonl")
+            && let Ok(meta) = entry.metadata()
+            && let Ok(mtime) = meta.modified()
+        {
+            if latest.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                latest = Some((mtime, path));
+            }
+        }
+    }
+    latest.map(|(_, path)| path)
+}
+
+pub(crate) fn truncate_text(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let head: String = text.chars().take(max).collect();
+        format!("{head}…")
+    }
 }
 
 #[cfg(test)]
@@ -1714,6 +2526,7 @@ mod tests {
         assert!(names.contains(&"memory_search"));
         assert!(names.contains(&"memory_fetch"));
         assert!(names.contains(&"plan_create"));
+        assert!(names.contains(&"plan_list"));
         assert!(names.contains(&"plan_status"));
         assert!(names.contains(&"plan_next"));
         assert!(names.contains(&"plan_complete"));
@@ -1723,6 +2536,246 @@ mod tests {
         assert!(names.contains(&"repoprompt_tools"));
         assert!(names.contains(&"repoprompt_exec"));
         assert!(names.contains(&"repoprompt_call"));
+        assert!(names.contains(&"spawn_subagent"));
+        assert!(names.contains(&"ask_user"));
+    }
+
+    #[test]
+    fn escape_xml_protects_angle_brackets_and_amps() {
+        let escaped = escape_xml("3 < 5 && x > y");
+        assert_eq!(escaped, "3 &lt; 5 &amp;&amp; x &gt; y");
+    }
+
+    #[test]
+    fn registry_exposes_plan_create_via_repoprompt() {
+        let registry = seed_registry();
+        let names = registry.names();
+        assert!(names.contains(&"plan_create_via_repoprompt"));
+        assert!(names.contains(&"plan_refine_via_repoprompt"));
+    }
+
+    #[test]
+    fn plan_create_from_repoprompt_imports_steps_and_records_artifact() {
+        let root = temp_root();
+        let ctx = temp_ctx(&root);
+        fs::create_dir_all(&ctx.cwd).unwrap();
+        let export_path = ctx.cwd.join("export.md");
+        fs::write(
+            &export_path,
+            "# Refactor cache\n\nWe need to split the cache layer.\n\n## Plan\n\n1. Investigate the existing cache across the codebase.\n2. Add new in-memory store.\n3. Run the integration tests.\n",
+        )
+        .unwrap();
+        let call = ToolCall::new(
+            "plan_create_from_repoprompt",
+            json!({ "export_path": "export.md" }),
+        );
+        let result = PlanCreateFromRepoPromptTool.execute(&ctx, &call).unwrap();
+        assert!(result.ok, "tool failed: {:?}", result.content);
+        let import_stats = &result.content["import_stats"];
+        assert_eq!(import_stats["steps_total"].as_u64(), Some(3));
+        assert!(import_stats["delegated"].as_u64().unwrap_or_default() >= 1);
+        let plan = &result.content["plan"];
+        let artifacts = plan["state"]["orchestration"]["artifacts"]
+            .as_array()
+            .unwrap();
+        assert!(
+            artifacts
+                .iter()
+                .any(|a| a["kind"] == "repo_prompt_export" && a["path"].as_str().is_some()),
+            "expected RepoPromptExport artifact, got {:?}",
+            artifacts
+        );
+        let items = plan["items"].as_array().unwrap();
+        let first = &items[0];
+        assert!(
+            first["text"].as_str().unwrap_or_default().contains("[D]"),
+            "expected [D] marker on item 0, got {:?}",
+            first["text"]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_subagent_refuses_when_depth_at_limit() {
+        let root = temp_root();
+        let ctx = temp_ctx(&root);
+        fs::create_dir_all(&ctx.cwd).unwrap();
+        let prev = env::var(SEED_SUBAGENT_DEPTH_ENV).ok();
+        // SAFETY: tests in this binary run single-threaded for env mutation by convention here.
+        unsafe {
+            env::set_var(SEED_SUBAGENT_DEPTH_ENV, SEED_SUBAGENT_MAX_DEPTH.to_string());
+        }
+        let call = ToolCall::new(
+            "spawn_subagent",
+            json!({ "task": "noop", "max_turns": 1 }),
+        );
+        let result = SpawnSubagentTool.execute(&ctx, &call).unwrap();
+        unsafe {
+            match prev {
+                Some(prev_value) => env::set_var(SEED_SUBAGENT_DEPTH_ENV, prev_value),
+                None => env::remove_var(SEED_SUBAGENT_DEPTH_ENV),
+            }
+        }
+        assert!(!result.ok);
+        let message = result.content["message"].as_str().unwrap_or_default();
+        assert!(message.contains("depth"), "got: {message}");
+    }
+
+    #[test]
+    fn subagent_signals_round_trip_through_write_and_consume() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        write_subagent_signals(&root, Some("verified port=8080"), Some("switch to plan mode"), true).unwrap();
+        assert!(root.join(SUBAGENT_SIGNAL_KEYINFO).is_file());
+        assert!(root.join(SUBAGENT_SIGNAL_INTERVENE).is_file());
+        assert!(root.join(SUBAGENT_SIGNAL_STOP).is_file());
+
+        let signals = consume_subagent_signals(&root);
+        assert_eq!(signals.key_info, vec!["verified port=8080".to_string()]);
+        assert_eq!(signals.intervene.as_deref(), Some("switch to plan mode"));
+        assert!(signals.stop);
+
+        // files must be consumed (deleted) so the same signal does not re-fire.
+        assert!(!root.join(SUBAGENT_SIGNAL_KEYINFO).exists());
+        assert!(!root.join(SUBAGENT_SIGNAL_INTERVENE).exists());
+        assert!(!root.join(SUBAGENT_SIGNAL_STOP).exists());
+
+        let empty = consume_subagent_signals(&root);
+        assert!(empty.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_files_batches_multiple_paths() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.md"), "alpha line one\nalpha line two\n").unwrap();
+        fs::write(root.join("b.md"), "bravo line one\n").unwrap();
+        let ctx = temp_ctx(&root);
+        let call = ToolCall::new(
+            "read_files",
+            json!({ "paths": ["a.md", "b.md"], "show_line_numbers": false }),
+        );
+        let result = ReadFilesTool.execute(&ctx, &call).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.content["succeeded"].as_u64(), Some(2));
+        assert_eq!(result.content["failed"].as_u64(), Some(0));
+        let files = result.content["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files[0]["content"].as_str().unwrap().contains("alpha"));
+        assert!(files[1]["content"].as_str().unwrap().contains("bravo"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_files_reports_partial_when_one_path_missing() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.md"), "alpha\n").unwrap();
+        let ctx = temp_ctx(&root);
+        let call = ToolCall::new(
+            "read_files",
+            json!({ "paths": ["a.md", "nope.md"] }),
+        );
+        let result = ReadFilesTool.execute(&ctx, &call).unwrap();
+        assert_eq!(
+            result.content["status"].as_str(),
+            Some("partial"),
+            "got: {:?}",
+            result.content
+        );
+        assert_eq!(result.content["succeeded"].as_u64(), Some(1));
+        assert_eq!(result.content["failed"].as_u64(), Some(1));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_files_caps_path_count() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let ctx = temp_ctx(&root);
+        let paths: Vec<String> = (0..12).map(|i| format!("file{i}.md")).collect();
+        let call = ToolCall::new("read_files", json!({ "paths": paths }));
+        let result = ReadFilesTool.execute(&ctx, &call).unwrap();
+        assert!(!result.ok);
+        assert!(
+            result.content["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("capped"),
+            "got: {:?}",
+            result.content
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registry_exposes_read_files() {
+        let registry = seed_registry();
+        assert!(registry.names().contains(&"read_files"));
+    }
+
+    #[test]
+    fn spawn_subagent_map_rejects_empty_task_list() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext::with_cwd(&root);
+        let call = ToolCall::new("spawn_subagent_map", json!({ "tasks": [] }));
+        let result = SpawnSubagentMapTool.execute(&ctx, &call).unwrap();
+        assert!(!result.ok);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registry_exposes_spawn_subagent_map_and_nudge() {
+        let registry = seed_registry();
+        let names = registry.names();
+        assert!(names.contains(&"spawn_subagent_map"));
+        assert!(names.contains(&"subagent_nudge"));
+    }
+
+    #[test]
+    fn subagent_nudge_writes_requested_files() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext::with_cwd(&root);
+        let target = root.join("subagent").join("abc");
+        fs::create_dir_all(&target).unwrap();
+        let call = ToolCall::new(
+            "subagent_nudge",
+            json!({ "target": target, "key_info": "do this next" }),
+        );
+        let result = SubagentNudgeTool.execute(&ctx, &call).unwrap();
+        assert!(result.ok);
+        assert!(target.join(SUBAGENT_SIGNAL_KEYINFO).is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn subagent_nudge_requires_at_least_one_signal() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext::with_cwd(&root);
+        let target = root.join("subagent").join("abc");
+        fs::create_dir_all(&target).unwrap();
+        let call = ToolCall::new("subagent_nudge", json!({ "target": target }));
+        let result = SubagentNudgeTool.execute(&ctx, &call).unwrap();
+        assert!(!result.ok);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ask_user_refuses_when_stdin_is_not_a_tty() {
+        let root = temp_root();
+        let ctx = temp_ctx(&root);
+        let call = ToolCall::new("ask_user", json!({ "question": "ok?" }));
+        let result = AskUserTool.execute(&ctx, &call).unwrap();
+        assert!(!result.ok);
+        let message = result.content["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("terminal") || message.contains("interactive"),
+            "got: {message}"
+        );
     }
 
     #[test]
@@ -1770,6 +2823,128 @@ mod tests {
     }
 
     #[test]
+    fn plan_list_tool_returns_counts_and_plans() {
+        let root = temp_root();
+        let ctx = temp_ctx(&root);
+        let empty = PlanListTool
+            .execute(&ctx, &ToolCall::new("plan_list", json!({})))
+            .unwrap();
+        assert!(empty.ok);
+        assert_eq!(empty.content["total_count"], json!(0));
+
+        PlanCreateTool
+            .execute(
+                &ctx,
+                &ToolCall::new(
+                    "plan_create",
+                    json!({
+                        "title": "List Tool",
+                        "task": "Task",
+                        "steps": ["Do one"]
+                    }),
+                ),
+            )
+            .unwrap();
+        let result = PlanListTool
+            .execute(&ctx, &ToolCall::new("plan_list", json!({"limit": 1})))
+            .unwrap();
+
+        assert!(result.ok);
+        assert_eq!(result.content["total_count"], json!(1));
+        assert_eq!(result.content["shown_count"], json!(1));
+        assert_eq!(
+            result.content["plans"][0]["state"]["title"],
+            json!("List Tool")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_create_accepts_goal_and_items_aliases() {
+        let root = temp_root();
+        let ctx = temp_ctx(&root);
+        let result = PlanCreateTool
+            .execute(
+                &ctx,
+                &ToolCall::new(
+                    "plan_create",
+                    json!({
+                        "goal": "优化当前项目：选择一个小而高价值的改进点。",
+                        "items": ["Inspect code", "Implement change"]
+                    }),
+                ),
+            )
+            .unwrap();
+
+        assert!(result.ok);
+        assert_eq!(
+            result.content["plan"]["state"]["title"],
+            json!("优化当前项目：选择一个小而高价值的改进点")
+        );
+        assert_eq!(
+            result.content["plan"]["state"]["task"],
+            json!("优化当前项目：选择一个小而高价值的改进点。")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_tools_accept_common_plan_id_aliases() {
+        let root = temp_root();
+        let ctx = temp_ctx(&root);
+        let created = PlanCreateTool
+            .execute(
+                &ctx,
+                &ToolCall::new(
+                    "plan_create",
+                    json!({
+                        "title": "Alias Plan",
+                        "task": "Task",
+                        "steps": ["Do one"]
+                    }),
+                ),
+            )
+            .unwrap();
+        let plan_id = created.content["plan"]["state"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let next = PlanNextTool
+            .execute(
+                &ctx,
+                &ToolCall::new("plan_next", json!({ "plan_id": plan_id.clone() })),
+            )
+            .unwrap();
+        assert_eq!(next.content["plan_id"], json!(plan_id));
+
+        let complete = PlanCompleteTool
+            .execute(
+                &ctx,
+                &ToolCall::new(
+                    "plan_complete",
+                    json!({ "plan_id": plan_id.clone(), "item_index": 1 }),
+                ),
+            )
+            .unwrap();
+        assert!(complete.ok);
+        assert!(
+            complete.content["plan"]["items"][0]["checked"]
+                .as_bool()
+                .unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn truncate_middle_does_not_split_utf8() {
+        let input = "优化当前的项目".repeat(80);
+        let output = truncate_middle(&input, 17);
+
+        assert!(output.contains("[omitted long output]"));
+    }
+
+    #[test]
     fn repoprompt_routing_defaults_to_cwd_for_workspace_tools() {
         let root = temp_root();
         let ctx = temp_ctx(&root);
@@ -1789,6 +2964,16 @@ mod tests {
         ));
         assert!(!default_cwd_for_repoprompt_exec("workspace list"));
         assert!(default_cwd_for_repoprompt_exec("search \"TODO\""));
+    }
+
+    #[test]
+    fn repoprompt_exec_accepts_cmd_alias() {
+        let args: RepoPromptExecArgs = serde_json::from_value(json!({
+            "cmd": "tree --mode folders"
+        }))
+        .unwrap();
+
+        assert_eq!(args.command, "tree --mode folders");
     }
 
     #[test]

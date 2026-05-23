@@ -116,10 +116,10 @@ impl CodexAppServerConfig {
     }
 
     fn discover_mcp_server_names(&self) -> Result<Vec<String>> {
-        if !self.plugins_enabled {
-            if let Ok(names) = discover_mcp_server_names_from_config() {
-                return Ok(names);
-            }
+        if !self.plugins_enabled
+            && let Ok(names) = discover_mcp_server_names_from_config()
+        {
+            return Ok(names);
         }
         self.discover_mcp_server_names_from_cli()
     }
@@ -257,10 +257,21 @@ impl CodexAppServerClient {
     }
 
     pub fn run_prompt(&mut self, prompt: &str) -> Result<CodexRunResult> {
+        self.run_prompt_streaming(prompt, |_| {})
+    }
+
+    pub fn run_prompt_streaming<F>(
+        &mut self,
+        prompt: &str,
+        mut on_delta: F,
+    ) -> Result<CodexRunResult>
+    where
+        F: FnMut(&str),
+    {
         self.ensure_ready()?;
         let thread_id = self.start_thread()?;
         let turn_id = self.start_turn(&thread_id, prompt)?;
-        self.stream_turn(thread_id, turn_id)
+        self.stream_turn(thread_id, turn_id, &mut on_delta)
     }
 
     pub fn ensure_ready(&mut self) -> Result<()> {
@@ -398,7 +409,12 @@ impl CodexAppServerClient {
             .context("turn/start response did not include turn.id")
     }
 
-    fn stream_turn(&mut self, thread_id: String, turn_id: String) -> Result<CodexRunResult> {
+    fn stream_turn(
+        &mut self,
+        thread_id: String,
+        turn_id: String,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<CodexRunResult> {
         let deadline = Instant::now() + Duration::from_secs(self.cfg.turn_timeout_secs);
         let mut text = String::new();
         let mut events_seen = 0usize;
@@ -417,6 +433,7 @@ impl CodexAppServerClient {
                 "item/agentMessage/delta" if matches_turn(params, &thread_id, &turn_id) => {
                     if let Some(delta) = params.get("delta").and_then(Value::as_str) {
                         text.push_str(delta);
+                        on_delta(delta);
                     }
                 }
                 "turn/completed" if message_mentions_turn(params, &turn_id) => {

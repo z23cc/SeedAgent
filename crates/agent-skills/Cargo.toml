@@ -9,8 +9,10 @@ rust-version.workspace = true
 [dependencies]
 agent-core.workspace = true
 agent-memory.workspace = true
+agent-repoprompt.workspace = true
 agent-session.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true

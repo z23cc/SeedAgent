@@ -7,3 +7,5 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+reedline.workspace = true

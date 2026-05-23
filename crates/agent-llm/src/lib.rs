@@ -39,6 +39,7 @@ impl ProviderId {
     pub const GOOGLE: &'static str = "google";
     pub const OPENCODE: &'static str = "opencode";
     pub const CODEX: &'static str = "codex";
+    pub const REPOPROMPT_ORACLE: &'static str = "repoprompt_oracle";
 
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -585,10 +586,10 @@ fn responses_role(role: &ChatRole) -> &'static str {
 }
 
 pub fn extract_response_text(raw: &Value) -> Option<String> {
-    if let Some(text) = raw.get("output_text").and_then(Value::as_str) {
-        if !text.is_empty() {
-            return Some(text.to_string());
-        }
+    if let Some(text) = raw.get("output_text").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        return Some(text.to_string());
     }
 
     let mut chunks = Vec::new();

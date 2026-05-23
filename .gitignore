@@ -5,6 +5,7 @@
 
 # Runtime traces are useful locally but noisy in git.
 /sessions/*.jsonl
+/sessions/.seed_history
 
 # Generated memory/search artifacts can contain local paths and session summaries.
 /memory/index.json
@@ -14,3 +15,12 @@
 # Local smoke skills generated from one-off sessions.
 /skills/first-shell-smoke/
 /skills/find-a-shell-related-skill-fetch-it-then-summarize-it-in-one-sen/
+
+# Per-run plan state — created by plan_create, timestamps rot in git, treat
+# like sessions/.
+/plans/
+
+# External reference codebases (forgecode, GenericAgent, …) cloned under ref/
+# for the agent to read. They are not part of this project and can be very
+# large (multi-GB), so always local-only.
+/ref/

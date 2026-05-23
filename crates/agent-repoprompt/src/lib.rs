@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
@@ -9,6 +9,24 @@ use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 use wait_timeout::ChildExt;
+
+/// Library error surface for `agent-repoprompt`. The dominant failure mode
+/// at the API boundary is "the CLI isn't reachable / mis-installed" — the
+/// `CliUnavailable` variant makes that pattern-matchable so callers can
+/// gracefully degrade (e.g. the run-loop disables the oracle planner instead
+/// of erroring out).
+#[derive(Debug, thiserror::Error)]
+pub enum RepoPromptError {
+    /// `check_available` failed (binary missing, version mismatch, etc).
+    /// The inner string is the underlying CLI's stderr or our probe message.
+    #[error("RepoPrompt CLI unavailable: {reason}")]
+    CliUnavailable { reason: String },
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+pub type RepoPromptResult<T> = std::result::Result<T, RepoPromptError>;
 
 pub const DEFAULT_REPOPROMPT_CLI: &str = "repoprompt_cli";
 
@@ -258,32 +276,256 @@ impl RepoPromptClient {
         &self.cfg
     }
 
-    pub fn check_available(&self) -> Result<()> {
+    pub fn check_available(&self) -> RepoPromptResult<()> {
         let path = &self.cfg.cli_path;
         if !path.is_file() {
-            bail!("RepoPrompt CLI not found: {}", path.display());
+            return Err(RepoPromptError::CliUnavailable {
+                reason: format!("CLI not found: {}", path.display()),
+            });
         }
         Ok(())
     }
 
-    pub fn exec(&self, command: &str) -> Result<RepoPromptOutput> {
+    pub fn exec(&self, command: &str) -> RepoPromptResult<RepoPromptOutput> {
         self.check_available()?;
         let args = self.args_for_exec(command);
-        self.run(args)
+        Ok(self.run(args)?)
     }
 
-    pub fn call_tool(&self, tool: RepoPromptTool, args: &Value) -> Result<RepoPromptOutput> {
+    pub fn build_context(
+        &self,
+        instructions: &str,
+        response_type: BuilderResponseType,
+        export_response: bool,
+    ) -> RepoPromptResult<ContextBuilderResponse> {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "instructions".to_string(),
+            Value::String(instructions.to_string()),
+        );
+        payload.insert(
+            "response_type".to_string(),
+            Value::String(response_type.as_str().to_string()),
+        );
+        if export_response {
+            payload.insert("export_response".to_string(), Value::Bool(true));
+        }
+        let mut cfg = self.cfg.clone();
+        cfg.raw_json = true;
+        // Builder calls take 30s–5min per RepoPrompt docs; ensure we don't truncate.
+        if cfg.timeout_secs < 600 {
+            cfg.timeout_secs = 600;
+        }
+        let raw_client = RepoPromptClient::new(cfg);
+        let output =
+            raw_client.call_tool(RepoPromptTool::ContextBuilder, &Value::Object(payload))?;
+        Ok(ContextBuilderResponse::from_output(output))
+    }
+
+    pub fn send_oracle(
+        &self,
+        message: &str,
+        mode: OracleMode,
+        chat_id: Option<&str>,
+        new_chat: bool,
+    ) -> RepoPromptResult<OracleResponse> {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "message".to_string(),
+            Value::String(message.to_string()),
+        );
+        payload.insert(
+            "mode".to_string(),
+            Value::String(mode.as_str().to_string()),
+        );
+        if let Some(id) = chat_id {
+            payload.insert("chat_id".to_string(), Value::String(id.to_string()));
+        }
+        if new_chat {
+            payload.insert("new_chat".to_string(), Value::Bool(true));
+        }
+        let mut cfg = self.cfg.clone();
+        cfg.raw_json = true;
+        let raw_client = RepoPromptClient::new(cfg);
+        let output = raw_client.call_tool(RepoPromptTool::OracleSend, &Value::Object(payload))?;
+        Ok(OracleResponse::from_output(output))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BuilderResponseType {
+    Clarify,
+    Question,
+    Plan,
+    Review,
+}
+
+impl BuilderResponseType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BuilderResponseType::Clarify => "clarify",
+            BuilderResponseType::Question => "question",
+            BuilderResponseType::Plan => "plan",
+            BuilderResponseType::Review => "review",
+        }
+    }
+}
+
+impl FromStr for BuilderResponseType {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "clarify" => Ok(Self::Clarify),
+            "question" => Ok(Self::Question),
+            "plan" => Ok(Self::Plan),
+            "review" => Ok(Self::Review),
+            other => Err(format!("unknown builder response_type: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextBuilderResponse {
+    pub response_text: String,
+    pub chat_id: Option<String>,
+    pub oracle_export_path: Option<PathBuf>,
+    pub raw_output: RepoPromptOutput,
+}
+
+impl ContextBuilderResponse {
+    pub fn from_output(output: RepoPromptOutput) -> Self {
+        let json = output.json.as_ref();
+        let response_text = extract_response_text(json, &output.stdout);
+        let chat_id = json
+            .and_then(|value| value.get("chat_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let oracle_export_path = json
+            .and_then(|value| value.get("oracle_export_path"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        Self {
+            response_text,
+            chat_id,
+            oracle_export_path,
+            raw_output: output,
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        if self.raw_output.timed_out || self.raw_output.exit_code != Some(0) {
+            return false;
+        }
+        if json_signals_error(self.raw_output.json.as_ref()) {
+            return false;
+        }
+        true
+    }
+
+    pub fn error_message(&self) -> Option<&str> {
+        self.raw_output
+            .json
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OracleMode {
+    Chat,
+    Plan,
+    Edit,
+    Review,
+}
+
+impl OracleMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OracleMode::Chat => "chat",
+            OracleMode::Plan => "plan",
+            OracleMode::Edit => "edit",
+            OracleMode::Review => "review",
+        }
+    }
+}
+
+impl FromStr for OracleMode {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chat" => Ok(Self::Chat),
+            "plan" => Ok(Self::Plan),
+            "edit" => Ok(Self::Edit),
+            "review" => Ok(Self::Review),
+            other => Err(format!("unknown oracle mode: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OracleResponse {
+    pub response_text: String,
+    pub chat_id: Option<String>,
+    pub oracle_export_path: Option<PathBuf>,
+    pub raw_output: RepoPromptOutput,
+}
+
+impl OracleResponse {
+    pub fn from_output(output: RepoPromptOutput) -> Self {
+        let json = output.json.as_ref();
+        let response_text = extract_response_text(json, &output.stdout);
+        let chat_id = json
+            .and_then(|value| value.get("chat_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let oracle_export_path = json
+            .and_then(|value| value.get("oracle_export_path"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        Self {
+            response_text,
+            chat_id,
+            oracle_export_path,
+            raw_output: output,
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        if self.raw_output.timed_out || self.raw_output.exit_code != Some(0) {
+            return false;
+        }
+        if json_signals_error(self.raw_output.json.as_ref()) {
+            return false;
+        }
+        true
+    }
+
+    pub fn error_message(&self) -> Option<&str> {
+        self.raw_output
+            .json
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+    }
+}
+
+impl RepoPromptClient {
+
+    pub fn call_tool(&self, tool: RepoPromptTool, args: &Value) -> RepoPromptResult<RepoPromptOutput> {
         self.check_available()?;
         let args = self.args_for_call(tool, args)?;
-        self.run(args)
+        Ok(self.run(args)?)
     }
 
-    pub fn describe_tool(&self, tool: RepoPromptTool) -> Result<RepoPromptOutput> {
+    pub fn describe_tool(&self, tool: RepoPromptTool) -> RepoPromptResult<RepoPromptOutput> {
         self.check_available()?;
         let mut args = self.routing_args();
         args.push("--describe".to_string());
         args.push(tool.as_str().to_string());
-        self.run(args)
+        Ok(self.run(args)?)
     }
 
     pub fn args_for_exec(&self, command: &str) -> Vec<String> {
@@ -296,7 +538,7 @@ impl RepoPromptClient {
         args
     }
 
-    pub fn args_for_call(&self, tool: RepoPromptTool, args_json: &Value) -> Result<Vec<String>> {
+    pub fn args_for_call(&self, tool: RepoPromptTool, args_json: &Value) -> RepoPromptResult<Vec<String>> {
         let mut args = self.routing_args();
         if self.cfg.raw_json {
             args.push("--raw-json".to_string());
@@ -309,7 +551,7 @@ impl RepoPromptClient {
         args.push("--call".to_string());
         args.push(tool.as_str().to_string());
         args.push("--json".to_string());
-        args.push(serde_json::to_string(&payload)?);
+        args.push(serde_json::to_string(&payload).context("serialize tool args")?);
         Ok(args)
     }
 
@@ -359,7 +601,7 @@ impl RepoPromptClient {
 
         let stdout = out_handle.join().unwrap_or_default();
         let stderr = err_handle.join().unwrap_or_default();
-        let json = serde_json::from_str(stdout.trim()).ok();
+        let json = parse_repoprompt_json_payload(&stdout);
 
         Ok(RepoPromptOutput {
             stdout,
@@ -393,7 +635,7 @@ pub fn default_cli_path() -> PathBuf {
     PathBuf::from(DEFAULT_REPOPROMPT_CLI)
 }
 
-pub fn parse_args_json(text: &str) -> Result<Value> {
+pub fn parse_args_json(text: &str) -> RepoPromptResult<Value> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(Value::Object(Default::default()));
@@ -402,9 +644,11 @@ pub fn parse_args_json(text: &str) -> Result<Value> {
     if path.is_file() {
         let body =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        return serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()));
+        return Ok(
+            serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?,
+        );
     }
-    serde_json::from_str(trimmed).context("parse RepoPrompt args JSON")
+    Ok(serde_json::from_str(trimmed).context("parse RepoPrompt args JSON")?)
 }
 
 pub fn known_tools() -> Vec<RepoPromptToolInfo> {
@@ -412,6 +656,81 @@ pub fn known_tools() -> Vec<RepoPromptToolInfo> {
         .iter()
         .map(|tool| tool.info())
         .collect()
+}
+
+/// Parse the JSON payload out of the RepoPrompt CLI stdout. The CLI emits
+/// `[progress] ...` lines before the final JSON body, so we have to strip them.
+/// Returns None when no JSON object is present.
+pub fn parse_repoprompt_json_payload(stdout: &str) -> Option<Value> {
+    let candidate = stdout
+        .lines()
+        .rev()
+        .find(|line| {
+            let trimmed = line.trim();
+            (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        })
+        .map(str::trim)
+        .map(ToString::to_string)
+        .or_else(|| {
+            let cleaned: String = stdout
+                .lines()
+                .filter(|line| !line.trim().starts_with("[progress]"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let trimmed = cleaned.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })?;
+    serde_json::from_str(&candidate).ok()
+}
+
+/// Heuristic: the RepoPrompt CLI signals failure in-band via `{"error":"...","is_error":true}`
+/// even when the process exit code is 0. Treat that as a hard error.
+fn json_signals_error(json: Option<&Value>) -> bool {
+    json.and_then(|value| value.get("is_error"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || json.and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+            .is_some_and(|err| !err.trim().is_empty())
+}
+
+/// Try the known response field names. Returns a clear error sentinel when
+/// JSON was parsed but none of the known fields matched — so callers can detect
+/// API drift instead of silently parsing raw stdout as the model reply.
+fn extract_response_text(json: Option<&Value>, fallback_stdout: &str) -> String {
+    if let Some(value) = json {
+        for field in [
+            "response",
+            "text",
+            "message",
+            "assistant_message",
+            "plan",
+            "output",
+            "reply",
+        ] {
+            if let Some(text) = value.get(field).and_then(Value::as_str) {
+                return text.to_string();
+            }
+        }
+        // JSON parsed but no known field. Surface a structured error string so
+        // downstream parsers (e.g. parse_planned_action) fail loudly rather than
+        // attempting to parse the whole envelope as a planner action.
+        return format!(
+            "[repoprompt-response-error] none of the known response fields (response/text/message/assistant_message/plan/output/reply) were present; raw envelope keys: {}",
+            value
+                .as_object()
+                .map(|obj| obj.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_default()
+        );
+    }
+    // Last resort: when the CLI returned no parseable JSON at all, the raw
+    // stdout is the only signal we have.
+    fallback_stdout.trim().to_string()
 }
 
 #[cfg(test)]
@@ -426,6 +745,141 @@ mod tests {
         assert!(tools.iter().any(|tool| tool.name == "agent_run"));
         assert!(tools.iter().any(|tool| tool.name == "apply_edits"));
         assert!(tools.iter().any(|tool| tool.name == "workspace_context"));
+    }
+
+    #[test]
+    fn oracle_response_parses_common_field_shapes() {
+        let primary = RepoPromptOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            timed_out: false,
+            json: Some(json!({
+                "response": "hello world",
+                "chat_id": "chat-42",
+                "oracle_export_path": "/tmp/oracle.md",
+            })),
+        };
+        let parsed = OracleResponse::from_output(primary);
+        assert_eq!(parsed.response_text, "hello world");
+        assert_eq!(parsed.chat_id.as_deref(), Some("chat-42"));
+        assert_eq!(
+            parsed.oracle_export_path,
+            Some(PathBuf::from("/tmp/oracle.md"))
+        );
+        assert!(parsed.is_success());
+
+        let fallback_field = RepoPromptOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            timed_out: false,
+            json: Some(json!({ "text": "fallback" })),
+        };
+        assert_eq!(
+            OracleResponse::from_output(fallback_field).response_text,
+            "fallback"
+        );
+
+        let raw_only = RepoPromptOutput {
+            stdout: "raw answer\n".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            timed_out: false,
+            json: None,
+        };
+        assert_eq!(OracleResponse::from_output(raw_only).response_text, "raw answer");
+    }
+
+    #[test]
+    fn builder_response_round_trips_and_parses_export_path() {
+        for kind in [
+            BuilderResponseType::Clarify,
+            BuilderResponseType::Question,
+            BuilderResponseType::Plan,
+            BuilderResponseType::Review,
+        ] {
+            let parsed: BuilderResponseType = kind.as_str().parse().unwrap();
+            assert_eq!(parsed, kind);
+        }
+        assert!("nope".parse::<BuilderResponseType>().is_err());
+
+        let output = RepoPromptOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            timed_out: false,
+            json: Some(json!({
+                "response": "# Plan\n...",
+                "oracle_export_path": "/tmp/plan.md",
+                "chat_id": "chat-7",
+            })),
+        };
+        let parsed = ContextBuilderResponse::from_output(output);
+        assert_eq!(parsed.response_text, "# Plan\n...");
+        assert_eq!(
+            parsed.oracle_export_path,
+            Some(PathBuf::from("/tmp/plan.md"))
+        );
+        assert!(parsed.is_success());
+    }
+
+    #[test]
+    fn oracle_response_treats_in_band_is_error_as_failure() {
+        let output = RepoPromptOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            timed_out: false,
+            json: Some(json!({
+                "error": "Multiple windows detected",
+                "is_error": true,
+            })),
+        };
+        let parsed = OracleResponse::from_output(output);
+        assert!(!parsed.is_success(), "is_error=true must override exit_code=0");
+        assert_eq!(parsed.error_message(), Some("Multiple windows detected"));
+    }
+
+    #[test]
+    fn oracle_response_unknown_field_returns_structured_error() {
+        let output = RepoPromptOutput {
+            stdout: "{\"unexpected\":\"shape\"}".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            timed_out: false,
+            json: Some(json!({ "unexpected": "shape" })),
+        };
+        let parsed = OracleResponse::from_output(output);
+        assert!(
+            parsed.response_text.starts_with("[repoprompt-response-error]"),
+            "expected loud error, got: {}",
+            parsed.response_text
+        );
+        assert!(parsed.response_text.contains("unexpected"));
+    }
+
+    #[test]
+    fn parse_repoprompt_json_payload_strips_progress_lines() {
+        let stdout = "[progress] oracle_send: Starting Oracle...\n[progress] oracle_send: Oracle complete\n{\"chat_id\":\"abc\",\"response\":\"ok\"}\n";
+        let parsed = parse_repoprompt_json_payload(stdout).expect("payload present");
+        assert_eq!(parsed["chat_id"], "abc");
+        assert_eq!(parsed["response"], "ok");
+    }
+
+    #[test]
+    fn parse_repoprompt_json_payload_returns_none_for_empty() {
+        assert!(parse_repoprompt_json_payload("").is_none());
+        assert!(parse_repoprompt_json_payload("[progress] only\n").is_none());
+    }
+
+    #[test]
+    fn oracle_mode_round_trips() {
+        for mode in [OracleMode::Chat, OracleMode::Plan, OracleMode::Edit, OracleMode::Review] {
+            let parsed: OracleMode = mode.as_str().parse().unwrap();
+            assert_eq!(parsed, mode);
+        }
+        assert!("nope".parse::<OracleMode>().is_err());
     }
 
     #[test]

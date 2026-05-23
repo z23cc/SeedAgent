@@ -7,6 +7,24 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Library error surface for `agent-skills`.
+///
+/// The most useful pattern-matchable variant is `NotFound` — `seed skill fetch`
+/// translates it to "skill not in $skills_dir; try `seed skill list`" rather
+/// than the bare anyhow message. Everything else is `Other`.
+#[derive(Debug, thiserror::Error)]
+pub enum SkillError {
+    /// `fetch_skill` was asked for a name that doesn't exist under
+    /// `<skills_dir>/<name>/SKILL.md`.
+    #[error("skill not found: {name} (under {skills_dir})")]
+    NotFound { name: String, skills_dir: PathBuf },
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+pub type SkillResult<T> = std::result::Result<T, SkillError>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillInfo {
     pub name: String,
@@ -26,6 +44,150 @@ pub struct SkillInfo {
     pub autonomous_safe: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blast_radius: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repoprompt: Option<RepoPromptBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RepoPromptBinding {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_dirs: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
+}
+
+impl RepoPromptBinding {
+    pub fn is_empty(&self) -> bool {
+        self.working_dirs.is_empty()
+            && self.context_id.is_none()
+            && self.oracle_mode.is_none()
+            && self.workspace_name.is_none()
+    }
+}
+
+/// Query the RepoPrompt CLI for its current bind state and decode the
+/// `bind_context op=status` response into a `RepoPromptBinding`. Returns
+/// `None` if the CLI is missing, the call fails, or the binding is empty —
+/// callers treat that as "skill creation should not embed a binding".
+///
+/// Lives in agent-skills (not agent-cli) so the function and the type it
+/// produces stay together.
+pub fn query_current_repoprompt_binding() -> Option<RepoPromptBinding> {
+    let cli_path = agent_repoprompt::default_cli_path();
+    if !cli_path.is_file() {
+        return None;
+    }
+    let cfg = agent_repoprompt::RepoPromptClientConfig {
+        cli_path,
+        timeout_secs: 15,
+        raw_json: true,
+        ..Default::default()
+    };
+    let client = agent_repoprompt::RepoPromptClient::new(cfg);
+    let output = client
+        .call_tool(
+            agent_repoprompt::RepoPromptTool::BindContext,
+            &serde_json::json!({ "op": "status" }),
+        )
+        .ok()?;
+    if output.exit_code != Some(0) {
+        return None;
+    }
+    let json = output.json.as_ref()?;
+    parse_repoprompt_status(json).filter(|b| !b.is_empty())
+}
+
+/// Decode a `bind_context` response payload into a binding. Exposed for
+/// tests and for callers that already have the JSON in hand (e.g. when
+/// inspecting a cached response).
+pub fn parse_repoprompt_status(value: &serde_json::Value) -> Option<RepoPromptBinding> {
+    // Real RepoPrompt `bind_context op=status|bind` returns:
+    //   { "binding": {
+    //       "binding_kind": "unbound" | "window" | "tab",
+    //       "explicit": bool,
+    //       "repo_paths": [string],
+    //       "workspace_name": string?,
+    //       "workspace_id": string?,
+    //       "window_id": int?,
+    //     }, ... }
+    // The context_id only appears in `op=list` under windows[].tabs[].
+    let bind = value.get("binding").or_else(|| value.get("status"))?;
+    let binding_kind = bind
+        .get("binding_kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if binding_kind == "unbound" {
+        return None;
+    }
+    let workspace_name = bind
+        .get("workspace_name")
+        .or_else(|| bind.get("workspace"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let context_id = bind
+        .get("context_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let working_dirs = bind
+        .get("repo_paths")
+        .or_else(|| bind.get("working_dirs"))
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(RepoPromptBinding {
+        working_dirs,
+        context_id,
+        oracle_mode: None,
+        workspace_name,
+    })
+}
+
+#[cfg(test)]
+mod binding_status_tests {
+    use super::parse_repoprompt_status;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    #[test]
+    fn returns_none_for_unbound_binding() {
+        let v = json!({
+            "binding": {
+                "binding_kind": "unbound",
+                "explicit": false,
+                "repo_paths": [],
+                "run_scoped": false,
+            }
+        });
+        assert!(parse_repoprompt_status(&v).is_none());
+    }
+
+    #[test]
+    fn parses_real_bound_shape_from_repoprompt() {
+        let v = json!({
+            "binding": {
+                "binding_kind": "window",
+                "explicit": false,
+                "repo_paths": ["/Users/me/repo"],
+                "run_scoped": false,
+                "window_id": 2,
+                "workspace_id": "F7A857A5-4BDF-41C9-BCC0-B55D39753FBC",
+                "workspace_name": "seed-agent-rs"
+            },
+            "changed": true,
+        });
+        let parsed = parse_repoprompt_status(&v).expect("bound");
+        assert_eq!(parsed.workspace_name.as_deref(), Some("seed-agent-rs"));
+        assert_eq!(parsed.working_dirs, vec![PathBuf::from("/Users/me/repo")]);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,7 +285,7 @@ pub fn reflect_markdown(records: &[SessionRecord]) -> String {
                 checkpoints.push(line);
             }
             AgentEvent::RunFinished { summary, .. } => final_summary = Some(summary.clone()),
-            AgentEvent::Reflection { .. } => {}
+            AgentEvent::Reflection { .. } | AgentEvent::TurnTimings { .. } => {}
         }
     }
 
@@ -174,14 +336,24 @@ pub fn create_skill(
     skills_dir: impl AsRef<Path>,
     name: &str,
     records: &[SessionRecord],
-) -> Result<PathBuf> {
+) -> SkillResult<PathBuf> {
+    create_skill_with_binding(skills_dir, name, records, None)
+}
+
+pub fn create_skill_with_binding(
+    skills_dir: impl AsRef<Path>,
+    name: &str,
+    records: &[SessionRecord],
+    binding: Option<&RepoPromptBinding>,
+) -> SkillResult<PathBuf> {
     let slug = slugify(name);
     let dir = skills_dir.as_ref().join(&slug);
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("SKILL.md");
     let reflection = reflect_markdown(records);
+    let frontmatter = render_binding_frontmatter(name, binding);
     let body = format!(
-        r#"# {name}
+        r#"{frontmatter}# {name}
 
 Use this skill when a future task matches the verified pattern below.
 
@@ -197,11 +369,48 @@ Only carry forward facts that were verified by successful tool calls. Do not sto
     Ok(path)
 }
 
+fn render_binding_frontmatter(name: &str, binding: Option<&RepoPromptBinding>) -> String {
+    let Some(binding) = binding else {
+        return String::new();
+    };
+    if binding.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("---\n");
+    out.push_str(&format!("name: {name}\n"));
+    if let Some(ws) = &binding.workspace_name {
+        out.push_str(&format!("repoprompt_workspace_name: {ws}\n"));
+    }
+    if let Some(ctx) = &binding.context_id {
+        out.push_str(&format!("repoprompt_context_id: {ctx}\n"));
+    }
+    if let Some(mode) = &binding.oracle_mode {
+        out.push_str(&format!("repoprompt_oracle_mode: {mode}\n"));
+    }
+    if !binding.working_dirs.is_empty() {
+        out.push_str("repoprompt_working_dirs:\n");
+        for dir in &binding.working_dirs {
+            out.push_str(&format!("  - {}\n", dir.display()));
+        }
+    }
+    out.push_str("---\n\n");
+    out
+}
+
 pub fn consolidate_skill(
     skills_dir: impl AsRef<Path>,
     name_hint: &str,
     records: &[SessionRecord],
-) -> Result<SkillConsolidation> {
+) -> SkillResult<SkillConsolidation> {
+    consolidate_skill_with_binding(skills_dir, name_hint, records, None)
+}
+
+pub fn consolidate_skill_with_binding(
+    skills_dir: impl AsRef<Path>,
+    name_hint: &str,
+    records: &[SessionRecord],
+    binding: Option<&RepoPromptBinding>,
+) -> SkillResult<SkillConsolidation> {
     let skills_dir = skills_dir.as_ref();
     let run = RunLearningContext::from_records(records);
     let candidates = list_skill_infos(skills_dir)?;
@@ -218,7 +427,7 @@ pub fn consolidate_skill(
         });
     }
 
-    let path = create_skill(skills_dir, name_hint, records)?;
+    let path = create_skill_with_binding(skills_dir, name_hint, records, binding)?;
     let skill_name = path
         .parent()
         .and_then(Path::file_name)
@@ -233,7 +442,7 @@ pub fn consolidate_skill(
     })
 }
 
-pub fn list_skill_infos(skills_dir: impl AsRef<Path>) -> Result<Vec<SkillInfo>> {
+pub fn list_skill_infos(skills_dir: impl AsRef<Path>) -> SkillResult<Vec<SkillInfo>> {
     let skills_dir = skills_dir.as_ref();
     if !skills_dir.exists() {
         return Ok(Vec::new());
@@ -243,7 +452,7 @@ pub fn list_skill_infos(skills_dir: impl AsRef<Path>) -> Result<Vec<SkillInfo>> 
     for entry in
         fs::read_dir(skills_dir).with_context(|| format!("read {}", skills_dir.display()))?
     {
-        let entry = entry?;
+        let entry = entry.context("read directory entry")?;
         let path = entry.path();
         let skill_path = if path.is_dir() {
             path.join("SKILL.md")
@@ -267,7 +476,7 @@ pub fn search_skill_infos(
     skills_dir: impl AsRef<Path>,
     query: &str,
     limit: usize,
-) -> Result<Vec<SkillInfo>> {
+) -> SkillResult<Vec<SkillInfo>> {
     let query_terms = terms(query);
     if query_terms.is_empty() {
         return Ok(list_skill_infos(skills_dir)?
@@ -300,7 +509,7 @@ pub fn search_skill_infos(
         .collect())
 }
 
-pub fn fetch_skill(skills_dir: impl AsRef<Path>, name: &str) -> Result<SkillDocument> {
+pub fn fetch_skill(skills_dir: impl AsRef<Path>, name: &str) -> SkillResult<SkillDocument> {
     let skills_dir = skills_dir.as_ref();
     let wanted = name.trim();
     let wanted_slug = slugify(wanted);
@@ -311,7 +520,10 @@ pub fn fetch_skill(skills_dir: impl AsRef<Path>, name: &str) -> Result<SkillDocu
             return Ok(SkillDocument { info, body });
         }
     }
-    anyhow::bail!("skill not found: {name}")
+    Err(SkillError::NotFound {
+        name: name.to_string(),
+        skills_dir: skills_dir.to_path_buf(),
+    })
 }
 
 pub fn route_repoprompt_skill(task: &str) -> Option<RepoPromptSkillRoute> {
@@ -412,7 +624,7 @@ pub fn route_repoprompt_skill(task: &str) -> Option<RepoPromptSkillRoute> {
 pub fn load_routed_repoprompt_skill(
     skills_dir: impl AsRef<Path>,
     task: &str,
-) -> Result<Option<RoutedSkill>> {
+) -> SkillResult<Option<RoutedSkill>> {
     let Some(route) = route_repoprompt_skill(task) else {
         return Ok(None);
     };
@@ -491,6 +703,7 @@ fn skill_info_from_body(skills_dir: &Path, path: PathBuf, body: &str) -> SkillIn
         .unwrap_or_else(default_autonomous_safe);
     let blast_radius =
         front_matter.and_then(|front_matter| front_matter_value(front_matter, "blast_radius"));
+    let repoprompt = front_matter.and_then(parse_repoprompt_binding);
     let mut tags = BTreeSet::new();
     if let Some(front_matter) = front_matter {
         for tag in front_matter_list(front_matter, "tags") {
@@ -532,7 +745,25 @@ fn skill_info_from_body(skills_dir: &Path, path: PathBuf, body: &str) -> SkillIn
         preferred_backend,
         autonomous_safe,
         blast_radius,
+        repoprompt,
     }
+}
+
+fn parse_repoprompt_binding(front_matter: &str) -> Option<RepoPromptBinding> {
+    let working_dirs = front_matter_list(front_matter, "repoprompt_working_dirs")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let context_id = front_matter_value(front_matter, "repoprompt_context_id");
+    let oracle_mode = front_matter_value(front_matter, "repoprompt_oracle_mode");
+    let workspace_name = front_matter_value(front_matter, "repoprompt_workspace_name");
+    let binding = RepoPromptBinding {
+        working_dirs,
+        context_id,
+        oracle_mode,
+        workspace_name,
+    };
+    if binding.is_empty() { None } else { Some(binding) }
 }
 
 fn split_front_matter(body: &str) -> (Option<&str>, &str) {
@@ -724,7 +955,7 @@ impl RunLearningContext {
                         checkpoints.push(evidence.clone());
                     }
                 }
-                AgentEvent::ToolFinished { .. } => {}
+                AgentEvent::ToolFinished { .. } | AgentEvent::TurnTimings { .. } => {}
             }
         }
         let tools = tools.into_iter().collect::<Vec<_>>();
@@ -880,7 +1111,7 @@ fn meaningful_terms(input: &str) -> Vec<String> {
 fn compact_inline(text: &str, limit: usize) -> String {
     let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if text.len() > limit {
-        text.truncate(limit);
+        truncate_utf8(&mut text, limit);
         text.push_str(" ...");
     }
     text.replace('`', "'")
@@ -891,8 +1122,35 @@ fn compact_json(value: &serde_json::Value) -> String {
     if text.len() <= 240 {
         text
     } else {
-        format!("{} ... {}", &text[..120], &text[text.len() - 80..])
+        format!("{} ... {}", safe_prefix(&text, 120), safe_suffix(&text, 80))
     }
+}
+
+fn truncate_utf8(text: &mut String, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
+fn safe_prefix(text: &str, limit: usize) -> &str {
+    let mut end = limit.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn safe_suffix(text: &str, limit: usize) -> &str {
+    let mut start = text.len().saturating_sub(limit);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 fn bullet_list(items: impl IntoIterator<Item = String>) -> String {
@@ -978,6 +1236,38 @@ mod tests {
     }
 
     #[test]
+    fn reads_repoprompt_binding_block() {
+        let root = std::env::temp_dir().join(format!("seed-skill-rp-bind-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("with-binding")).unwrap();
+        fs::write(
+            root.join("with-binding").join("SKILL.md"),
+            "---\nname: With Binding\ndescription: bound\nrepoprompt_workspace_name: seed-agent-rs\nrepoprompt_context_id: ctx_abc123\nrepoprompt_oracle_mode: plan\nrepoprompt_working_dirs:\n  - /Users/me/repo\n---\n\nbody\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("no-binding")).unwrap();
+        fs::write(
+            root.join("no-binding").join("SKILL.md"),
+            "---\nname: No Binding\ndescription: plain\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        let infos = list_skill_infos(&root).unwrap();
+        let with = infos.iter().find(|i| i.name == "With Binding").unwrap();
+        let plain = infos.iter().find(|i| i.name == "No Binding").unwrap();
+        let bind = with.repoprompt.as_ref().unwrap();
+        assert_eq!(bind.context_id.as_deref(), Some("ctx_abc123"));
+        assert_eq!(bind.oracle_mode.as_deref(), Some("plan"));
+        assert_eq!(bind.workspace_name.as_deref(), Some("seed-agent-rs"));
+        assert_eq!(
+            bind.working_dirs,
+            vec![PathBuf::from("/Users/me/repo")]
+        );
+        assert!(plain.repoprompt.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn routes_repoprompt_skills_by_task_intent() {
         assert_eq!(
             route_repoprompt_skill("帮我实现新的计划流程").unwrap().slug,
@@ -1037,6 +1327,18 @@ mod tests {
         assert_eq!(result.decision, SkillConsolidationDecision::Created);
         assert!(result.path.is_file());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compact_helpers_do_not_split_utf8() {
+        let inline = compact_inline("优化 当前 的 项目 优化 当前 的 项目", 13);
+        assert!(inline.ends_with(" ..."));
+
+        let value = serde_json::json!({
+            "result": "优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目优化当前的项目"
+        });
+        let text = compact_json(&value);
+        assert!(text.contains(" ... "));
     }
 
     fn learning_records(goal: &str, tool_name: &str) -> Vec<SessionRecord> {
