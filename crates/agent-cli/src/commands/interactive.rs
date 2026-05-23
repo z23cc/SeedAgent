@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use agent_session::SessionStore;
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::commands::run::{PlannerProvider, ProviderSpec, RunGoalArgs, RunPolicy, run_goal};
 use crate::commands::skill::print_skill_infos;
@@ -60,12 +60,87 @@ struct ReplState {
     last_goal: Option<String>,
 }
 
+/// Single source of truth for "where the agent thinks it is" during a REPL
+/// session. Codex picks this up at next `start_turn` (via the per-turn
+/// `cwd` field documented as "Override the working directory for this turn
+/// and subsequent turns"). RepoPrompt picks it up lazily on the next
+/// `repoprompt_*` tool call (see `agent-tools::default_repoprompt_working_dirs`).
+///
+/// Mutated by `/cd <path>` and (RF24-5) by skill autobind. Read by `run_goal`
+/// at the top of each REPL iteration to pass as the run's cwd.
+#[derive(Debug, Clone)]
+pub(crate) struct SeedWorkspace {
+    pub(crate) cwd: PathBuf,
+    /// What RepoPrompt was last told to bind to. `None` means "we never
+    /// pushed a binding from this REPL" — the lazy-align layer can still
+    /// inspect RepoPrompt's actual state if needed. Used to avoid
+    /// re-calling `bind_context` when nothing changed.
+    pub(crate) repoprompt_bound: Option<Vec<PathBuf>>,
+}
+
+impl SeedWorkspace {
+    pub(crate) fn new(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            repoprompt_bound: None,
+        }
+    }
+
+    /// Update the cwd. Caller is expected to flush downstream effects
+    /// (Codex `set_cwd`, RepoPrompt rebind) lazily on the next op.
+    /// Returns the previous cwd so callers can show "OLD → NEW".
+    pub(crate) fn set_cwd(&mut self, new_cwd: PathBuf) -> PathBuf {
+        // Invalidate the RP binding cache — a different cwd means the next
+        // RP call should re-bind even if the bound vector technically matched
+        // (different working_dirs[0] = different context).
+        self.repoprompt_bound = None;
+        std::mem::replace(&mut self.cwd, new_cwd)
+    }
+}
+
+/// Resolve a user-supplied `/cd` target into an absolute, canonicalized
+/// directory path.
+///
+/// Supports:
+///   - `~` and `~/...` (tilde expansion via `$HOME`)
+///   - relative paths (joined against the current REPL cwd)
+///   - absolute paths
+///
+/// Validates that the target exists and is a directory.
+pub(crate) fn resolve_cd_target(target: &str, current_cwd: &Path) -> Result<PathBuf> {
+    let expanded: PathBuf = if target == "~" {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(target))
+    } else if let Some(rest) = target.strip_prefix("~/") {
+        match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(rest),
+            None => PathBuf::from(target),
+        }
+    } else {
+        PathBuf::from(target)
+    };
+    let abs = if expanded.is_absolute() {
+        expanded
+    } else {
+        current_cwd.join(expanded)
+    };
+    let canonical = abs
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", abs.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("not a directory: {}", canonical.display());
+    }
+    Ok(canonical)
+}
+
 pub(crate) fn run_interactive(
     cli: &Cli,
     store: &SessionStore,
     mut args: InteractiveArgs,
 ) -> Result<()> {
-    let cwd = args.cwd.clone().unwrap_or(env::current_dir()?);
+    let initial_cwd = args.cwd.clone().unwrap_or(env::current_dir()?);
+    let mut workspace = SeedWorkspace::new(initial_cwd);
     std::fs::create_dir_all(&cli.sessions_dir)?;
     let history_path = cli.sessions_dir.join(".seed_history");
     let mut repl = agent_tui::Repl::new(history_path);
@@ -81,7 +156,7 @@ pub(crate) fn run_interactive(
     agent_tui::print_banner();
     loop {
         let prompt = agent_tui::PromptState::new(
-            cwd.clone(),
+            workspace.cwd.clone(),
             mode,
             args.provider.clone(),
             args.model.clone(),
@@ -93,13 +168,20 @@ pub(crate) fn run_interactive(
                 // and prints its output. Must precede the slash dispatcher so
                 // `!` is not mistaken for an unknown command.
                 if let Some(rest) = input.strip_prefix(agent_tui::SHELL_ESCAPE_PREFIX) {
-                    if let Err(err) = run_shell_escape(&cwd, rest.trim()) {
+                    if let Err(err) = run_shell_escape(&workspace.cwd, rest.trim()) {
                         agent_tui::print_error(err);
                     }
                     continue;
                 }
 
-                if handle_interactive_command(cli, store, &mut args, &mut state, &cwd, &input)? {
+                if handle_interactive_command(
+                    cli,
+                    store,
+                    &mut args,
+                    &mut state,
+                    &mut workspace,
+                    &input,
+                )? {
                     break;
                 }
 
@@ -111,7 +193,7 @@ pub(crate) fn run_interactive(
                 if let Err(err) = run_goal(RunGoalArgs {
                     store,
                     goal: input,
-                    cwd: Some(cwd.clone()),
+                    cwd: Some(workspace.cwd.clone()),
                     use_llm: !args.record_only && !args.codex,
                     use_codex: args.codex,
                     learn: args.learn,
@@ -147,7 +229,7 @@ fn handle_interactive_command(
     store: &SessionStore,
     args: &mut InteractiveArgs,
     state: &mut ReplState,
-    cwd: &Path,
+    workspace: &mut SeedWorkspace,
     input: &str,
 ) -> Result<bool> {
     let trimmed = input.trim();
@@ -191,15 +273,15 @@ fn handle_interactive_command(
             Ok(false)
         }
         "/memory" => {
-            handle_memory_command(cli, cwd, rest)?;
+            handle_memory_command(cli, &workspace.cwd, rest)?;
             Ok(false)
         }
         "/plan" => {
-            handle_plan_command(cwd, rest)?;
+            handle_plan_command(&workspace.cwd, rest)?;
             Ok(false)
         }
         "/plans" => {
-            handle_plans_command(cwd)?;
+            handle_plans_command(&workspace.cwd)?;
             Ok(false)
         }
         "/dump" => {
@@ -207,7 +289,7 @@ fn handle_interactive_command(
             Ok(false)
         }
         "/compact" => {
-            handle_compact_command(cli, cwd)?;
+            handle_compact_command(cli, &workspace.cwd)?;
             Ok(false)
         }
         "/new" => {
@@ -215,7 +297,11 @@ fn handle_interactive_command(
             Ok(false)
         }
         "/retry" => {
-            handle_retry_command(cli, store, args, state, cwd)?;
+            handle_retry_command(cli, store, args, state, &workspace.cwd)?;
+            Ok(false)
+        }
+        "/cd" => {
+            handle_cd_command(workspace, rest);
             Ok(false)
         }
         cmd if cmd.starts_with('/') => {
@@ -548,6 +634,39 @@ fn handle_compact_command(cli: &Cli, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+// --- /cd ---------------------------------------------------------------------
+
+/// `/cd [<path>]` — change the REPL workspace cwd.
+///
+/// Empty arg prints the current cwd. A valid path updates `workspace.cwd`;
+/// both Codex and RepoPrompt pick it up on their next op:
+///   - Codex via per-turn `TurnStartParams.cwd` (always read fresh from
+///     `CodexAppServerConfig.cwd`, set at `run_goal` construction time).
+///   - RepoPrompt via `default_repoprompt_working_dirs(ctx.cwd)` and (RF24-5)
+///     the lazy `bind_context` alignment that runs before each rp tool call.
+///
+/// Invalid paths print an error and leave state unchanged — we never want
+/// to land the REPL in a phantom cwd that future commands silently fail on.
+fn handle_cd_command(workspace: &mut SeedWorkspace, rest: &str) {
+    if rest.is_empty() {
+        println!("cwd: {}", workspace.cwd.display());
+        println!("  /cd <path>     change workspace cwd (supports ~ and relative)");
+        return;
+    }
+    match resolve_cd_target(rest, &workspace.cwd) {
+        Ok(new_cwd) => {
+            if new_cwd == workspace.cwd {
+                println!("cwd: already at {} (no change)", new_cwd.display());
+                return;
+            }
+            let old = workspace.set_cwd(new_cwd.clone());
+            println!("cwd: {} → {}", old.display(), new_cwd.display());
+            println!("  next codex turn + repoprompt call will sync to the new cwd");
+        }
+        Err(err) => agent_tui::print_error(err),
+    }
+}
+
 // --- /new --------------------------------------------------------------------
 
 fn handle_new_command(state: &mut ReplState) {
@@ -872,5 +991,117 @@ mod tests {
             let root = scratch_dir("shell-true");
             run_shell_escape(&root, "true").unwrap();
         }
+    }
+
+    // --- /cd + SeedWorkspace ---------------------------------------------
+
+    #[test]
+    fn workspace_set_cwd_returns_previous_and_invalidates_bound() {
+        let mut ws = SeedWorkspace::new(PathBuf::from("/tmp/seed-A"));
+        ws.repoprompt_bound = Some(vec![PathBuf::from("/tmp/seed-A")]);
+        let prev = ws.set_cwd(PathBuf::from("/tmp/seed-B"));
+        assert_eq!(prev, PathBuf::from("/tmp/seed-A"));
+        assert_eq!(ws.cwd, PathBuf::from("/tmp/seed-B"));
+        // Critical: changing cwd must invalidate the cached binding so the
+        // next rp call re-binds. Otherwise the lazy-align layer thinks
+        // we're still good and the agent talks to the wrong workspace.
+        assert!(ws.repoprompt_bound.is_none());
+    }
+
+    #[test]
+    fn resolve_cd_absolute_existing_dir() {
+        let root = scratch_dir("cd-abs");
+        let resolved = resolve_cd_target(root.to_str().unwrap(), Path::new("/")).unwrap();
+        // canonicalize() may turn /var → /private/var on macOS; just check
+        // that the result exists and is a directory.
+        assert!(resolved.is_dir(), "{} not a dir", resolved.display());
+    }
+
+    #[test]
+    fn resolve_cd_relative_resolves_against_current() {
+        let root = scratch_dir("cd-rel-parent");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let resolved = resolve_cd_target("child", &root).unwrap();
+        assert_eq!(resolved.canonicalize().unwrap(), child.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_cd_nonexistent_errors() {
+        let root = scratch_dir("cd-nope");
+        let err = resolve_cd_target("does-not-exist-xyz", &root).unwrap_err();
+        // We don't pin the exact message — `canonicalize` errors vary by OS —
+        // but it should mention the bad path so the user can debug.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does-not-exist-xyz") || msg.contains("cannot resolve"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_cd_file_errors_with_not_a_directory() {
+        let root = scratch_dir("cd-file");
+        let file = root.join("not-a-dir.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        let err = resolve_cd_target(file.to_str().unwrap(), &root).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not a directory"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn resolve_cd_tilde_expands_to_home() {
+        // Skip if HOME isn't set (some CI). When it is, "~" should resolve
+        // to the canonical home dir if it exists.
+        if let Some(home) = std::env::var_os("HOME") {
+            let home_path = PathBuf::from(home);
+            if home_path.is_dir() {
+                let resolved = resolve_cd_target("~", Path::new("/")).unwrap();
+                assert_eq!(resolved, home_path.canonicalize().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn cd_command_empty_arg_does_not_mutate_cwd() {
+        let root = scratch_dir("cd-empty");
+        let mut ws = SeedWorkspace::new(root.clone());
+        handle_cd_command(&mut ws, "");
+        assert_eq!(ws.cwd, root);
+    }
+
+    #[test]
+    fn cd_command_invalid_path_does_not_mutate_cwd() {
+        let root = scratch_dir("cd-invalid");
+        let mut ws = SeedWorkspace::new(root.clone());
+        ws.repoprompt_bound = Some(vec![root.clone()]);
+        handle_cd_command(&mut ws, "/this/does/not/exist/anywhere/xyz");
+        // Error path: cwd stays put, AND the cached binding stays valid
+        // (we only invalidate on successful change).
+        assert_eq!(ws.cwd, root);
+        assert!(ws.repoprompt_bound.is_some());
+    }
+
+    #[test]
+    fn cd_command_same_dir_is_noop() {
+        let root = scratch_dir("cd-same");
+        let bound_marker = vec![root.clone()];
+        let mut ws = SeedWorkspace::new(root.canonicalize().unwrap());
+        ws.repoprompt_bound = Some(bound_marker.clone());
+        let same_path = ws.cwd.to_string_lossy().to_string();
+        handle_cd_command(&mut ws, &same_path);
+        // Same target → no change → binding cache should NOT be invalidated.
+        assert_eq!(ws.repoprompt_bound, Some(bound_marker));
+    }
+
+    #[test]
+    fn cd_command_valid_path_updates_workspace() {
+        let root = scratch_dir("cd-valid-root");
+        let target = scratch_dir("cd-valid-target");
+        let mut ws = SeedWorkspace::new(root.canonicalize().unwrap());
+        handle_cd_command(&mut ws, target.to_str().unwrap());
+        assert_eq!(ws.cwd, target.canonicalize().unwrap());
+        // Successful change invalidates the binding cache.
+        assert!(ws.repoprompt_bound.is_none());
     }
 }

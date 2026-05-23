@@ -495,6 +495,12 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             },
     } = args;
     let cwd = cwd.unwrap_or(env::current_dir()?);
+    // Drop any pending RepoPrompt binding override left behind by a previous
+    // run (e.g. a skill_fetch that queued an override but the planner never
+    // followed up with a repoprompt_* call). Without this, the next run's
+    // first rp tool call would mysteriously bind to the previous run's
+    // skill dir.
+    agent_tools::repoprompt_sync::reset();
     let memory_paths = memory_paths(&cwd, &skills_dir, store.root());
     agent_memory::rebuild_index(&memory_paths)?;
     let base_memory_text = agent_memory::planner_memory_context(&memory_paths)?;

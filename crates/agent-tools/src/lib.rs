@@ -19,6 +19,62 @@ pub use subagent::{
     write_subagent_signals,
 };
 
+/// Process-wide RepoPrompt sync state. Tiny — only used to carry "one-shot
+/// working_dirs override" suggestions from `skill_fetch` to the next
+/// `repoprompt_*` tool call without changing the cross-tool API surface.
+///
+/// `repoprompt_client()` is built fresh per call from `ToolContext` + routing
+/// args, so there's no natural place to hang per-run state. We use a static
+/// guarded by a Mutex; `repoprompt_sync::reset()` is called at the top of
+/// each `run_goal` to prevent leakage across runs.
+pub mod repoprompt_sync {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    static STATE: OnceLock<Mutex<SyncState>> = OnceLock::new();
+
+    #[derive(Debug, Default)]
+    struct SyncState {
+        /// Working_dirs the next RepoPrompt bind should use *instead of*
+        /// `[ctx.cwd]`. Consumed (taken) by `default_repoprompt_working_dirs`.
+        /// `None` means "no skill override pending — fall back to ctx.cwd".
+        pending_override: Option<Vec<PathBuf>>,
+    }
+
+    fn state() -> &'static Mutex<SyncState> {
+        STATE.get_or_init(|| Mutex::new(SyncState::default()))
+    }
+
+    /// Clear all sync state. Call once at the start of a fresh run so stale
+    /// pending overrides from a prior REPL turn / aborted run don't bleed in.
+    pub fn reset() {
+        if let Ok(mut st) = state().lock() {
+            st.pending_override = None;
+        }
+    }
+
+    /// Queue a one-shot override. The next RepoPrompt call that would
+    /// otherwise default to `[ctx.cwd]` will use these dirs and then
+    /// the override is consumed.
+    pub fn set_pending_override(working_dirs: Vec<PathBuf>) {
+        if let Ok(mut st) = state().lock() {
+            st.pending_override = Some(working_dirs);
+        }
+    }
+
+    /// Atomically take and return the pending override, leaving the slot
+    /// empty for the call after this one.
+    pub fn take_pending_override() -> Option<Vec<PathBuf>> {
+        state().lock().ok().and_then(|mut st| st.pending_override.take())
+    }
+
+    /// Inspect without consuming. Test-only.
+    #[cfg(test)]
+    pub fn peek_pending_override() -> Option<Vec<PathBuf>> {
+        state().lock().ok().and_then(|st| st.pending_override.clone())
+    }
+}
+
 pub fn seed_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(MemorySearchTool);
@@ -243,7 +299,7 @@ impl Tool for SkillFetchTool {
             .info
             .repoprompt
             .as_ref()
-            .map(|binding| autobind_repoprompt(ctx, binding));
+            .map(queue_skill_repoprompt_binding);
         let mut content = json!({
             "status": "success",
             "skill": document.info,
@@ -256,57 +312,28 @@ impl Tool for SkillFetchTool {
     }
 }
 
-fn autobind_repoprompt(ctx: &ToolContext, binding: &agent_skills::RepoPromptBinding) -> Value {
-    let routing = RepoPromptRoutingArgs {
-        raw_json: Some(true),
-        ..Default::default()
-    };
-    let client = match repoprompt_client(ctx, routing, false) {
-        Ok(client) => client,
-        Err(err) => {
-            return json!({ "status": "skipped", "reason": format!("RepoPrompt unavailable: {err}") });
-        }
-    };
-    let mut payload = serde_json::Map::new();
-    payload.insert("op".to_string(), Value::String("bind".to_string()));
-    if !binding.working_dirs.is_empty() {
-        payload.insert(
-            "working_dirs".to_string(),
-            Value::Array(
-                binding
-                    .working_dirs
-                    .iter()
-                    .map(|path| Value::String(path.display().to_string()))
-                    .collect(),
-            ),
-        );
+/// RF24-4: Skills with `repoprompt_*` frontmatter no longer call
+/// `bind_context` eagerly. We just queue the binding as a one-shot override
+/// in `repoprompt_sync::set_pending_override` — the very next rp tool call
+/// consumes it via `default_repoprompt_working_dirs`. After that, RP binds
+/// fall back to `ctx.cwd` (mutated by the user via `/cd`), so skill
+/// suggestions remain transient and the user's workspace stays primary.
+///
+/// `context_id` is not queue-able the same way (it's a stable RP context
+/// reference, not a per-cwd thing), so we just surface it in the result
+/// for the planner to use explicitly if it wants.
+fn queue_skill_repoprompt_binding(binding: &agent_skills::RepoPromptBinding) -> Value {
+    if binding.working_dirs.is_empty() {
+        return json!({
+            "status": "noop",
+            "reason": "skill has repoprompt frontmatter but no working_dirs",
+            "context_id": binding.context_id,
+        });
     }
-    if let Some(context_id) = &binding.context_id {
-        payload.insert(
-            "context_id".to_string(),
-            Value::String(context_id.clone()),
-        );
-    }
-    let result = match client.call_tool(
-        agent_repoprompt::RepoPromptTool::BindContext,
-        &Value::Object(payload),
-    ) {
-        Ok(output) => output,
-        Err(err) => {
-            return json!({ "status": "error", "reason": format!("bind_context call failed: {err}") });
-        }
-    };
-    let status = if result.timed_out {
-        "timeout"
-    } else if result.exit_code == Some(0) {
-        "bound"
-    } else {
-        "error"
-    };
+    repoprompt_sync::set_pending_override(binding.working_dirs.clone());
     json!({
-        "status": status,
-        "exit_code": result.exit_code,
-        "stdout_tail": truncate_text(result.stdout.trim(), 400),
+        "status": "queued_transient",
+        "applies_to": "next repoprompt_* tool call",
         "working_dirs": binding.working_dirs,
         "context_id": binding.context_id,
     })
@@ -2061,7 +2088,18 @@ fn default_repoprompt_working_dirs(
 ) -> Vec<PathBuf> {
     let mut working_dirs = working_dirs.unwrap_or_default();
     if working_dirs.is_empty() && default_cwd {
-        working_dirs.push(ctx.cwd.clone());
+        // RF24-4/5: if a skill_fetch queued a one-shot working_dirs override
+        // (via `repoprompt_sync::set_pending_override`), honor it here — but
+        // only when the caller didn't provide explicit working_dirs AND only
+        // for tools that opt into cwd defaulting (default_cwd=true). The
+        // override is *consumed*: the call after this one falls back to
+        // [ctx.cwd], which is how skill bindings stay transient instead of
+        // sticky.
+        if let Some(override_dirs) = repoprompt_sync::take_pending_override() {
+            working_dirs = override_dirs;
+        } else {
+            working_dirs.push(ctx.cwd.clone());
+        }
     }
     working_dirs
         .into_iter()
@@ -3127,5 +3165,146 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("seed-tools-test-{nanos}"))
+    }
+
+    // --- RF24-4/5 repoprompt_sync ----------------------------------------
+    //
+    // These tests poke the process-wide `repoprompt_sync` singleton. Cargo
+    // runs tests in parallel by default, so any pair of these would race
+    // (one sets, another peeks/clears in between). We serialize them with
+    // a dedicated test-only mutex held for the lifetime of each test; the
+    // guard is returned so test bodies can hold it via `let _g = ...`.
+
+    use std::sync::Mutex as StdMutex;
+    static RP_SYNC_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn rp_sync_setup() -> std::sync::MutexGuard<'static, ()> {
+        // `lock()` returns Err only if the mutex was poisoned by a previous
+        // panicking test. We don't care — the inner data is `()`, so just
+        // recover the guard and continue.
+        let guard = RP_SYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        repoprompt_sync::reset();
+        assert!(repoprompt_sync::peek_pending_override().is_none());
+        guard
+    }
+
+    #[test]
+    fn repoprompt_sync_reset_clears_pending() {
+        let _g = rp_sync_setup();
+        repoprompt_sync::set_pending_override(vec![PathBuf::from("/skill-dir")]);
+        assert!(repoprompt_sync::peek_pending_override().is_some());
+        repoprompt_sync::reset();
+        assert!(repoprompt_sync::peek_pending_override().is_none());
+    }
+
+    #[test]
+    fn repoprompt_sync_take_is_consuming() {
+        let _g = rp_sync_setup();
+        repoprompt_sync::set_pending_override(vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        let first = repoprompt_sync::take_pending_override();
+        let second = repoprompt_sync::take_pending_override();
+        assert_eq!(
+            first,
+            Some(vec![PathBuf::from("/a"), PathBuf::from("/b")])
+        );
+        assert!(second.is_none(), "second take should be None — override is one-shot");
+    }
+
+    #[test]
+    fn default_working_dirs_consumes_pending_override() {
+        let _g = rp_sync_setup();
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = temp_ctx(&root);
+        repoprompt_sync::set_pending_override(vec![PathBuf::from("/some/skill/dir")]);
+        let dirs = default_repoprompt_working_dirs(&ctx, None, true);
+        // Override wins over ctx.cwd default. absolutize keeps absolute paths intact.
+        assert_eq!(dirs, vec![PathBuf::from("/some/skill/dir")]);
+        // And the override is now consumed.
+        assert!(repoprompt_sync::peek_pending_override().is_none());
+    }
+
+    #[test]
+    fn default_working_dirs_falls_back_to_ctx_cwd_after_override_consumed() {
+        let _g = rp_sync_setup();
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = temp_ctx(&root);
+        repoprompt_sync::set_pending_override(vec![PathBuf::from("/skill-dir")]);
+        // First call consumes.
+        let _ = default_repoprompt_working_dirs(&ctx, None, true);
+        // Second call: no override → ctx.cwd.
+        let dirs = default_repoprompt_working_dirs(&ctx, None, true);
+        assert_eq!(dirs, vec![root.clone()]);
+    }
+
+    #[test]
+    fn default_working_dirs_ignores_override_when_user_provided_dirs() {
+        let _g = rp_sync_setup();
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = temp_ctx(&root);
+        repoprompt_sync::set_pending_override(vec![PathBuf::from("/skill-dir")]);
+        // User explicitly passed working_dirs → override should not fire.
+        let explicit = vec![PathBuf::from("/user/picked")];
+        let dirs = default_repoprompt_working_dirs(&ctx, Some(explicit.clone()), true);
+        assert_eq!(dirs, explicit);
+        // Override is still pending — it only consumes when defaults kick in.
+        assert!(
+            repoprompt_sync::peek_pending_override().is_some(),
+            "override should survive a call that didn't need defaulting"
+        );
+        repoprompt_sync::reset();
+    }
+
+    #[test]
+    fn default_working_dirs_ignores_override_when_default_cwd_false() {
+        let _g = rp_sync_setup();
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = temp_ctx(&root);
+        repoprompt_sync::set_pending_override(vec![PathBuf::from("/skill-dir")]);
+        // Meta ops like bind_context call with default_cwd=false; the
+        // override must not fire (those calls aren't workspace-scoped).
+        let dirs = default_repoprompt_working_dirs(&ctx, None, false);
+        assert!(dirs.is_empty(), "no defaulting when default_cwd=false");
+        assert!(
+            repoprompt_sync::peek_pending_override().is_some(),
+            "override should survive a default_cwd=false call"
+        );
+        repoprompt_sync::reset();
+    }
+
+    #[test]
+    fn queue_skill_repoprompt_binding_sets_override_and_returns_status() {
+        let _g = rp_sync_setup();
+        let binding = agent_skills::RepoPromptBinding {
+            working_dirs: vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            context_id: Some("ctx-42".to_string()),
+            ..Default::default()
+        };
+        let v = queue_skill_repoprompt_binding(&binding);
+        assert_eq!(v["status"], "queued_transient");
+        assert_eq!(v["applies_to"], "next repoprompt_* tool call");
+        assert_eq!(
+            repoprompt_sync::peek_pending_override(),
+            Some(vec![PathBuf::from("/a"), PathBuf::from("/b")])
+        );
+        repoprompt_sync::reset();
+    }
+
+    #[test]
+    fn queue_skill_repoprompt_binding_noop_when_no_working_dirs() {
+        let _g = rp_sync_setup();
+        let binding = agent_skills::RepoPromptBinding {
+            working_dirs: vec![],
+            context_id: Some("ctx-7".to_string()),
+            ..Default::default()
+        };
+        let v = queue_skill_repoprompt_binding(&binding);
+        assert_eq!(v["status"], "noop");
+        assert!(repoprompt_sync::peek_pending_override().is_none());
     }
 }

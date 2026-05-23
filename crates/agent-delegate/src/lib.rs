@@ -260,6 +260,29 @@ impl CodexAppServerClient {
         self.run_prompt_streaming(prompt, |_| {})
     }
 
+    /// Read-only view of the current working directory the client will send
+    /// with the next `turn/start` request (or `thread/start` if the thread
+    /// isn't open yet). Returns `None` if no cwd was configured at launch and
+    /// none has been set since.
+    pub fn cwd(&self) -> Option<&PathBuf> {
+        self.cfg.cwd.as_ref()
+    }
+
+    /// Update the cwd that gets sent on the next request. Codex's
+    /// `TurnStartParams.cwd` is officially "Override the working directory
+    /// for this turn and subsequent turns" — so this propagates without
+    /// restarting the app-server. Safe to call mid-thread; the change lands
+    /// on the next `start_turn` / `run_prompt[_streaming]` call.
+    ///
+    /// Does NOT mutate the spawned subprocess's `current_dir`; only the
+    /// per-request field. If you launched the server in cwd A and call
+    /// `set_cwd(B)`, the server still runs from A but Codex's *logical*
+    /// workspace for new turns becomes B. That matches what the protocol
+    /// is designed to do.
+    pub fn set_cwd(&mut self, cwd: PathBuf) {
+        self.cfg.cwd = Some(cwd);
+    }
+
     pub fn run_prompt_streaming<F>(
         &mut self,
         prompt: &str,
@@ -733,5 +756,25 @@ mod tests {
     fn turn_match_accepts_nested_turn() {
         let params = json!({ "turn": { "id": "turn_1" } });
         assert!(message_mentions_turn(&params, "turn_1"));
+    }
+
+    #[test]
+    fn set_cwd_updates_config() {
+        // We can't actually start the app-server in a unit test, but
+        // `start_turn` reads `self.cfg.cwd` at request build time so
+        // mutating it is the entire mechanism. Verify the accessor pair.
+        let mut client = CodexAppServerClient::new(CodexAppServerConfig::default());
+        assert!(client.cwd().is_none());
+        client.set_cwd(PathBuf::from("/tmp/seed-agent-test"));
+        assert_eq!(
+            client.cwd().map(|p| p.to_string_lossy().to_string()),
+            Some("/tmp/seed-agent-test".to_string())
+        );
+        // Overwrites cleanly.
+        client.set_cwd(PathBuf::from("/var/empty"));
+        assert_eq!(
+            client.cwd().map(|p| p.to_string_lossy().to_string()),
+            Some("/var/empty".to_string())
+        );
     }
 }
