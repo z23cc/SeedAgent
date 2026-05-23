@@ -306,6 +306,9 @@ fn main() -> Result<()> {
                 mcp_allow,
                 plugins,
             },
+            // One-shot `seed run` — no REPL session to inherit, fall back
+            // to the local throwaway session built inside run_goal.
+            codex_session: None,
         }),
         Command::Tool { command, cwd } => run_tool(&store, command, cwd, cli.skills_dir.clone()),
         Command::Plan { command, cwd } => run_plan(command, cwd),

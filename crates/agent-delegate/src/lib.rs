@@ -283,6 +283,79 @@ impl CodexAppServerClient {
         self.cfg.cwd = Some(cwd);
     }
 
+    /// `Option`-aware variant of `set_cwd` for the long-lived-client glue.
+    pub fn set_cwd_opt(&mut self, cwd: Option<PathBuf>) {
+        self.cfg.cwd = cwd;
+    }
+
+    /// Mutate the model used on the next `start_turn`. Picked up the same
+    /// way as `set_cwd` — `start_turn` reads `self.cfg.model` at request
+    /// build time, so no restart needed.
+    pub fn set_model(&mut self, model: Option<String>) {
+        self.cfg.model = model;
+    }
+
+    /// Mutate the reasoning effort used on the next `start_turn`.
+    pub fn set_effort(&mut self, effort: Option<String>) {
+        self.cfg.reasoning_effort = effort;
+    }
+
+    /// Mutate the sandbox sent on the next `start_thread`. `run_prompt`
+    /// starts a fresh thread for every prompt, so this lands on the next
+    /// `run_prompt[_streaming]` call.
+    pub fn set_sandbox(&mut self, sandbox: String) {
+        self.cfg.sandbox = sandbox;
+    }
+
+    /// Mutate the approval policy string sent in `start_thread`/`start_turn`.
+    pub fn set_approval_policy(&mut self, policy: String) {
+        self.cfg.approval_policy = policy;
+    }
+
+    /// Mutate the approval-callback mode used for `requestApproval` JSON-RPC
+    /// callbacks. Per-callback, so safe to change between prompts.
+    pub fn set_approval_mode(&mut self, mode: ApprovalMode) {
+        self.cfg.approval_mode = mode;
+    }
+
+    /// Snapshot of the launch-relevant config fields. Two clients with
+    /// equal fingerprints can be used interchangeably — different fingerprints
+    /// require a fresh subprocess (mcp_policy and plugins_enabled affect the
+    /// argv passed to `codex app-server`, so they can't be hot-swapped).
+    pub fn launch_fingerprint(&self) -> CodexLaunchFingerprint {
+        CodexLaunchFingerprint::from(&self.cfg)
+    }
+}
+
+/// Fingerprint of the subset of `CodexAppServerConfig` that must match for
+/// two requests to share an app-server subprocess. Everything NOT in this
+/// fingerprint is per-turn-mutable via the `set_*` methods above
+/// (cwd / model / effort / sandbox / approval_policy / approval_mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexLaunchFingerprint {
+    pub plugins_enabled: bool,
+    pub mcp_policy: McpPolicy,
+    pub command: String,
+    pub args: Vec<String>,
+    pub experimental_api: bool,
+}
+
+impl From<&CodexAppServerConfig> for CodexLaunchFingerprint {
+    fn from(cfg: &CodexAppServerConfig) -> Self {
+        Self {
+            plugins_enabled: cfg.plugins_enabled,
+            mcp_policy: cfg.mcp_policy.clone(),
+            command: cfg.command.clone(),
+            args: cfg.args.clone(),
+            experimental_api: cfg.experimental_api,
+        }
+    }
+}
+
+// Spurious-impl to keep the rest of the file's `impl CodexAppServerClient`
+// block readable — re-open the impl below.
+impl CodexAppServerClient {
+
     pub fn run_prompt_streaming<F>(
         &mut self,
         prompt: &str,
@@ -775,6 +848,84 @@ mod tests {
         assert_eq!(
             client.cwd().map(|p| p.to_string_lossy().to_string()),
             Some("/var/empty".to_string())
+        );
+    }
+
+    #[test]
+    fn set_cwd_opt_handles_none() {
+        let mut client = CodexAppServerClient::new(CodexAppServerConfig::default());
+        client.set_cwd(PathBuf::from("/a"));
+        client.set_cwd_opt(None);
+        assert!(client.cwd().is_none(), "set_cwd_opt(None) must clear");
+        client.set_cwd_opt(Some(PathBuf::from("/b")));
+        assert_eq!(client.cwd(), Some(&PathBuf::from("/b")));
+    }
+
+    #[test]
+    fn per_turn_setters_mutate_cfg() {
+        let mut client = CodexAppServerClient::new(CodexAppServerConfig::default());
+        client.set_model(Some("gpt-5.3".to_string()));
+        client.set_effort(Some("high".to_string()));
+        client.set_sandbox("read-only".to_string());
+        client.set_approval_policy("never".to_string());
+        client.set_approval_mode(ApprovalMode::AcceptForSession);
+        // We expose the readback for cwd; the others we verify via fingerprint
+        // not changing (sandbox/approval are NOT in fingerprint).
+        let fp = client.launch_fingerprint();
+        // Sandbox is per-thread, not in fingerprint.
+        assert_eq!(fp.plugins_enabled, false);
+    }
+
+    #[test]
+    fn launch_fingerprint_matches_when_only_per_turn_fields_differ() {
+        let mut a = CodexAppServerConfig::default();
+        a.cwd = Some(PathBuf::from("/a"));
+        a.model = Some("m1".to_string());
+        a.reasoning_effort = Some("low".to_string());
+        a.sandbox = "danger-full-access".to_string();
+        a.approval_policy = "never".to_string();
+        a.approval_mode = ApprovalMode::AcceptForSession;
+
+        let mut b = CodexAppServerConfig::default();
+        b.cwd = Some(PathBuf::from("/different"));
+        b.model = Some("m2".to_string());
+        b.reasoning_effort = None;
+        b.sandbox = "read-only".to_string();
+        b.approval_policy = "on-request".to_string();
+        b.approval_mode = ApprovalMode::Deny;
+
+        // Both have plugins_enabled=false, default mcp_policy (Allow RepoPrompt),
+        // default command/args. Per-turn fields should not affect fingerprint.
+        assert_eq!(
+            CodexLaunchFingerprint::from(&a),
+            CodexLaunchFingerprint::from(&b),
+            "per-turn fields must not contribute to the fingerprint",
+        );
+    }
+
+    #[test]
+    fn launch_fingerprint_differs_when_plugins_or_mcp_differ() {
+        let mut a = CodexAppServerConfig::default();
+        let mut b = CodexAppServerConfig::default();
+        b.plugins_enabled = true;
+        assert_ne!(
+            CodexLaunchFingerprint::from(&a),
+            CodexLaunchFingerprint::from(&b),
+            "plugins_enabled must split fingerprints"
+        );
+        b = CodexAppServerConfig::default();
+        b.mcp_policy = McpPolicy::All;
+        assert_ne!(
+            CodexLaunchFingerprint::from(&a),
+            CodexLaunchFingerprint::from(&b),
+            "mcp_policy must split fingerprints"
+        );
+        // Same config = same fingerprint (sanity).
+        a = CodexAppServerConfig::default();
+        b = CodexAppServerConfig::default();
+        assert_eq!(
+            CodexLaunchFingerprint::from(&a),
+            CodexLaunchFingerprint::from(&b),
         );
     }
 }

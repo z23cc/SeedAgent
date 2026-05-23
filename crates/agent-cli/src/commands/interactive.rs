@@ -71,29 +71,23 @@ struct ReplState {
 #[derive(Debug, Clone)]
 pub(crate) struct SeedWorkspace {
     pub(crate) cwd: PathBuf,
-    /// What RepoPrompt was last told to bind to. `None` means "we never
-    /// pushed a binding from this REPL" — the lazy-align layer can still
-    /// inspect RepoPrompt's actual state if needed. Used to avoid
-    /// re-calling `bind_context` when nothing changed.
-    pub(crate) repoprompt_bound: Option<Vec<PathBuf>>,
 }
 
 impl SeedWorkspace {
     pub(crate) fn new(cwd: PathBuf) -> Self {
-        Self {
-            cwd,
-            repoprompt_bound: None,
-        }
+        Self { cwd }
     }
 
     /// Update the cwd. Caller is expected to flush downstream effects
     /// (Codex `set_cwd`, RepoPrompt rebind) lazily on the next op.
     /// Returns the previous cwd so callers can show "OLD → NEW".
+    ///
+    /// Also clears the process-global RepoPrompt bound-window cache
+    /// (RF25-2): the cached window_id is for the old cwd; the next rp call
+    /// will have a different `working_dirs` and must re-bind to a fresh
+    /// window (or no-op if RP already has one open for the new dir).
     pub(crate) fn set_cwd(&mut self, new_cwd: PathBuf) -> PathBuf {
-        // Invalidate the RP binding cache — a different cwd means the next
-        // RP call should re-bind even if the bound vector technically matched
-        // (different working_dirs[0] = different context).
-        self.repoprompt_bound = None;
+        agent_tools::repoprompt_sync::clear_bound_window();
         std::mem::replace(&mut self.cwd, new_cwd)
     }
 }
@@ -152,6 +146,11 @@ pub(crate) fn run_interactive(
         "planner"
     };
     let mut state = ReplState::default();
+    // RF25-1: REPL-lifetime Codex client cache. First codex call in the
+    // session spawns; subsequent calls (with matching launch fingerprint)
+    // hot-swap cfg fields and reuse the subprocess. `/new` and REPL exit
+    // both drop it, which kills the subprocess via Drop.
+    let mut codex_session = crate::commands::codex_session::CodexSession::default();
 
     agent_tui::print_banner();
     loop {
@@ -180,6 +179,7 @@ pub(crate) fn run_interactive(
                     &mut args,
                     &mut state,
                     &mut workspace,
+                    &mut codex_session,
                     &input,
                 )? {
                     break;
@@ -212,6 +212,7 @@ pub(crate) fn run_interactive(
                         mcp_allow: args.mcp_allow.clone(),
                         plugins: args.plugins,
                     },
+                    codex_session: Some(&mut codex_session),
                 }) {
                     agent_tui::print_error(err);
                 }
@@ -230,6 +231,7 @@ fn handle_interactive_command(
     args: &mut InteractiveArgs,
     state: &mut ReplState,
     workspace: &mut SeedWorkspace,
+    codex_session: &mut crate::commands::codex_session::CodexSession,
     input: &str,
 ) -> Result<bool> {
     let trimmed = input.trim();
@@ -248,6 +250,11 @@ fn handle_interactive_command(
         }
         "/doctor" => {
             doctor::doctor(&cli.skills_dir, store)?;
+            // REPL-only addendum: re-run cwd-health-check with our live
+            // workspace + codex_session so the printed cwd reflects /cd
+            // mutations and the codex line shows the cached client's cwd
+            // instead of "N/A".
+            doctor::cwd_health_check(&workspace.cwd, Some(codex_session))?;
             Ok(false)
         }
         "/providers" => {
@@ -293,11 +300,11 @@ fn handle_interactive_command(
             Ok(false)
         }
         "/new" => {
-            handle_new_command(state);
+            handle_new_command(state, codex_session);
             Ok(false)
         }
         "/retry" => {
-            handle_retry_command(cli, store, args, state, &workspace.cwd)?;
+            handle_retry_command(cli, store, args, state, &workspace.cwd, codex_session)?;
             Ok(false)
         }
         "/cd" => {
@@ -669,15 +676,21 @@ fn handle_cd_command(workspace: &mut SeedWorkspace, rest: &str) {
 
 // --- /new --------------------------------------------------------------------
 
-fn handle_new_command(state: &mut ReplState) {
+fn handle_new_command(
+    state: &mut ReplState,
+    codex_session: &mut crate::commands::codex_session::CodexSession,
+) {
     // Each goal already creates its own session UUID — there's no in-REPL
-    // running session to close. /new just resets retry state and confirms.
+    // running session to close. /new just resets retry state and tears
+    // down the cached Codex client so the next prompt starts with a clean
+    // Codex slate (no leftover thread state, fresh `initialize` handshake).
     let had_retry = state.last_goal.is_some();
     state.last_goal = None;
+    codex_session.shutdown();
     if had_retry {
-        println!("ready for a new goal (cleared /retry buffer)");
+        println!("ready for a new goal (cleared /retry buffer + codex session)");
     } else {
-        println!("ready for a new goal");
+        println!("ready for a new goal (cleared codex session)");
     }
 }
 
@@ -689,6 +702,7 @@ fn handle_retry_command(
     args: &InteractiveArgs,
     state: &mut ReplState,
     cwd: &Path,
+    codex_session: &mut crate::commands::codex_session::CodexSession,
 ) -> Result<()> {
     let Some(goal) = state.last_goal.clone() else {
         agent_tui::print_error("nothing to retry — submit a goal first");
@@ -717,6 +731,9 @@ fn handle_retry_command(
             mcp_allow: args.mcp_allow.clone(),
             plugins: args.plugins,
         },
+        // Reuse the REPL-lifetime Codex client (RF25-1) — same fingerprint
+        // means same subprocess, no respawn cost on retry.
+        codex_session: Some(codex_session),
     });
     // Refresh last_goal even on failure — the user clearly wants to keep
     // iterating on this goal, so /retry should keep working.
@@ -747,6 +764,18 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// Serial lock for tests that read/write `agent_tools::repoprompt_sync`'s
+    /// process-global state. Mirrors the pattern in `agent-tools::tests`.
+    /// Hold the returned guard for the test body via `let _g = ...`.
+    static RP_SYNC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn rp_sync_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = RP_SYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        agent_tools::repoprompt_sync::reset();
+        g
     }
 
     fn fresh_cli(root: &Path) -> Cli {
@@ -880,15 +909,28 @@ mod tests {
         let mut s = ReplState {
             last_goal: Some("analyze runtime".to_string()),
         };
-        handle_new_command(&mut s);
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        handle_new_command(&mut s, &mut cs);
         assert_eq!(s.last_goal, None);
     }
 
     #[test]
     fn new_command_is_noop_when_buffer_empty() {
         let mut s = ReplState::default();
-        handle_new_command(&mut s);
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        handle_new_command(&mut s, &mut cs);
         assert_eq!(s.last_goal, None);
+    }
+
+    #[test]
+    fn new_command_shuts_down_codex_session() {
+        let mut s = ReplState::default();
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        // Prime the session (no spawn — just constructs the inner client).
+        let _ = cs.ensure(agent_delegate::CodexAppServerConfig::default()).unwrap();
+        assert!(cs.is_live());
+        handle_new_command(&mut s, &mut cs);
+        assert!(!cs.is_live(), "/new must tear down the cached codex client");
     }
 
     // --- /memory ---------------------------------------------------------
@@ -997,15 +1039,21 @@ mod tests {
 
     #[test]
     fn workspace_set_cwd_returns_previous_and_invalidates_bound() {
+        let _g = rp_sync_test_guard();
+        // Seed a cached binding in the process-global sync state so we can
+        // assert set_cwd clears it.
+        agent_tools::repoprompt_sync::record_bound_window(
+            vec![PathBuf::from("/tmp/seed-A")],
+            42,
+        );
         let mut ws = SeedWorkspace::new(PathBuf::from("/tmp/seed-A"));
-        ws.repoprompt_bound = Some(vec![PathBuf::from("/tmp/seed-A")]);
         let prev = ws.set_cwd(PathBuf::from("/tmp/seed-B"));
         assert_eq!(prev, PathBuf::from("/tmp/seed-A"));
         assert_eq!(ws.cwd, PathBuf::from("/tmp/seed-B"));
         // Critical: changing cwd must invalidate the cached binding so the
         // next rp call re-binds. Otherwise the lazy-align layer thinks
         // we're still good and the agent talks to the wrong workspace.
-        assert!(ws.repoprompt_bound.is_none());
+        assert!(agent_tools::repoprompt_sync::peek_bound_window().is_none());
     }
 
     #[test]
@@ -1072,36 +1120,47 @@ mod tests {
 
     #[test]
     fn cd_command_invalid_path_does_not_mutate_cwd() {
+        let _g = rp_sync_test_guard();
         let root = scratch_dir("cd-invalid");
         let mut ws = SeedWorkspace::new(root.clone());
-        ws.repoprompt_bound = Some(vec![root.clone()]);
+        agent_tools::repoprompt_sync::record_bound_window(vec![root.clone()], 42);
         handle_cd_command(&mut ws, "/this/does/not/exist/anywhere/xyz");
-        // Error path: cwd stays put, AND the cached binding stays valid
-        // (we only invalidate on successful change).
         assert_eq!(ws.cwd, root);
-        assert!(ws.repoprompt_bound.is_some());
+        assert!(
+            agent_tools::repoprompt_sync::peek_bound_window().is_some(),
+            "invalid /cd must not invalidate the RP bound-window cache"
+        );
     }
 
     #[test]
     fn cd_command_same_dir_is_noop() {
+        let _g = rp_sync_test_guard();
         let root = scratch_dir("cd-same");
-        let bound_marker = vec![root.clone()];
         let mut ws = SeedWorkspace::new(root.canonicalize().unwrap());
-        ws.repoprompt_bound = Some(bound_marker.clone());
+        agent_tools::repoprompt_sync::record_bound_window(vec![ws.cwd.clone()], 13);
         let same_path = ws.cwd.to_string_lossy().to_string();
         handle_cd_command(&mut ws, &same_path);
         // Same target → no change → binding cache should NOT be invalidated.
-        assert_eq!(ws.repoprompt_bound, Some(bound_marker));
+        assert!(
+            agent_tools::repoprompt_sync::peek_bound_window().is_some(),
+            "no-op /cd must preserve the RP bound-window cache"
+        );
     }
 
     #[test]
     fn cd_command_valid_path_updates_workspace() {
+        let _g = rp_sync_test_guard();
         let root = scratch_dir("cd-valid-root");
         let target = scratch_dir("cd-valid-target");
         let mut ws = SeedWorkspace::new(root.canonicalize().unwrap());
+        agent_tools::repoprompt_sync::record_bound_window(vec![ws.cwd.clone()], 99);
         handle_cd_command(&mut ws, target.to_str().unwrap());
         assert_eq!(ws.cwd, target.canonicalize().unwrap());
-        // Successful change invalidates the binding cache.
-        assert!(ws.repoprompt_bound.is_none());
+        // Successful change invalidates the binding cache so the next rp
+        // call rebinds to the new cwd's window.
+        assert!(
+            agent_tools::repoprompt_sync::peek_bound_window().is_none(),
+            "successful /cd must clear the RP bound-window cache"
+        );
     }
 }

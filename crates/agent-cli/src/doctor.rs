@@ -9,6 +9,8 @@ use agent_llm::{ModelId, ProviderRouter};
 use agent_session::SessionStore;
 use anyhow::Result;
 
+use crate::commands::codex_session::CodexSession;
+
 pub(crate) fn doctor(skills_dir: &Path, store: &SessionStore) -> Result<()> {
     let registry = agent_tools::seed_registry();
     println!("seed doctor");
@@ -30,7 +32,131 @@ pub(crate) fn doctor(skills_dir: &Path, store: &SessionStore) -> Result<()> {
             .join(", ")
     );
     println!("- delegates: codex-app-server, repoprompt-oracle");
+    // RF25-3: cwd sync health check. Always run; for one-shot `seed doctor`
+    // (no REPL session), we just print env::current_dir() + any cached RP
+    // bound state. For REPL `/doctor` callers see `cwd_health_check` below.
+    cwd_health_check(&env::current_dir()?, None)?;
     Ok(())
+}
+
+/// Surface cwd-sync state across the three subsystems that all need to
+/// agree on "where the agent is": `workspace.cwd` (REPL's truth), the
+/// `CodexSession`'s cached client cwd (only meaningful inside a REPL),
+/// and the `repoprompt_sync` bound-window cache (process-global).
+///
+/// Prints a `MISMATCH` marker next to any value that doesn't match
+/// `workspace_cwd`. The goal: one command to debug "agent is reading
+/// files from the wrong workspace" without grepping logs.
+pub(crate) fn cwd_health_check(
+    workspace_cwd: &Path,
+    codex_session: Option<&CodexSession>,
+) -> Result<()> {
+    println!("- cwd-sync:");
+    println!("    workspace.cwd: {}", workspace_cwd.display());
+
+    // Codex session (only present in REPL).
+    match codex_session {
+        Some(cs) if cs.is_live() => match cs.client_cwd() {
+            Some(c) => {
+                let marker = if c == workspace_cwd { "ok" } else { "MISMATCH" };
+                println!("    codex client:  {}  [{marker}]", c.display());
+            }
+            None => println!("    codex client:  live, cwd unset (next turn will inherit workspace.cwd)"),
+        },
+        Some(_) => println!("    codex client:  not spawned (REPL session empty)"),
+        None => println!("    codex client:  N/A (one-shot, no REPL)"),
+    }
+
+    // RepoPrompt bound-window cache.
+    match agent_tools::repoprompt_sync::peek_bound_window() {
+        Some((dirs, wid)) => {
+            let covers = dirs.iter().any(|d| d == workspace_cwd);
+            let marker = if covers { "ok" } else { "MISMATCH" };
+            println!(
+                "    rp bind cache: window={wid} dirs={:?}  [{marker}]",
+                dirs.iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+        None => println!("    rp bind cache: (empty — next rp call will bind fresh)"),
+    }
+
+    // Pending skill override (RF24-4).
+    match agent_tools::repoprompt_sync::peek_pending_override() {
+        Some(over) => println!(
+            "    rp pending override: {:?} (consumed by next rp call, transient)",
+            over.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        ),
+        None => println!("    rp pending override: (none)"),
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_delegate::CodexAppServerConfig;
+    use std::path::PathBuf;
+
+    // The health-check function calls `println!` so we don't capture output —
+    // instead we verify it runs without panicking under every shape of input
+    // (codex session live/dead, RP cache hit/miss, override present/absent).
+    // The shape of the printed lines is exercised by the smoke test that
+    // calls `seed doctor` end-to-end in RF25-4.
+
+    static RP_SYNC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn rp_sync_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = RP_SYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        agent_tools::repoprompt_sync::reset();
+        g
+    }
+
+    #[test]
+    fn cwd_health_check_runs_without_codex_session() {
+        let _g = rp_sync_test_guard();
+        cwd_health_check(&PathBuf::from("/tmp/seed-doctor-a"), None).unwrap();
+    }
+
+    #[test]
+    fn cwd_health_check_runs_with_dead_codex_session() {
+        let _g = rp_sync_test_guard();
+        let cs = CodexSession::default();
+        cwd_health_check(&PathBuf::from("/tmp/seed-doctor-b"), Some(&cs)).unwrap();
+    }
+
+    #[test]
+    fn cwd_health_check_runs_with_live_codex_session_mismatched_cwd() {
+        let _g = rp_sync_test_guard();
+        let mut cs = CodexSession::default();
+        let mut cfg = CodexAppServerConfig::default();
+        cfg.cwd = Some(PathBuf::from("/tmp/seed-codex-cwd"));
+        cs.ensure(cfg).unwrap();
+        // workspace.cwd different from codex's cwd → MISMATCH path exercised.
+        cwd_health_check(&PathBuf::from("/tmp/seed-workspace-different"), Some(&cs))
+            .unwrap();
+    }
+
+    #[test]
+    fn cwd_health_check_runs_with_rp_cache_hit_and_miss() {
+        let _g = rp_sync_test_guard();
+        let cwd = PathBuf::from("/tmp/seed-doctor-c");
+        agent_tools::repoprompt_sync::record_bound_window(vec![cwd.clone()], 7);
+        cwd_health_check(&cwd, None).unwrap(); // hit (ok marker)
+        cwd_health_check(&PathBuf::from("/tmp/seed-doctor-d"), None).unwrap(); // miss (MISMATCH)
+    }
+
+    #[test]
+    fn cwd_health_check_runs_with_pending_override() {
+        let _g = rp_sync_test_guard();
+        agent_tools::repoprompt_sync::set_pending_override(vec![PathBuf::from("/tmp/skill-bind")]);
+        cwd_health_check(&PathBuf::from("/tmp/seed-doctor-e"), None).unwrap();
+    }
 }
 
 pub(crate) fn show_providers(

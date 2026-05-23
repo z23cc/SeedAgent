@@ -39,6 +39,20 @@ pub mod repoprompt_sync {
         /// `[ctx.cwd]`. Consumed (taken) by `default_repoprompt_working_dirs`.
         /// `None` means "no skill override pending — fall back to ctx.cwd".
         pending_override: Option<Vec<PathBuf>>,
+        /// RF25-2: cached `(working_dirs, window_id)` from the most recent
+        /// successful `bind_context`. Subsequent rp calls with matching
+        /// working_dirs can pre-set `cfg.window_id` from this cache,
+        /// which short-circuits `resolve_repoprompt_window` and avoids one
+        /// rp-cli subprocess (~70ms each). Invalidated by `reset()`, by
+        /// consuming a `pending_override` (next call is intentionally
+        /// targeting different dirs), and by `clear_bound_window`.
+        bound: Option<BoundWindow>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct BoundWindow {
+        pub working_dirs: Vec<PathBuf>,
+        pub window_id: u32,
     }
 
     fn state() -> &'static Mutex<SyncState> {
@@ -46,19 +60,23 @@ pub mod repoprompt_sync {
     }
 
     /// Clear all sync state. Call once at the start of a fresh run so stale
-    /// pending overrides from a prior REPL turn / aborted run don't bleed in.
+    /// pending overrides + window caches from a prior REPL turn / aborted
+    /// run don't bleed in.
     pub fn reset() {
         if let Ok(mut st) = state().lock() {
             st.pending_override = None;
+            st.bound = None;
         }
     }
 
     /// Queue a one-shot override. The next RepoPrompt call that would
     /// otherwise default to `[ctx.cwd]` will use these dirs and then
-    /// the override is consumed.
+    /// the override is consumed. Also clears the bound-window cache —
+    /// we're about to switch dirs, so the cached window won't match.
     pub fn set_pending_override(working_dirs: Vec<PathBuf>) {
         if let Ok(mut st) = state().lock() {
             st.pending_override = Some(working_dirs);
+            st.bound = None;
         }
     }
 
@@ -68,10 +86,50 @@ pub mod repoprompt_sync {
         state().lock().ok().and_then(|mut st| st.pending_override.take())
     }
 
-    /// Inspect without consuming. Test-only.
-    #[cfg(test)]
+    /// RF25-2: look up a previously-bound window_id matching `working_dirs`.
+    /// Returns `None` if the cache is empty or the cached binding is for
+    /// a different dir set.
+    pub(super) fn cached_window_id_for(working_dirs: &[PathBuf]) -> Option<u32> {
+        state()
+            .lock()
+            .ok()
+            .and_then(|st| st.bound.as_ref().filter(|b| b.working_dirs == working_dirs).map(|b| b.window_id))
+    }
+
+    /// Record a successful bind so future calls with the same working_dirs
+    /// can skip the bind_context CLI roundtrip. `pub` (not pub(super)) so
+    /// other crates' integration tests can prime the cache to test
+    /// invalidation paths without spinning up a real RP CLI.
+    pub fn record_bound_window(working_dirs: Vec<PathBuf>, window_id: u32) {
+        if let Ok(mut st) = state().lock() {
+            st.bound = Some(BoundWindow { working_dirs, window_id });
+        }
+    }
+
+    /// Drop the cached bound window without touching pending_override.
+    /// Used when /cd changes the workspace cwd — the cached window is for
+    /// the old cwd.
+    pub fn clear_bound_window() {
+        if let Ok(mut st) = state().lock() {
+            st.bound = None;
+        }
+    }
+
+    /// Inspect without consuming. Public (not `#[cfg(test)]`) so other
+    /// crates' tests can read state; runtime callers shouldn't need this
+    /// since the cache is internal to the sync layer.
     pub fn peek_pending_override() -> Option<Vec<PathBuf>> {
         state().lock().ok().and_then(|st| st.pending_override.clone())
+    }
+
+    /// As above, for the bound-window cache. Returns `(working_dirs, window_id)`
+    /// or `None` if no bind has been recorded since the last invalidation.
+    pub fn peek_bound_window() -> Option<(Vec<PathBuf>, u32)> {
+        state().lock().ok().and_then(|st| {
+            st.bound
+                .as_ref()
+                .map(|b| (b.working_dirs.clone(), b.window_id))
+        })
     }
 }
 
@@ -2145,7 +2203,32 @@ fn repoprompt_client(
     default_cwd: bool,
 ) -> Result<agent_repoprompt::RepoPromptClient, ToolError> {
     let mut cfg = repoprompt_config(ctx, routing, default_cwd);
+    // RF25-2: if we have a cached window_id for this working_dirs set,
+    // pre-set it before resolve_repoprompt_window runs. That makes the
+    // resolver short-circuit (it returns early when window_id is Some)
+    // and skips a ~70ms bind_context CLI call. The cache is populated on
+    // every successful resolve below, and invalidated by /cd, by skill
+    // overrides, and by run_goal's reset_sync_state.
+    if cfg.window_id.is_none()
+        && !cfg.working_dirs.is_empty()
+        && cfg.context_id.is_none()
+    {
+        if let Some(cached) = repoprompt_sync::cached_window_id_for(&cfg.working_dirs) {
+            cfg.window_id = Some(cached);
+        }
+    }
+    let working_dirs_for_record = cfg.working_dirs.clone();
     resolve_repoprompt_window(&mut cfg)?;
+    // If resolve produced a window_id (either freshly-bound or already
+    // cached via our pre-set above), record it for next time. We avoid
+    // re-recording the same `(working_dirs, window_id)` repeatedly because
+    // `record_bound_window` overwrites unconditionally; the cost is just
+    // a Mutex lock so it's not worth deduping here.
+    if let Some(window_id) = cfg.window_id
+        && !working_dirs_for_record.is_empty()
+    {
+        repoprompt_sync::record_bound_window(working_dirs_for_record, window_id);
+    }
     Ok(agent_repoprompt::RepoPromptClient::new(cfg))
 }
 
@@ -3305,6 +3388,70 @@ mod tests {
         };
         let v = queue_skill_repoprompt_binding(&binding);
         assert_eq!(v["status"], "noop");
+        assert!(repoprompt_sync::peek_pending_override().is_none());
+    }
+
+    // --- RF25-2 bound-window cache ---------------------------------------
+
+    #[test]
+    fn bound_window_cache_round_trips() {
+        let _g = rp_sync_setup();
+        let dirs = vec![PathBuf::from("/repo/a")];
+        assert!(repoprompt_sync::cached_window_id_for(&dirs).is_none());
+        repoprompt_sync::record_bound_window(dirs.clone(), 7);
+        assert_eq!(repoprompt_sync::cached_window_id_for(&dirs), Some(7));
+        assert_eq!(
+            repoprompt_sync::peek_bound_window(),
+            Some((dirs.clone(), 7))
+        );
+    }
+
+    #[test]
+    fn bound_window_cache_misses_on_different_dirs() {
+        let _g = rp_sync_setup();
+        repoprompt_sync::record_bound_window(vec![PathBuf::from("/repo/a")], 1);
+        // Same prefix, different path → cache miss (set equality).
+        let miss = repoprompt_sync::cached_window_id_for(&[PathBuf::from("/repo/b")]);
+        assert_eq!(miss, None);
+        // Different order of multi-dir set → also miss (vec order matters).
+        let miss2 = repoprompt_sync::cached_window_id_for(&[
+            PathBuf::from("/repo/b"),
+            PathBuf::from("/repo/a"),
+        ]);
+        assert_eq!(miss2, None);
+    }
+
+    #[test]
+    fn clear_bound_window_drops_cache_but_not_override() {
+        let _g = rp_sync_setup();
+        repoprompt_sync::record_bound_window(vec![PathBuf::from("/repo/a")], 1);
+        repoprompt_sync::set_pending_override(vec![PathBuf::from("/repo/skill")]);
+        // set_pending_override clears bound (intentional — about to switch).
+        assert!(repoprompt_sync::peek_bound_window().is_none());
+        // Re-record after, then test the standalone clear:
+        repoprompt_sync::record_bound_window(vec![PathBuf::from("/repo/a")], 1);
+        assert!(repoprompt_sync::peek_bound_window().is_some());
+        assert!(repoprompt_sync::peek_pending_override().is_some());
+        repoprompt_sync::clear_bound_window();
+        assert!(repoprompt_sync::peek_bound_window().is_none());
+        assert!(
+            repoprompt_sync::peek_pending_override().is_some(),
+            "clear_bound_window must not touch pending_override"
+        );
+        repoprompt_sync::reset();
+    }
+
+    #[test]
+    fn reset_clears_both_override_and_bound() {
+        let _g = rp_sync_setup();
+        repoprompt_sync::record_bound_window(vec![PathBuf::from("/a")], 9);
+        repoprompt_sync::set_pending_override(vec![PathBuf::from("/skill")]);
+        repoprompt_sync::record_bound_window(vec![PathBuf::from("/a")], 9);
+        // set_pending_override above cleared bound, so re-record after.
+        assert!(repoprompt_sync::peek_bound_window().is_some());
+        assert!(repoprompt_sync::peek_pending_override().is_some());
+        repoprompt_sync::reset();
+        assert!(repoprompt_sync::peek_bound_window().is_none());
         assert!(repoprompt_sync::peek_pending_override().is_none());
     }
 }

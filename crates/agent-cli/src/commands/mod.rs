@@ -2,6 +2,7 @@
 //! subcommand's logic; `main.rs` keeps only argument parsing and dispatch.
 
 pub(crate) mod codex;
+pub(crate) mod codex_session;
 pub(crate) mod exec;
 pub(crate) mod interactive;
 pub(crate) mod llm;

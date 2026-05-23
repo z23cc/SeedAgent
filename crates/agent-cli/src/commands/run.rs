@@ -348,6 +348,12 @@ pub(crate) struct RunGoalArgs<'a> {
     pub(crate) skills_dir: PathBuf,
     pub(crate) policy: RunPolicy,
     pub(crate) provider: ProviderSpec,
+    /// Optional REPL-lifetime Codex client cache. When `Some`, every Codex
+    /// spawn site inside this `run_goal` will reuse the cached client (with
+    /// per-turn cfg hot-swapped) instead of spawning a fresh `codex
+    /// app-server` subprocess. One-shot `seed run` callers pass `None`,
+    /// which falls back to the previous "fresh client per call" behavior.
+    pub(crate) codex_session: Option<&'a mut crate::commands::codex_session::CodexSession>,
 }
 
 fn planner_tool_infos_for_goal(tools: Vec<ToolInfo>, goal: &str) -> Vec<ToolInfo> {
@@ -493,7 +499,15 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 mcp_allow,
                 plugins,
             },
+        codex_session,
     } = args;
+    // Bridge: when we have no REPL-owned session we build a throwaway one
+    // locally so the rest of this function can speak the same API. The
+    // local session's drop kills the subprocess at function exit, restoring
+    // the pre-RF25 "fresh codex per run_goal" behavior.
+    let mut local_codex_session = crate::commands::codex_session::CodexSession::default();
+    let codex_session: &mut crate::commands::codex_session::CodexSession =
+        codex_session.unwrap_or(&mut local_codex_session);
     let cwd = cwd.unwrap_or(env::current_dir()?);
     // Drop any pending RepoPrompt binding override left behind by a previous
     // run (e.g. a skill_fetch that queued an override but the planner never
@@ -536,7 +550,12 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             mcp_allow,
             plugins,
         )?;
-        let mut client = CodexAppServerClient::new(cfg);
+        // RF25-1: reuse the REPL-lifetime client if its launch fingerprint
+        // matches; otherwise this constructs a fresh one and stashes it for
+        // next time. For one-shot `seed run --codex` callers, `codex_session`
+        // is the throwaway local one, so behavior matches the pre-RF25
+        // "fresh client per run" path.
+        let client = codex_session.ensure(cfg)?;
         let codex_goal = codex_prompt_with_routed_skill(&goal, &skills_dir)?;
         let delta_chars: Cell<usize> = Cell::new(0);
         let outcome = client.run_prompt_streaming(&codex_goal, |delta| {
@@ -718,7 +737,10 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                     synthesis_mcp_allow.clone(),
                     plugins,
                 )?;
-                let mut codex = CodexAppServerClient::new(cfg);
+                // Reuse the REPL-lifetime session (RF25-1) — synthesis is
+                // a single extra Codex turn, so it benefits the same way
+                // as the main path.
+                let codex = codex_session.ensure(cfg)?;
                 codex
                     .run_prompt(&synthesis_prompt)
                     .and_then(|result| extract_synthesized_answer(&result.text))
@@ -1003,6 +1025,18 @@ impl Planner for OraclePlanner {
     }
 }
 
+/// Planner-loop backend for `--provider codex`.
+///
+/// RF25-1 note: this planner OWNS its `CodexAppServerClient` because it
+/// lives inside a `Box<dyn Planner>` and we don't want to bleed lifetimes
+/// through the trait. As a result, planner-loop Codex sessions are NOT
+/// shared with the REPL-lifetime `codex_session` — every `run_goal` that
+/// uses `--provider codex` spawns one fresh `codex app-server` subprocess.
+/// The shared-session optimization covers the two higher-traffic paths
+/// (the `--codex` fast-path delegation and the post-loop synthesis pass);
+/// adding the planner-loop case would force a trait-object lifetime
+/// refactor and is deferred until that overhead actually shows up in a
+/// profile.
 struct CodexPlanner {
     client: CodexAppServerClient,
 }
