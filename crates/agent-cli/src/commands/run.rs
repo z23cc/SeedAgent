@@ -179,6 +179,70 @@ fn extract_synthesized_answer(text: &str) -> Result<String> {
     }
 }
 
+/// RF26-1: cheap structural check for "does this draft already follow the
+/// FINISH ANSWER SCHEMA that the synthesis pass would rewrite it into?"
+///
+/// The synthesis pass costs one full Codex turn (~60s in real runs). For
+/// reasonably-disciplined drafts that already have the four mandatory
+/// sections and at least one `[via <tool>]` citation, the rewrite is
+/// usually a paraphrase — net negative on latency and tokens, no
+/// correctness win.
+///
+/// We err on the side of running synthesis when in doubt: returning `false`
+/// here just means "do the extra turn, like before". Returning `true`
+/// short-circuits to the draft. So the cost of a false positive (skip
+/// when we shouldn't) is "the answer is structurally fine but might have
+/// banned openers"; the cost of a false negative (run synthesis when we
+/// could've skipped) is the wasted 60s. Bias toward true is fine.
+///
+/// Strategy:
+///   - Must mention all four required section labels ("Bottom line",
+///     "Evidence", "Counter-intuitive / risk" OR "Counter-intuitive", "Action items").
+///   - Must contain at least one `[via ` citation (proves Evidence
+///     section has tool-grounded bullets, not just header).
+///   - Must not start with a banned opener (these are forbidden by the
+///     synthesis prompt — if a draft starts with one, the synthesis would
+///     do real work).
+///   - Total length > 200 chars to filter out shape-only stubs.
+fn draft_already_conforms(draft: &str) -> bool {
+    let body = draft.trim();
+    if body.len() < 200 {
+        return false;
+    }
+    // Required sections. Each `find` is case-sensitive on purpose — the
+    // schema we ship in the prompt uses these exact strings, so a draft
+    // that paraphrased them ("# Conclusion" instead of "Bottom line:")
+    // probably *does* need the rewrite.
+    let has_bottom_line = body.contains("Bottom line");
+    let has_evidence = body.contains("Evidence");
+    let has_counter = body.contains("Counter-intuitive");
+    let has_actions = body.contains("Action items");
+    if !(has_bottom_line && has_evidence && has_counter && has_actions) {
+        return false;
+    }
+    // Evidence section integrity: at least one [via TOOL] citation.
+    if !body.contains("[via ") {
+        return false;
+    }
+    // Banned opener check (subset — schema lists more; this catches the
+    // common ones). If the draft opens with one of these, synthesis can
+    // still salvage the answer, so don't skip.
+    let banned_openers = [
+        "整体来看",
+        "当前", // weak — but the schema lists it explicitly
+        "如果想要继续",
+        "This project is",
+        "Overall,",
+    ];
+    let first_para = body.lines().next().unwrap_or("").trim();
+    for banned in banned_openers {
+        if first_para.starts_with(banned) {
+            return false;
+        }
+    }
+    true
+}
+
 fn active_plan_brief_for_prompt(plans_root: &Path) -> Option<String> {
     let store = agent_plan::PlanStore::new(plans_root.to_path_buf());
     let brief = store.active_brief().ok().flatten()?;
@@ -509,6 +573,18 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
     let codex_session: &mut crate::commands::codex_session::CodexSession =
         codex_session.unwrap_or(&mut local_codex_session);
     let cwd = cwd.unwrap_or(env::current_dir()?);
+    // RF26-2: for read-only analysis goals, default codex `reasoning_effort`
+    // to "low" when the user didn't explicitly set one. Codex's default is
+    // "medium" which is overkill for "summarize / explain / explore" tasks
+    // — `low` typically cuts per-turn planner time roughly in half on those
+    // shapes. User-set --effort (or /effort in REPL) always wins.
+    let effort = effort.or_else(|| {
+        if agent_runtime::is_read_only_analysis_goal(&goal) {
+            Some("low".to_string())
+        } else {
+            None
+        }
+    });
     // Drop any pending RepoPrompt binding override left behind by a previous
     // run (e.g. a skill_fetch that queued an override but the planner never
     // followed up with a repoprompt_* call). Without this, the next run's
@@ -681,10 +757,24 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         // extra LLM call to rewrite the draft answer strictly to schema. This
         // separates "what to explore next" from "how to present what I found",
         // which the planner conflates when given both jobs in the same turn.
-        if matches!(loop_result.status, agent_runtime::AgentLoopStatus::Finished)
-            && agent_runtime::is_read_only_analysis_goal(&goal)
-            && !loop_result.summary.trim().is_empty()
-        {
+        //
+        // RF26-1: skip the entire synthesis turn (~60s) when the draft
+        // already structurally conforms — same content, half the latency.
+        let synthesis_eligible = matches!(
+            loop_result.status,
+            agent_runtime::AgentLoopStatus::Finished
+        ) && agent_runtime::is_read_only_analysis_goal(&goal)
+            && !loop_result.summary.trim().is_empty();
+        if synthesis_eligible && draft_already_conforms(&loop_result.summary) {
+            // Skip path. Leave loop_result.summary as the draft; log so the
+            // user sees from the trace whether synthesis fired.
+            eprintln!(
+                "{}",
+                agent_tui::dim_text(
+                    "(synthesis pass skipped: draft already conforms to schema)"
+                )
+            );
+        } else if synthesis_eligible {
             let synthesis_spinner = agent_tui::Spinner::start("synthesizing answer · turn final");
             let synthesis_prompt = build_synthesis_prompt(
                 &goal,
@@ -1635,5 +1725,126 @@ mod tests {
         // 4-8 fail (streak=5). Abort check fires at top of turn 9, which
         // means plan() ran 8 times (one per tool call invocation).
         assert_eq!(turn_counter.get(), 8);
+    }
+
+    // --- RF26-1 draft_already_conforms ----------------------------------
+
+    fn conforming_draft() -> &'static str {
+        "Bottom line: this project ships a tiny self-bootstrapping agent kernel.\n\n\
+         Evidence:\n\
+         - [via read_files] Cargo.toml:2-15 lists 12 workspace crates.\n\
+         - [via read_files] main.rs:24 defines DEFAULT_MAX_TURNS = 24.\n\n\
+         Counter-intuitive / risk:\n\
+         - agent-cli has grown thick — orchestration logic accumulates here.\n\n\
+         Action items:\n\
+         1. Extract DEFAULT_MAX_TURNS into RunPolicy.\n\
+         2. Move codex prompt routing into a tested module."
+    }
+
+    #[test]
+    fn draft_conforms_when_all_sections_and_citation_present() {
+        assert!(draft_already_conforms(conforming_draft()));
+    }
+
+    #[test]
+    fn draft_does_not_conform_when_too_short() {
+        // Same shape, but under the 200-char threshold — that filters out
+        // header-only stubs that happen to mention all four labels.
+        let short = "Bottom line: x. Evidence: y. Counter-intuitive: z. Action items: w. [via t]";
+        assert!(short.len() < 200);
+        assert!(!draft_already_conforms(short));
+    }
+
+    #[test]
+    fn draft_does_not_conform_without_via_citation() {
+        // Replace the citations with un-citation-flavored text so [via …]
+        // is absent. Synthesis should still run to enforce the rule.
+        let noisy = "Bottom line: a project description.\n\n\
+                     Evidence:\n\
+                     - One thing about the repo.\n\
+                     - Another thing about the repo.\n\n\
+                     Counter-intuitive / risk:\n\
+                     - Nothing surprising.\n\n\
+                     Action items:\n\
+                     1. Do a thing.\n\
+                     2. Do another thing.\n\
+                     3. And a third for length padding to clear the 200-char threshold.";
+        assert!(noisy.len() >= 200);
+        assert!(!draft_already_conforms(noisy));
+    }
+
+    #[test]
+    fn draft_does_not_conform_when_missing_section() {
+        let mut text = conforming_draft().to_string();
+        text = text.replace("Counter-intuitive / risk", "Random heading");
+        assert!(!draft_already_conforms(&text));
+    }
+
+    #[test]
+    fn draft_does_not_conform_with_banned_opener() {
+        // Schema explicitly forbids these openers. If the draft uses one,
+        // synthesis would rewrite — so we should run it.
+        let banned = format!("整体来看 this project is fine. {}", conforming_draft());
+        assert!(!draft_already_conforms(&banned));
+        let banned2 = format!("Overall, the design is clean. {}", conforming_draft());
+        assert!(!draft_already_conforms(&banned2));
+    }
+
+    // --- RF26-2 auto-effort heuristic ----------------------------------
+
+    // The auto-effort logic lives inline inside `run_goal` and can't be
+    // unit-tested directly without spinning up the whole runtime. We cover
+    // the underlying classifier (`is_read_only_analysis_goal`) in
+    // agent-runtime's own test suite (lib.rs:1921+), and verify the
+    // selection rule itself here with a tiny mirror function so we catch
+    // regressions to the override logic without coupling to run_goal.
+
+    /// Mirror of the RF26-2 rule used inside `run_goal`. Kept in sync by
+    /// review (it's three lines). If this diverges, the inline call site
+    /// is the source of truth.
+    fn auto_effort_mirror(user_set: Option<String>, goal: &str) -> Option<String> {
+        user_set.or_else(|| {
+            if agent_runtime::is_read_only_analysis_goal(goal) {
+                Some("low".to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn auto_effort_user_set_always_wins() {
+        // Even if goal is read-only, user-set effort is preserved.
+        assert_eq!(
+            auto_effort_mirror(Some("high".to_string()), "分析当前的项目"),
+            Some("high".to_string())
+        );
+        // And for implementation goals.
+        assert_eq!(
+            auto_effort_mirror(Some("minimal".to_string()), "implement feature X"),
+            Some("minimal".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_effort_defaults_to_low_for_read_only_goals() {
+        for goal in ["分析当前的项目", "explain this code", "summarize the README"] {
+            assert_eq!(
+                auto_effort_mirror(None, goal),
+                Some("low".to_string()),
+                "expected low for read-only goal: {goal}",
+            );
+        }
+    }
+
+    #[test]
+    fn auto_effort_stays_none_for_implementation_goals() {
+        for goal in ["implement feature X", "refactor module Y", "fix bug Z"] {
+            assert_eq!(
+                auto_effort_mirror(None, goal),
+                None,
+                "implementation goal {goal} must not get auto-low effort",
+            );
+        }
     }
 }
