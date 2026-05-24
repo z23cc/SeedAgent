@@ -1,0 +1,1 @@
+Read-only git ops via RepoPrompt with structured output. Args: `op` (`status`|`diff`|`log`|`show`|`blame`), optional `path`, `revision`, `max_lines`. Prefer over `run_shell git ...` when you want a stable shape that survives across git output changes.

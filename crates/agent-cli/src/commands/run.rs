@@ -324,6 +324,9 @@ fn is_read_only_planner_tool(name: &str) -> bool {
             | "repoprompt_tools"
             | "repoprompt_exec"
             | "repoprompt_call"
+            | "repoprompt_codemap"
+            | "repoprompt_file_search"
+            | "repoprompt_git"
             | "read_file"
             | "read_files"
             | "run_shell"
@@ -1095,6 +1098,9 @@ mod tests {
             "plan_list",
             "tool_describe",
             "repoprompt_tools",
+            "repoprompt_codemap",
+            "repoprompt_file_search",
+            "repoprompt_git",
         ] {
             assert!(pure.contains(n), "should memoize {n}; got set={pure:?}");
         }

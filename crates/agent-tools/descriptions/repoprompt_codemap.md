@@ -1,0 +1,1 @@
+Return function and type signatures (codemap) for a file, directory, or whole workspace without loading body text. Far cheaper than read_file when you only need the API surface. Args: `targets` (paths, optional — empty = whole workspace), `language` (optional filter). Use this before read_file when exploring an unfamiliar module.

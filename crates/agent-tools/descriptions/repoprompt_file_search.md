@@ -1,0 +1,1 @@
+Structured file/content search via RepoPrompt. Args: `pattern` (required), `mode` (`path`|`content`, default `path`), `context_lines` (for content mode), `include` (glob filter like `*.rs`). Returns ranked matches with paths and snippets. Prefer this over `run_shell rg` when you need consistent structured output.

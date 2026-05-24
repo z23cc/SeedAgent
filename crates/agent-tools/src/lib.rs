@@ -139,7 +139,10 @@ mod shell;
 mod tool_describe;
 pub use ask_user::AskUserTool;
 pub use memory::{MemoryFetchTool, MemorySearchTool};
-pub use repoprompt_bridge::{RepoPromptCallTool, RepoPromptExecTool, RepoPromptToolsTool};
+pub use repoprompt_bridge::{
+    RepoPromptCallTool, RepoPromptCodemapTool, RepoPromptExecTool, RepoPromptFileSearchTool,
+    RepoPromptGitTool, RepoPromptToolsTool,
+};
 pub use shell::{ShellIntent, ShellTool, shell_command_intent};
 pub use tool_describe::ToolDescribeTool;
 pub(crate) use repoprompt_bridge::RepoPromptRoutingArgs;
@@ -178,6 +181,9 @@ fn build_seed_registry() -> ToolRegistry {
     registry.register(RepoPromptToolsTool);
     registry.register(RepoPromptExecTool);
     registry.register(RepoPromptCallTool);
+    registry.register(RepoPromptCodemapTool);
+    registry.register(RepoPromptFileSearchTool);
+    registry.register(RepoPromptGitTool);
     registry.register(ReadFileTool);
     registry.register(ReadFilesTool);
     registry.register(PatchFileTool);
