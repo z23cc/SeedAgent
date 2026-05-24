@@ -20,6 +20,29 @@ use crate::{
     truncate_utf8,
 };
 
+/// Reject writes to a file that already exists on disk but wasn't read
+/// this run. Returns `None` when the write is allowed (file didn't
+/// exist, OR planner read it earlier, OR escape hatch active).
+fn check_read_before_write(path: &Path) -> Option<String> {
+    if crate::read_paths_guard::is_disabled() {
+        return None;
+    }
+    if !path.exists() {
+        return None;
+    }
+    if crate::read_paths_guard::was_read(path) {
+        return None;
+    }
+    Some(format!(
+        "write to {} blocked: file exists on disk but was not read this run. \
+         Call read_file (or read_files) on this path first so you're patching \
+         what's actually there, not what you imagine is there. \
+         Override with env SEED_DISABLE_READ_BEFORE_WRITE=1 if you genuinely \
+         need to overwrite blind (codegen, migrations).",
+        path.display()
+    ))
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ReadFileArgs {
     // accept the synonym `file` that planners often emit.
@@ -64,6 +87,7 @@ impl Tool for ReadFileTool {
             show_line_numbers,
         )
         .map_err(|err| ToolError::Failed(err.to_string()))?;
+        crate::read_paths_guard::record(&path);
         Ok(ToolResult::ok(
             call,
             json!({
@@ -244,6 +268,7 @@ impl Tool for ReadFilesTool {
             match read_file_window(&path, start, count, keyword.as_deref(), show_line_numbers) {
                 Ok(content) => {
                     succeeded += 1;
+                    crate::read_paths_guard::record(&path);
                     files.push(json!({
                         "path": path,
                         "status": "ok",
@@ -335,6 +360,9 @@ impl Tool for PatchFileTool {
         ) {
             return Ok(ToolResult::error(call, message));
         }
+        if let Some(msg) = check_read_before_write(&path) {
+            return Ok(ToolResult::error(call, msg));
+        }
         fs::write(&path, updated_text).map_err(|err| ToolError::Failed(err.to_string()))?;
         Ok(ToolResult::ok(
             call,
@@ -399,6 +427,9 @@ impl Tool for WriteFileTool {
             existing_nonempty,
         ) {
             return Ok(ToolResult::error(call, message));
+        }
+        if let Some(msg) = check_read_before_write(&path) {
+            return Ok(ToolResult::error(call, msg));
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| ToolError::Failed(err.to_string()))?;
@@ -495,6 +526,45 @@ pub(crate) fn read_file_window(
 mod tests {
     use super::*;
     use serde_json;
+
+    #[test]
+    fn check_read_before_write_blocks_unread_existing_file() {
+        crate::read_paths_guard::reset();
+        // Use a temp file so the test is hermetic.
+        let dir = std::env::temp_dir().join(format!(
+            "seed-rbw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("foo.txt");
+        fs::write(&path, "original").unwrap();
+        let blocked = check_read_before_write(&path);
+        assert!(blocked.is_some(), "existing unread file should be blocked");
+        crate::read_paths_guard::record(&path);
+        let allowed = check_read_before_write(&path);
+        assert!(allowed.is_none(), "after read, write should be allowed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_read_before_write_allows_new_file() {
+        crate::read_paths_guard::reset();
+        let path = std::env::temp_dir().join(format!(
+            "seed-rbw-new-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!path.exists());
+        let result = check_read_before_write(&path);
+        assert!(result.is_none(), "new file should be allowed");
+    }
 
     #[test]
     fn read_file_args_accept_file_alias() {

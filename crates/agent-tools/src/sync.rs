@@ -72,6 +72,50 @@ pub mod run_mode_guard {
     }
 }
 
+/// Tracks which absolute paths have been read this run. Write tools
+/// consult this to refuse "hallucinated" edits to files the planner
+/// never inspected (Cline / Cursor convention). New-file creation is
+/// always allowed — only writes to files that ALREADY EXIST on disk
+/// and weren't read this run are blocked.
+///
+/// Escape hatch: set `SEED_DISABLE_READ_BEFORE_WRITE=1` to disable
+/// (useful for migration scripts or codegen tools that legitimately
+/// write without reading first).
+pub mod read_paths_guard {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static STATE: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
+    }
+
+    pub fn record(path: &Path) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        STATE.with(|cell| {
+            cell.borrow_mut().insert(canonical);
+        });
+    }
+
+    /// True iff `path` has been read this run (after canonicalization).
+    pub fn was_read(path: &Path) -> bool {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        STATE.with(|cell| cell.borrow().contains(&canonical))
+    }
+
+    pub fn reset() {
+        STATE.with(|cell| cell.borrow_mut().clear());
+    }
+
+    /// True when the env-var escape hatch is active.
+    pub fn is_disabled() -> bool {
+        std::env::var("SEED_DISABLE_READ_BEFORE_WRITE")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "0")
+            .is_some()
+    }
+}
+
 /// Carries one-shot suggestions from `skill_fetch` to the next
 /// `repoprompt_*` tool call without changing the cross-tool API. Reset
 /// at the top of every `run_goal` to prevent leakage across runs.

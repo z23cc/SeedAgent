@@ -61,6 +61,47 @@ SeedAgent is a self-bootstrapping agent kernel. The CLI `seed` drives a small pl
 - **Adding planner errors** (RF14): use `RuntimeError::Planner(_)` only for transient failures (network/transport/stdio hiccup that retrying might fix). Use `RuntimeError::PlannerFatal(_)` (or `RuntimeError::planner_fatal(msg)`) for permanent failures (auth rejection, model returned non-success response, runtime decided to give up). The runtime's retry loop only re-arms on `Planner` + `InvalidPlannerJson`.
 
 
+### RF54 — RepoPrompt + community-pattern parity
+
+Five-item round driven by "what RepoPrompt features and community agent
+patterns is seed not exploiting?"
+
+- **Typed RP wrappers**: `repoprompt_codemap` (signatures-only repo map,
+  Aider-style), `repoprompt_file_search` (structured search vs
+  shell-rg parsing), `repoprompt_git` (structured git ops vs shell
+  parsing). Registry 32 → 35 tools. All three are `is_pure_read` so the
+  memoization layer caches them across turns.
+- **`AGENTS.md` / `.seed/rules.md` auto-injection**: `local_project_rules_block(cwd)`
+  in `run.rs` reads either file if present and injects as a
+  `### LOCAL PROJECT RULES` block next to the L0 meta_rules / relevant
+  skill. Cursor/Continue convention.
+- **Read-before-write enforcement**: `agent_tools::read_paths_guard`
+  thread-local set. `read_file`/`read_files` record paths; `patch_file`/
+  `write_file` reject writes to existing files that weren't read this
+  run. New-file creation is always allowed. Escape hatch:
+  `SEED_DISABLE_READ_BEFORE_WRITE=1`. Check runs AFTER `durable_write_guard`
+  so generated-L1 blocks still surface their stronger error.
+- **`agent_role` on `spawn_subagent`**: optional field with three values
+  (`explorer` / `implementer` / `verifier`). Prepends a role-specific
+  system addendum to the child's task and auto-sets `--mode read|write`.
+  Unknown role is a hard error (not silently dropped). Lets the planner
+  delegate "go investigate this thing" without spelling out the rules
+  every time.
+- **Discovery hint in implementation-mode prompt**: `planner_goal_guidance`
+  for write goals now points at `repoprompt_codemap` as the recommended
+  first call on unfamiliar modules, and documents the write protocol
+  ("read before patch") so the planner sees the rule before hitting it.
+
+**Declined (not deferred)**:
+
+- **Tool-result LLM summarization**. The proposal was to summarize big
+  tool results via a planner-backend call before adding to working
+  memory. `truncate_middle_with_stats` already conveys what's missing
+  (`*_truncated: true` + `*_original_bytes`) and the planner can
+  re-slice with `read_file` start/count. An extra LLM call per turn
+  costs ~2–5s and tokens with no proven quality lift. Revisit if
+  real-run traces show truncation-induced confusion.
+
 ### Decision log
 
 RF32 through RF53 — which refactors shipped, which were declined, and
@@ -74,6 +115,7 @@ why — lives in [`ARCHITECTURE_HISTORY.md`](./ARCHITECTURE_HISTORY.md).
 - `REPOPROMPT_CLI` — override the RepoPrompt CLI path.
 - `CODEX_HOME` — override `~/.codex` for MCP config discovery.
 - `SEED_AGENT_CODEX_STDERR` — when set, forwards the Codex app-server's stderr to the terminal (useful when debugging delegate launches).
+- `SEED_DISABLE_READ_BEFORE_WRITE` — set to disable the RF54 read-before-write check (codegen / migrations).
 
 ### Where things live at runtime
 

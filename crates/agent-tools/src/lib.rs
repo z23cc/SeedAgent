@@ -54,7 +54,7 @@ pub use subagent::{
 
 
 mod sync;
-pub use sync::{skill_tools_guard, run_mode_guard, repoprompt_sync};
+pub use sync::{read_paths_guard, repoprompt_sync, run_mode_guard, skill_tools_guard};
 
 mod walk;
 pub use walk::{WalkOptions, WalkResult, walk_workspace};

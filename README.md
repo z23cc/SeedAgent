@@ -6,10 +6,13 @@ side-effect into a JSONL session, and updates a structured memory
 tree on disk.
 
 The kernel deliberately stays small — capabilities ship as crates,
-not as kernel changes. Today's tool surface is ~32 typed tools
-(read/write/patch files, shell, plan state, skill discovery,
-RepoPrompt bridge, subagent spawning, memory protocol) across 12
-workspace crates.
+not as kernel changes. Today's tool surface is ~35 typed tools
+(read/write/patch files with read-before-write enforcement, shell,
+plan state, skill discovery, RepoPrompt bridge incl. codemap /
+file_search / git wrappers, subagent spawning with `explorer` /
+`implementer` / `verifier` roles, memory protocol) across 12
+workspace crates. Project-local rules in `AGENTS.md` (or
+`.seed/rules.md`) auto-inject next to the L0 meta-rules.
 
 ## Install
 

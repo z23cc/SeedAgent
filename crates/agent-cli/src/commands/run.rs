@@ -93,6 +93,30 @@ fn build_session_archive_record(
     }
 }
 
+/// Look for project-local agent rules at `AGENTS.md` or `.seed/rules.md`
+/// relative to `cwd`. Returns a formatted prompt block when found. Mirrors
+/// the Cursor / Continue / Aider convention: a repo can ship its own
+/// agent instructions that get auto-injected next to the L0 meta_rules.
+fn local_project_rules_block(cwd: &Path) -> Option<String> {
+    const CANDIDATES: &[&str] = &["AGENTS.md", ".seed/rules.md"];
+    let mut found: Option<(PathBuf, String)> = None;
+    for candidate in CANDIDATES {
+        let path = cwd.join(candidate);
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            let trimmed = body.trim();
+            if !trimmed.is_empty() {
+                found = Some((path, trimmed.to_string()));
+                break;
+            }
+        }
+    }
+    let (path, body) = found?;
+    Some(format!(
+        "### LOCAL PROJECT RULES ({})\n{body}\nThese rules are project-local — treat them as authoritative for THIS codebase.\n",
+        path.display()
+    ))
+}
+
 /// Inline the bundled RepoPrompt routing skill (analysis / investigation
 /// / review goals) as a `### RELEVANT SKILL` block on turn 1.
 fn relevant_skill_for_goal(goal: &str, skills_dir: &Path) -> Option<String> {
@@ -680,11 +704,14 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
     // skill_fetch shouldn't restrict this run's tool catalog unless this
     // run also fetches that skill.
     agent_tools::skill_tools_guard::reset();
+    // Fresh read-before-write tracking each run.
+    agent_tools::read_paths_guard::reset();
     let memory_paths = memory_paths(&cwd, &skills_dir, store.root());
     agent_memory::rebuild_index(&memory_paths)?;
     let base_memory_text = agent_memory::planner_memory_context(&memory_paths)?;
     let plans_root = cwd.join("plans");
     let relevant_skill_block = relevant_skill_for_goal(&goal, &skills_dir);
+    let local_rules_block = local_project_rules_block(&cwd);
     let build_planner_memory = || -> agent_runtime::PlannerMemoryContext {
         let mut text = base_memory_text.clone();
         if let Some(brief) = active_plan_brief_for_prompt(&plans_root) {
@@ -692,6 +719,9 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         }
         if let Some(skill) = &relevant_skill_block {
             text = format!("{skill}\n{text}");
+        }
+        if let Some(rules) = &local_rules_block {
+            text = format!("{rules}\n{text}");
         }
         agent_runtime::PlannerMemoryContext::new(text)
     };

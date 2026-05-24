@@ -112,6 +112,31 @@ pub(crate) struct SpawnSubagentArgs {
     /// with the parent's memory layer.
     #[serde(default)]
     pub inherit_memory: Option<bool>,
+    /// Role specialization. When set, the child gets a role-specific
+    /// system addendum prepended to its task and `--mode` is auto-set.
+    /// Valid values: `explorer` | `implementer` | `verifier`.
+    #[serde(default, alias = "agent_role")]
+    pub role: Option<String>,
+}
+
+/// Returns a role-specific system addendum + the implied run mode, if
+/// the role string is recognized.
+fn resolve_role(role: &str) -> Option<(&'static str, &'static str)> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "explorer" | "explore" => Some((
+            "ROLE: explorer. You are a read-only investigation subagent. Prefer `repoprompt_codemap` and `repoprompt_file_search` over loading whole files. Do NOT call any write/patch/plan tools. Finish with concrete observations the parent can act on.",
+            "read",
+        )),
+        "implementer" | "impl" | "implement" => Some((
+            "ROLE: implementer. You are an editing subagent. Read each file before you patch it. Prefer minimal, targeted patches over whole-file rewrites. After every edit, run a narrow verification (cargo check, the relevant test). Finish with a list of changed files + the verification command + its outcome.",
+            "write",
+        )),
+        "verifier" | "verify" => Some((
+            "ROLE: verifier. You are a read-only validation subagent. Independently check whether the parent's claim holds by re-reading the relevant files, running the relevant tests, and reporting PASS or FAIL with a one-line reason. Do NOT mutate files.",
+            "read",
+        )),
+        _ => None,
+    }
 }
 
 pub struct SpawnSubagentTool;
@@ -228,18 +253,21 @@ pub(crate) fn spawn_one_subagent(
     let seed_exe = env::current_exe()
         .map_err(|err| SpawnError::Failed(format!("locate seed binary: {err}")))?;
 
-    let prompt = if args.context_files.is_empty() {
-        args.task.clone()
-    } else {
-        let mut prompt = args.task.clone();
+    let role_resolved = args.role.as_deref().and_then(resolve_role);
+    let mut prompt = String::new();
+    if let Some((addendum, _)) = role_resolved {
+        prompt.push_str(addendum);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(&args.task);
+    if !args.context_files.is_empty() {
         prompt.push_str("\n\n[CONTEXT FILES — read these first]\n");
         for path in &args.context_files {
             prompt.push_str("- ");
             prompt.push_str(path);
             prompt.push('\n');
         }
-        prompt
-    };
+    }
 
     let mut command = Command::new(&seed_exe);
     command
@@ -265,6 +293,13 @@ pub(crate) fn spawn_one_subagent(
     }
     if let Some(model) = &args.model {
         command.arg("--model").arg(model);
+    }
+    if let Some((_, mode)) = role_resolved {
+        command.arg("--mode").arg(mode);
+    } else if let Some(role) = &args.role {
+        return Err(SpawnError::Refused(format!(
+            "unknown agent_role `{role}` — valid values: explorer | implementer | verifier"
+        )));
     }
 
     let started = std::time::Instant::now();

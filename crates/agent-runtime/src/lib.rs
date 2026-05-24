@@ -374,7 +374,11 @@ fn planner_goal_guidance(goal: &str) -> &'static str {
         Rewrite any item that reads like \"考虑改进 X\" / \"加强 Y\" / \"补强 Z\" — replace with `crate-name/path:line` or `cargo test -p crate name`. \
         If you cannot point at a specific target, the item does not belong in the answer.\n"
     } else {
-        "Goal mode: implementation or action. Use durable plans for multi-step implementation work when they reduce risk.\n"
+        "Goal mode: implementation or action. Use durable plans for multi-step implementation work when they reduce risk.\n\
+        \n\
+        DISCOVERY HINT: when you don't yet know the shape of an unfamiliar module, call `repoprompt_codemap` FIRST (returns function + type signatures only, far cheaper than `read_file`). Only fall back to `read_file` once you know which specific file is worth opening.\n\
+        \n\
+        WRITE PROTOCOL: read the file before you write/patch it. The tool layer enforces this — writes to existing files that haven't been read this run are rejected. New-file creation is fine (no read required).\n"
     }
 }
 
