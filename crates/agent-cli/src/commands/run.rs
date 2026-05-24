@@ -786,6 +786,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 return Err(err);
             }
         };
+        let retries: RefCell<Vec<agent_runtime::PlannerRetryInfo>> = RefCell::new(Vec::new());
         let mut loop_result = match drive_planner_loop(
             planner.as_mut(),
             max_turns,
@@ -796,6 +797,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             &turn_timings,
             &failure_streak,
             max_consecutive_failures,
+            &retries,
             build_planner_memory,
             |call| {
                 let result = run_planner_tool(
@@ -831,6 +833,21 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         };
         drop(planner);
         spinner.stop();
+
+        // RF34-2: flush retry events captured during the loop. We defer
+        // session writes here because the in-loop on_retry closure can't
+        // hold &mut session (run_tool already does). Chronology is
+        // preserved by the JSONL timestamps.
+        for info in retries.into_inner() {
+            session.append(AgentEvent::PlannerRetry {
+                turn: info.turn,
+                attempt: info.attempt,
+                of: info.of,
+                backoff_ms: info.backoff_ms,
+                kind: info.kind.to_string(),
+                reason: compact_single_line_cli(&info.reason, 200),
+            })?;
+        }
 
         // Synthesis pass: read-only analysis goals that reach Finish get one
         // extra LLM call to rewrite the draft answer strictly to schema. This
@@ -1386,6 +1403,7 @@ fn drive_planner_loop<M, T>(
     turn_timings: &RefCell<Vec<TurnTiming>>,
     failure_streak: &Cell<usize>,
     max_consecutive_failures: usize,
+    retries: &RefCell<Vec<agent_runtime::PlannerRetryInfo>>,
     mut build_memory: M,
     mut run_tool: T,
 ) -> Result<agent_runtime::AgentLoopResult, agent_runtime::RuntimeError>
@@ -1394,7 +1412,7 @@ where
     T: FnMut(&ToolCall) -> ToolResult,
 {
     let label = planner.label();
-    agent_runtime::run_agent_loop_with_state_planner(
+    agent_runtime::run_agent_loop_with_state_planner_observed(
         max_turns,
         |state| {
             active_turn.set(state.next_turn);
@@ -1430,6 +1448,20 @@ where
             let result = run_tool(call);
             record_exec_timing(turn_timings, exec_started.elapsed());
             result
+        },
+        // RF34-2: capture retries for later session.append (we can't hold
+        // &mut session here because run_tool already does). The spinner
+        // gets a live subtitle update so the user sees the retry as it
+        // happens; the session events are flushed after the loop returns.
+        |info| {
+            spinner.set_subtitle(Some(format!(
+                "{} retry {}/{} ({:.1}s back-off)",
+                info.kind,
+                info.attempt,
+                info.of,
+                info.backoff_ms as f64 / 1000.0,
+            )));
+            retries.borrow_mut().push(info);
         },
     )
 }
@@ -1572,6 +1604,7 @@ mod tests {
         active_turn: Cell<usize>,
         turn_timings: RefCell<Vec<TurnTiming>>,
         failure_streak: Cell<usize>,
+        retries: RefCell<Vec<agent_runtime::PlannerRetryInfo>>,
     }
 
     impl LoopFixture {
@@ -1583,6 +1616,7 @@ mod tests {
                 active_turn: Cell::new(1),
                 turn_timings: RefCell::new(Vec::new()),
                 failure_streak: Cell::new(0),
+                retries: RefCell::new(Vec::new()),
             }
         }
     }
@@ -1633,6 +1667,7 @@ mod tests {
             &fx.turn_timings,
             &fx.failure_streak,
             5,
+            &fx.retries,
             || agent_runtime::PlannerMemoryContext::new(String::new()),
             |call| ok_tool_result(&call.name),
         )
@@ -1661,6 +1696,7 @@ mod tests {
             &fx.turn_timings,
             &fx.failure_streak,
             5,
+            &fx.retries,
             || agent_runtime::PlannerMemoryContext::new(String::new()),
             |call| ok_tool_result(&call.name),
         )
@@ -1698,6 +1734,7 @@ mod tests {
             &fx.turn_timings,
             &fx.failure_streak,
             5,
+            &fx.retries,
             || agent_runtime::PlannerMemoryContext::new(String::new()),
             |call| {
                 // Drive the tool closure outside drive_planner_loop too —
@@ -1739,6 +1776,7 @@ mod tests {
             &fx.turn_timings,
             &fx.failure_streak,
             5,
+            &fx.retries,
             || agent_runtime::PlannerMemoryContext::new(String::new()),
             |call| ok_tool_result(&call.name),
         )
@@ -1769,6 +1807,7 @@ mod tests {
             &fx.turn_timings,
             &fx.failure_streak,
             5,
+            &fx.retries,
             || agent_runtime::PlannerMemoryContext::new(String::new()),
             |call| ok_tool_result(&call.name),
         )
@@ -1804,6 +1843,7 @@ mod tests {
             &fx.turn_timings,
             &fx.failure_streak,
             5,
+            &fx.retries,
             || agent_runtime::PlannerMemoryContext::new(String::new()),
             |call| {
                 turn_counter.set(turn_counter.get() + 1);

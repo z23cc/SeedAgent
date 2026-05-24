@@ -850,19 +850,98 @@ where
         DEFAULT_PLANNER_TRANSPORT_RETRIES,
         plan_next,
         execute_tool,
+        |_| {},
     )
 }
 
-pub fn run_agent_loop_with_state_planner_retries<P, F>(
+/// RF34-2: same as `run_agent_loop_with_state_planner` but takes an
+/// `on_retry` callback so the CLI can emit `AgentEvent::PlannerRetry`
+/// and update the spinner. Existing callers who don't care about retry
+/// observability stay on the original entry point.
+pub fn run_agent_loop_with_state_planner_observed<P, F, R>(
+    max_turns: usize,
+    plan_next: P,
+    execute_tool: F,
+    on_retry: R,
+) -> Result<AgentLoopResult, RuntimeError>
+where
+    P: FnMut(&mut AgentLoopState) -> Result<PlannedAction, RuntimeError>,
+    F: FnMut(&ToolCall) -> ToolResult,
+    R: FnMut(PlannerRetryInfo),
+{
+    run_agent_loop_with_state_planner_retries(
+        max_turns,
+        DEFAULT_PLANNER_PARSE_RETRIES,
+        DEFAULT_PLANNER_TRANSPORT_RETRIES,
+        plan_next,
+        execute_tool,
+        on_retry,
+    )
+}
+
+/// RF34-2: information about one planner retry attempt, passed to the
+/// `on_retry` callback so the caller can emit telemetry (AgentEvent,
+/// spinner update, log line, etc.) without the runtime depending on any
+/// specific output channel.
+#[derive(Debug, Clone)]
+pub struct PlannerRetryInfo {
+    /// Turn number where the retry happened (1-based).
+    pub turn: usize,
+    /// 1-based attempt index. `attempt=1` is the first retry after the
+    /// original call failed; `attempt=2` is the second retry; etc.
+    pub attempt: usize,
+    /// Total attempts the runtime will make for this `kind`. For parse
+    /// retries this is `max_parse_retries`; for transport it's
+    /// `max_transport_retries`.
+    pub of: usize,
+    /// Backoff in milliseconds applied before this retry. Parse retries
+    /// don't sleep, so this is 0 for them; transport retries do
+    /// exponential backoff.
+    pub backoff_ms: u64,
+    /// Which retry path fired.
+    pub kind: PlannerRetryKind,
+    /// Short error string captured at retry time. Best-effort — long
+    /// errors are passed through unchanged (callers can truncate).
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerRetryKind {
+    /// `InvalidPlannerJson` — the planner returned malformed JSON. We
+    /// nudge it with a recovery hint and let it retry immediately.
+    Parse,
+    /// `RuntimeError::Planner(_)` — transport/IO failure where retrying
+    /// might succeed. Backoff applied.
+    Transport,
+}
+
+impl PlannerRetryKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            PlannerRetryKind::Parse => "parse",
+            PlannerRetryKind::Transport => "transport",
+        }
+    }
+}
+
+impl std::fmt::Display for PlannerRetryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub fn run_agent_loop_with_state_planner_retries<P, F, R>(
     max_turns: usize,
     max_parse_retries: usize,
     max_transport_retries: usize,
     mut plan_next: P,
     mut execute_tool: F,
+    mut on_retry: R,
 ) -> Result<AgentLoopResult, RuntimeError>
 where
     P: FnMut(&mut AgentLoopState) -> Result<PlannedAction, RuntimeError>,
     F: FnMut(&ToolCall) -> ToolResult,
+    R: FnMut(PlannerRetryInfo),
 {
     let max_turns = max_turns.max(1);
     let mut state = AgentLoopState::new(max_turns);
@@ -877,6 +956,15 @@ where
                 Ok(action) => break action,
                 Err(RuntimeError::InvalidPlannerJson(err)) if parse_left > 0 => {
                     parse_left -= 1;
+                    let attempt = max_parse_retries - parse_left;
+                    on_retry(PlannerRetryInfo {
+                        turn,
+                        attempt,
+                        of: max_parse_retries,
+                        backoff_ms: 0,
+                        kind: PlannerRetryKind::Parse,
+                        reason: err.to_string(),
+                    });
                     state.recovery_hint = Some(format!(
                         "Your previous response was rejected because it did not parse as a valid PlannedAction. \
                         Error: {err}\nReturn EXACTLY ONE JSON object with non-empty `summary` and `action: tool|finish`. \
@@ -886,17 +974,27 @@ where
                 }
                 Err(RuntimeError::Planner(err)) if transport_left > 0 => {
                     transport_left -= 1;
+                    let attempt = max_transport_retries - transport_left;
                     let backoff = Duration::from_millis(
                         500_u64.saturating_mul(
                             1 << (max_transport_retries - transport_left - 1) as u64,
                         ),
-                    );
+                    )
+                    .min(Duration::from_secs(8));
+                    on_retry(PlannerRetryInfo {
+                        turn,
+                        attempt,
+                        of: max_transport_retries,
+                        backoff_ms: backoff.as_millis() as u64,
+                        kind: PlannerRetryKind::Transport,
+                        reason: err.to_string(),
+                    });
                     state.recovery_hint = Some(format!(
                         "Previous planner call failed at the transport layer ({err}). \
                         The runtime backed off and is retrying once. Your next response should still \
                         be exactly one valid PlannedAction JSON object."
                     ));
-                    std::thread::sleep(backoff.min(Duration::from_secs(8)));
+                    std::thread::sleep(backoff);
                     continue;
                 }
                 Err(other) => return Err(other),
@@ -2220,7 +2318,7 @@ mod tests {
 
     #[test]
     fn planner_loop_bails_after_exhausting_retries() {
-        let err = run_agent_loop_with_state_planner_retries::<_, _>(
+        let err = run_agent_loop_with_state_planner_retries::<_, _, _>(
             3,
             1,
             0,
@@ -2230,6 +2328,7 @@ mod tests {
                 ))
             },
             |call| ToolResult::ok(call, json!({})),
+            |_| {},
         )
         .unwrap_err();
         assert!(matches!(err, RuntimeError::InvalidPlannerJson(_)));
@@ -2257,6 +2356,7 @@ mod tests {
                 }
             },
             |call| ToolResult::ok(call, json!({})),
+            |_| {},
         )
         .unwrap();
         assert_eq!(*calls.borrow(), 2);
@@ -2265,7 +2365,7 @@ mod tests {
 
     #[test]
     fn planner_loop_bails_after_transport_retries_exhaust() {
-        let err = run_agent_loop_with_state_planner_retries::<_, _>(
+        let err = run_agent_loop_with_state_planner_retries::<_, _, _>(
             3,
             0,
             1,
@@ -2275,6 +2375,7 @@ mod tests {
                 ))
             },
             |call| ToolResult::ok(call, json!({})),
+            |_| {},
         )
         .unwrap_err();
         assert!(matches!(err, RuntimeError::Planner(_)));

@@ -297,7 +297,9 @@ pub fn reflect_markdown(records: &[SessionRecord]) -> String {
                 checkpoints.push(line);
             }
             AgentEvent::RunFinished { summary, .. } => final_summary = Some(summary.clone()),
-            AgentEvent::Reflection { .. } | AgentEvent::TurnTimings { .. } => {}
+            AgentEvent::Reflection { .. }
+            | AgentEvent::TurnTimings { .. }
+            | AgentEvent::PlannerRetry { .. } => {}
         }
     }
 
@@ -974,7 +976,9 @@ impl RunLearningContext {
                         checkpoints.push(evidence.clone());
                     }
                 }
-                AgentEvent::ToolFinished { .. } | AgentEvent::TurnTimings { .. } => {}
+                AgentEvent::ToolFinished { .. }
+                | AgentEvent::TurnTimings { .. }
+                | AgentEvent::PlannerRetry { .. } => {}
             }
         }
         let tools = tools.into_iter().collect::<Vec<_>>();

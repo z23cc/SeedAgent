@@ -228,6 +228,25 @@ pub enum AgentEvent {
         status: String,
         summary: String,
     },
+    /// RF34-2: emitted when the planner's parse/transport retry path fires.
+    /// Lets sessions show how often (and why) the runtime had to back off,
+    /// without making the planner itself responsible for that observability.
+    PlannerRetry {
+        turn: usize,
+        /// Attempt index, 1-based. `attempt=1` means "first retry"
+        /// (the original call already failed).
+        attempt: usize,
+        /// Total attempts the runtime is willing to make for this kind.
+        of: usize,
+        /// Backoff in ms applied before this retry (0 for parse-retries
+        /// which retry immediately without sleeping).
+        backoff_ms: u64,
+        /// `"parse"` for `InvalidPlannerJson` retries, `"transport"` for
+        /// `Planner(_)` retries (network/stdio blip).
+        kind: String,
+        /// Short error string for trace context.
+        reason: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

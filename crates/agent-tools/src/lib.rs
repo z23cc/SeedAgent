@@ -11,6 +11,64 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 use wait_timeout::ChildExt;
 
+/// RF34-1: tool-argument repair pipeline.
+///
+/// Borrowed shape from `ref/forgecode/.../normalize_tool_args.rs`: planners
+/// don't always honor the contract. Common deviations we've observed:
+///   - `args` is a JSON object encoded as a string: `"{\"k\":\"v\"}"`
+///   - `args` is a string that re-parses as the right object type
+///   - `args` is `null` where an empty object would have worked
+///   - `args` is wrapped in an extra `{ "args": {...} }` envelope
+///
+/// `repair_tool_args` does cheap, non-destructive fixups before
+/// `serde_json::from_value` runs. When repair fails we let the normal
+/// deserialize error flow through — the planner gets a specific
+/// `ToolError::InvalidArguments` and the parse-retry path nudges it to
+/// fix the shape.
+pub fn repair_tool_args(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        // String that round-trips through a JSON parse → use the parsed
+        // version. Common cause: planner thought it needed to "escape"
+        // the args, or a model template forced everything to strings.
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            {
+                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                    return repair_tool_args(parsed);
+                }
+            }
+            Value::String(s)
+        }
+        // null → empty object so tools with all-optional fields succeed.
+        Value::Null => Value::Object(serde_json::Map::new()),
+        // Recursively unwrap `{ "args": {...} }` envelope — only when
+        // it's the sole field, to avoid eating legitimate `args` keys
+        // that happen to be the right name.
+        Value::Object(map) if map.len() == 1 && map.contains_key("args") => {
+            let mut map = map;
+            let inner = map.remove("args").unwrap_or(Value::Null);
+            repair_tool_args(inner)
+        }
+        other => other,
+    }
+}
+
+/// RF34-1: deserialize tool args with repair attempted first. Replaces
+/// the inline `serde_json::from_value(call.args.clone()).map_err(...)`
+/// boilerplate that was scattered across every Tool::execute impl.
+pub fn parse_tool_args<T: serde::de::DeserializeOwned>(
+    call: &ToolCall,
+) -> Result<T, ToolError> {
+    let repaired = repair_tool_args(call.args.clone());
+    serde_json::from_value(repaired).map_err(|source| ToolError::InvalidArguments {
+        tool: call.name.clone(),
+        source,
+    })
+}
+
 mod subagent;
 pub use subagent::{
     SEED_SUBAGENT_DEPTH_ENV, SEED_SUBAGENT_MAX_DEPTH, SEED_SUBAGENT_WATCH_DIR_ENV,
@@ -477,12 +535,8 @@ impl Tool for SkillFetchTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: SkillFetchArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-            ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            }
-        })?;
+            let args: SkillFetchArgs = parse_tool_args(call)?;
+
         let document = agent_skills::fetch_skill(&ctx.skills_dir, &args.name)
             .map_err(|err| ToolError::Failed(err.to_string()))?;
         let auto_bind = document
@@ -570,12 +624,8 @@ impl Tool for PlanCreateTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: PlanCreateArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-            ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            }
-        })?;
+            let args: PlanCreateArgs = parse_tool_args(call)?;
+
         let Some(task) = non_empty(args.task) else {
             return Ok(ToolResult::error(
                 call,
@@ -627,11 +677,8 @@ impl Tool for PlanCreateFromRepoPromptTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: PlanCreateFromRepoPromptArgs = serde_json::from_value(call.args.clone())
-            .map_err(|source| ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            })?;
+            let args: PlanCreateFromRepoPromptArgs = parse_tool_args(call)?;
+
         let export_path = absolutize(&ctx.cwd, args.export_path);
         if !export_path.is_file() {
             return Ok(ToolResult::error(
@@ -720,12 +767,8 @@ impl Tool for PlanRefineViaRepoPromptTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: PlanRefineArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-            ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            }
-        })?;
+            let args: PlanRefineArgs = parse_tool_args(call)?;
+
         let store = plan_store(ctx);
         let snapshot = store
             .snapshot(args.plan.as_deref())
@@ -868,11 +911,8 @@ impl Tool for PlanCreateViaRepoPromptTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: PlanCreateViaRepoPromptArgs = serde_json::from_value(call.args.clone())
-            .map_err(|source| ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            })?;
+            let args: PlanCreateViaRepoPromptArgs = parse_tool_args(call)?;
+
         let task_text = args.task.trim();
         if task_text.is_empty() {
             return Ok(ToolResult::error(call, "task must not be empty"));
@@ -1295,12 +1335,8 @@ impl Tool for PlanVerifyTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: PlanVerifyArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-            ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            }
-        })?;
+            let args: PlanVerifyArgs = parse_tool_args(call)?;
+
         let store = plan_store(ctx);
         let verify_context = store
             .write_verify_context(args.id.as_deref())
@@ -1555,12 +1591,8 @@ impl Tool for ReadFileTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: ReadFileArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-            ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            }
-        })?;
+            let args: ReadFileArgs = parse_tool_args(call)?;
+
         let path = resolve_path(&ctx.cwd, &args.path);
         let start = args.start.unwrap_or(1).max(1);
         let default_count = ctx.scaled_default(200, 60);
@@ -1610,12 +1642,8 @@ impl Tool for ReadFilesTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: ReadFilesArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-            ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            }
-        })?;
+            let args: ReadFilesArgs = parse_tool_args(call)?;
+
         if args.paths.is_empty() {
             return Ok(ToolResult::error(call, "paths must not be empty"));
         }
@@ -1695,12 +1723,8 @@ impl Tool for PatchFileTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: PatchFileArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-            ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            }
-        })?;
+            let args: PatchFileArgs = parse_tool_args(call)?;
+
         let path = resolve_path(&ctx.cwd, &args.path);
         if args.old_content.is_empty() {
             return Ok(ToolResult::error(call, "old_content must not be empty"));
@@ -1764,12 +1788,8 @@ impl Tool for WriteFileTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: WriteFileArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-            ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            }
-        })?;
+            let args: WriteFileArgs = parse_tool_args(call)?;
+
         let path = resolve_path(&ctx.cwd, &args.path);
         let mode = args.mode.unwrap_or(WriteMode::Overwrite);
         let existing_nonempty = fs::read_to_string(&path)
@@ -1997,12 +2017,8 @@ impl Tool for ShellTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: ShellArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-            ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            }
-        })?;
+            let args: ShellArgs = parse_tool_args(call)?;
+
         // RF27-2: in read-only mode, refuse write-shaped commands. The
         // `is_read_only_planner_tool` allowlist already lets `run_shell`
         // through unconditionally (so `ls`/`git status` work in read-only
@@ -2053,12 +2069,8 @@ impl Tool for WorkingCheckpointTool {
 }
 
 fn checkpoint_result(call: &ToolCall) -> Result<ToolResult, ToolError> {
-    let args: CheckpointArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-        ToolError::InvalidArguments {
-            tool: call.name.clone(),
-            source,
-        }
-    })?;
+        let args: CheckpointArgs = parse_tool_args(call)?;
+
     Ok(ToolResult::ok(
         call,
         json!({
@@ -2389,12 +2401,20 @@ fn run_shell(command: &str, cwd: &Path, timeout_secs: u64) -> anyhow::Result<ser
     let stdout = out_handle.join().unwrap_or_default();
     let stderr = err_handle.join().unwrap_or_default();
     let exit_code = status.and_then(|status| status.code());
+    // RF34-3: emit truncation metadata so the planner can tell when it's
+    // only seeing a slice of the real output.
+    let (stdout_text, stdout_stats) = truncate_middle_with_stats(&stdout, 12_000);
+    let (stderr_text, stderr_stats) = truncate_middle_with_stats(&stderr, 4_000);
     Ok(json!({
         "status": if !timed_out && exit_code == Some(0) { "success" } else { "error" },
         "timed_out": timed_out,
         "exit_code": exit_code,
-        "stdout": truncate_middle(&stdout, 12_000),
-        "stderr": truncate_middle(&stderr, 4_000),
+        "stdout": stdout_text,
+        "stdout_truncated": stdout_stats.was_truncated,
+        "stdout_original_bytes": stdout_stats.original_bytes,
+        "stderr": stderr_text,
+        "stderr_truncated": stderr_stats.was_truncated,
+        "stderr_original_bytes": stderr_stats.original_bytes,
     }))
 }
 
@@ -2611,12 +2631,19 @@ fn resolve_repoprompt_window(
 }
 
 fn repoprompt_output_json(output: agent_repoprompt::RepoPromptOutput) -> serde_json::Value {
+    // RF34-3: same truncation-metadata pattern as the shell tool.
+    let (stdout_text, stdout_stats) = truncate_middle_with_stats(&output.stdout, 20_000);
+    let (stderr_text, stderr_stats) = truncate_middle_with_stats(&output.stderr, 6_000);
     json!({
         "status": output.status(),
         "timed_out": output.timed_out,
         "exit_code": output.exit_code,
-        "stdout": truncate_middle(&output.stdout, 20_000),
-        "stderr": truncate_middle(&output.stderr, 6_000),
+        "stdout": stdout_text,
+        "stdout_truncated": stdout_stats.was_truncated,
+        "stdout_original_bytes": stdout_stats.original_bytes,
+        "stderr": stderr_text,
+        "stderr_truncated": stderr_stats.was_truncated,
+        "stderr_original_bytes": stderr_stats.original_bytes,
         "json": output.json,
     })
 }
@@ -2802,6 +2829,38 @@ fn truncate_middle(input: &str, max_len: usize) -> String {
     )
 }
 
+/// RF34-3: like `truncate_middle` but returns metadata alongside the
+/// truncated text. Tool results that include this metadata (`*_truncated`
+/// + `*_original_bytes` fields) let the planner reason about whether the
+/// observation is complete — e.g. "shell stdout was truncated from 80KB
+/// to 12KB, the relevant info might be in the missing 68KB so I should
+/// re-run with grep/head/tail to slice it."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TruncationStats {
+    pub was_truncated: bool,
+    pub original_bytes: usize,
+}
+
+pub fn truncate_middle_with_stats(input: &str, max_len: usize) -> (String, TruncationStats) {
+    let original_bytes = input.len();
+    if original_bytes <= max_len {
+        return (
+            input.to_string(),
+            TruncationStats {
+                was_truncated: false,
+                original_bytes,
+            },
+        );
+    }
+    (
+        truncate_middle(input, max_len),
+        TruncationStats {
+            was_truncated: true,
+            original_bytes,
+        },
+    )
+}
+
 fn truncate_utf8(text: &mut String, limit: usize) {
     if text.len() <= limit {
         return;
@@ -2849,12 +2908,8 @@ impl Tool for AskUserTool {
     }
 
     fn execute(&self, _ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: AskUserArgs = serde_json::from_value(call.args.clone()).map_err(|source| {
-            ToolError::InvalidArguments {
-                tool: call.name.clone(),
-                source,
-            }
-        })?;
+            let args: AskUserArgs = parse_tool_args(call)?;
+
         use std::io::IsTerminal;
         let stdin = std::io::stdin();
         if !stdin.is_terminal() {
@@ -3732,6 +3787,124 @@ mod tests {
         let v = queue_skill_repoprompt_binding(&binding);
         assert_eq!(v["status"], "noop");
         assert!(repoprompt_sync::peek_pending_override().is_none());
+    }
+
+    // --- RF34-1 repair_tool_args ----------------------------------------
+
+    #[test]
+    fn repair_unwraps_stringified_json_object() {
+        let input = serde_json::Value::String("{\"k\":\"v\"}".to_string());
+        let repaired = repair_tool_args(input);
+        assert_eq!(repaired, serde_json::json!({"k": "v"}));
+    }
+
+    #[test]
+    fn repair_unwraps_stringified_json_array() {
+        let input = serde_json::Value::String("[1, 2, 3]".to_string());
+        let repaired = repair_tool_args(input);
+        assert_eq!(repaired, serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn repair_leaves_genuine_string_untouched() {
+        // A user-meant string like a goal/prompt shouldn't be re-parsed.
+        let input = serde_json::Value::String("hello world".to_string());
+        let repaired = repair_tool_args(input);
+        assert_eq!(repaired, serde_json::json!("hello world"));
+    }
+
+    #[test]
+    fn repair_treats_null_as_empty_object() {
+        let repaired = repair_tool_args(serde_json::Value::Null);
+        assert_eq!(repaired, serde_json::json!({}));
+    }
+
+    #[test]
+    fn repair_unwraps_sole_args_envelope() {
+        let input = serde_json::json!({"args": {"k": "v"}});
+        let repaired = repair_tool_args(input);
+        assert_eq!(repaired, serde_json::json!({"k": "v"}));
+    }
+
+    #[test]
+    fn repair_does_not_unwrap_envelope_with_siblings() {
+        // {"args": {...}, "other": ...} — caller probably meant the
+        // multi-field object; eating "args" would lose data.
+        let input = serde_json::json!({"args": {"k": "v"}, "other": 1});
+        let repaired = repair_tool_args(input.clone());
+        assert_eq!(repaired, input);
+    }
+
+    #[test]
+    fn repair_handles_nested_stringification() {
+        // Double-wrap: object → string → "args" envelope. Recursion peels both.
+        let input = serde_json::json!({"args": "{\"k\": \"v\"}"});
+        let repaired = repair_tool_args(input);
+        assert_eq!(repaired, serde_json::json!({"k": "v"}));
+    }
+
+    #[test]
+    fn parse_tool_args_succeeds_via_repair_path() {
+        use serde::Deserialize;
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Foo {
+            k: String,
+        }
+        let call = ToolCall::new(
+            "test",
+            serde_json::Value::String("{\"k\":\"v\"}".to_string()),
+        );
+        let parsed: Foo = parse_tool_args(&call).unwrap();
+        assert_eq!(parsed, Foo { k: "v".to_string() });
+    }
+
+    #[test]
+    fn parse_tool_args_returns_invalid_arguments_for_unrepairable() {
+        use serde::Deserialize;
+        #[derive(Debug, Deserialize)]
+        struct Foo {
+            #[allow(dead_code)]
+            k: String,
+        }
+        // Plain string can't become Foo even after repair → InvalidArguments.
+        let call = ToolCall::new("test", serde_json::Value::String("plain".to_string()));
+        let err = parse_tool_args::<Foo>(&call).unwrap_err();
+        match err {
+            ToolError::InvalidArguments { tool, .. } => assert_eq!(tool, "test"),
+            other => panic!("expected InvalidArguments, got {other:?}"),
+        }
+    }
+
+    // --- RF34-3 truncate_middle_with_stats ------------------------------
+
+    #[test]
+    fn truncate_stats_no_truncation_when_under_limit() {
+        let (text, stats) = truncate_middle_with_stats("hello", 100);
+        assert_eq!(text, "hello");
+        assert!(!stats.was_truncated);
+        assert_eq!(stats.original_bytes, 5);
+    }
+
+    #[test]
+    fn truncate_stats_no_truncation_at_exact_limit() {
+        let input = "a".repeat(100);
+        let (text, stats) = truncate_middle_with_stats(&input, 100);
+        assert_eq!(text, input);
+        assert!(!stats.was_truncated);
+        assert_eq!(stats.original_bytes, 100);
+    }
+
+    #[test]
+    fn truncate_stats_reports_original_size() {
+        let input = "x".repeat(50_000);
+        let (text, stats) = truncate_middle_with_stats(&input, 1_000);
+        assert!(stats.was_truncated);
+        assert_eq!(stats.original_bytes, 50_000);
+        // Truncation marker is present.
+        assert!(text.contains("omitted long output"));
+        // Output IS shorter than input — though it may exceed max_len by
+        // the length of the marker; the contract is "shorter than input".
+        assert!(text.len() < input.len());
     }
 
     // --- RF25-2 bound-window cache ---------------------------------------
