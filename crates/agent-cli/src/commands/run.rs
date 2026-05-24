@@ -492,6 +492,42 @@ fn is_read_only_planner_tool(name: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// RF35-2: cache key for within-run tool memoization. We canonicalize the
+/// args via `to_string` (which sorts object keys deterministically in
+/// serde_json) so `{"a":1,"b":2}` and `{"b":2,"a":1}` hash the same.
+fn memoize_key(name: &str, args: &serde_json::Value) -> (String, String) {
+    (
+        name.to_string(),
+        serde_json::to_string(args).unwrap_or_default(),
+    )
+}
+
+/// RF35-2: allowlist of tools whose result is a pure function of their
+/// args within one run. Repeated calls (planner double-checking, multiple
+/// turns asking the same question) return the cached value.
+///
+/// Excluded by default: anything with side effects (write/patch/shell/
+/// spawn/plan-mutating/long-term-memory-mutating/checkpoint/ask_user),
+/// repoprompt_exec/repoprompt_call (they can perform edits or oracle
+/// chats that aren't reproducible).
+fn is_memoizable_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "read_files"
+            | "memory_search"
+            | "memory_fetch"
+            | "skill_list"
+            | "skill_search"
+            | "skill_fetch"
+            | "plan_status"
+            | "plan_next"
+            | "plan_list"
+            | "tool_describe"
+            | "repoprompt_tools"
+    )
+}
+
 fn run_planner_tool(
     spinner: Option<&agent_tui::Spinner>,
     allowed_tool_names: &BTreeSet<String>,
@@ -721,11 +757,34 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 session.append(AgentEvent::Reflection {
                     summary: result.text.clone(),
                 })?;
+                // RF35-1: surface token usage when Codex sent the
+                // `thread/tokenUsageUpdated` notification. Single dim line
+                // so it doesn't compete with the answer; absent when the
+                // daemon/server didn't emit usage data.
+                if let Some(t) = result.tokens.as_ref() {
+                    eprintln!(
+                        "{}",
+                        agent_tui::dim_text(&format!(
+                            "(tokens: {} in / {} cached / {} out / {} reasoning · {} total)",
+                            t.input_tokens,
+                            t.cached_input_tokens,
+                            t.output_tokens,
+                            t.reasoning_output_tokens,
+                            t.total_tokens
+                        ))
+                    );
+                }
                 session.append(AgentEvent::RunFinished {
                     status: "completed".to_string(),
                     summary: format!(
-                        "Codex completed turn {} after {} events.",
-                        result.turn_id, result.events_seen
+                        "Codex completed turn {} after {} events.{}",
+                        result.turn_id,
+                        result.events_seen,
+                        result
+                            .tokens
+                            .as_ref()
+                            .map(|t| format!(" tokens: {}", t.total_tokens))
+                            .unwrap_or_default()
                     ),
                 })?;
                 println!("{}", result.text);
@@ -787,6 +846,11 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             }
         };
         let retries: RefCell<Vec<agent_runtime::PlannerRetryInfo>> = RefCell::new(Vec::new());
+        // RF35-2: per-run cache for pure-read tools. Saves the planner
+        // re-reading Cargo.toml three times in one goal (a common pattern
+        // when it's exploring → answers → double-checks before finishing).
+        let tool_cache: RefCell<std::collections::HashMap<(String, String), ToolResult>> =
+            RefCell::new(std::collections::HashMap::new());
         let mut loop_result = match drive_planner_loop(
             planner.as_mut(),
             max_turns,
@@ -800,6 +864,28 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             &retries,
             build_planner_memory,
             |call| {
+                // RF35-2: short-circuit if we already have a cached
+                // result for this exact (name, args). We emit a dim
+                // "(cached)" line via the spinner so the trace makes the
+                // skip visible.
+                if is_memoizable_tool(&call.name) {
+                    let key = memoize_key(&call.name, &call.args);
+                    if let Some(cached) = tool_cache.borrow().get(&key).cloned() {
+                        let (inner_tool, args_text) =
+                            format_call_args_for_display(&call.name, &call.args, 120);
+                        emit_tool_line(
+                            Some(&spinner),
+                            &compose_tool_label(&call.name, inner_tool.as_deref()),
+                            &args_text,
+                            agent_tui::Status::Ok,
+                            None,
+                            "cached",
+                        );
+                        // Cached read = always "success" from streak POV.
+                        failure_streak.set(0);
+                        return cached;
+                    }
+                }
                 let result = run_planner_tool(
                     Some(&spinner),
                     &allowed_tool_names,
@@ -812,6 +898,11 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 );
                 if result.ok {
                     failure_streak.set(0);
+                    if is_memoizable_tool(&call.name) {
+                        tool_cache
+                            .borrow_mut()
+                            .insert(memoize_key(&call.name, &call.args), result.clone());
+                    }
                 } else {
                     failure_streak.set(failure_streak.get() + 1);
                 }
@@ -1470,6 +1561,70 @@ where
 mod tests {
     use super::*;
     use agent_core::ToolInfo;
+
+    // --- RF35-2 tool memoization ----------------------------------------
+
+    #[test]
+    fn memoize_key_orders_object_fields_canonically() {
+        // Same logical args, different field order → same key.
+        let a = serde_json::json!({"a": 1, "b": 2});
+        let b = serde_json::json!({"a": 1, "b": 2});
+        assert_eq!(memoize_key("t", &a), memoize_key("t", &b));
+    }
+
+    #[test]
+    fn memoize_key_differs_on_args_change() {
+        let a = serde_json::json!({"path": "foo"});
+        let b = serde_json::json!({"path": "bar"});
+        assert_ne!(memoize_key("read_file", &a), memoize_key("read_file", &b));
+    }
+
+    #[test]
+    fn memoize_key_differs_on_name_change() {
+        let args = serde_json::json!({"x": 1});
+        assert_ne!(memoize_key("read_file", &args), memoize_key("read_files", &args));
+    }
+
+    #[test]
+    fn is_memoizable_only_for_read_tools() {
+        // Read-shaped → memoize.
+        for n in [
+            "read_file",
+            "read_files",
+            "memory_search",
+            "memory_fetch",
+            "skill_list",
+            "skill_search",
+            "skill_fetch",
+            "plan_status",
+            "plan_next",
+            "plan_list",
+            "tool_describe",
+            "repoprompt_tools",
+        ] {
+            assert!(is_memoizable_tool(n), "should memoize {n}");
+        }
+        // Side-effect tools → must NOT memoize.
+        for n in [
+            "write_file",
+            "patch_file",
+            "run_shell",
+            "spawn_subagent",
+            "plan_create",
+            "plan_complete",
+            "plan_record_artifact",
+            "plan_record_handoff",
+            "plan_verify",
+            "update_working_checkpoint",
+            "start_long_term_update",
+            "complete_long_term_update",
+            "ask_user",
+            "repoprompt_exec",
+            "repoprompt_call",
+        ] {
+            assert!(!is_memoizable_tool(n), "must not memoize {n}");
+        }
+    }
 
     #[test]
     fn read_only_analysis_hides_plan_and_mutating_tools_from_planner() {

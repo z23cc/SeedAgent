@@ -254,6 +254,28 @@ pub struct CodexRunResult {
     pub turn_id: String,
     pub text: String,
     pub events_seen: usize,
+    /// RF35-1: token usage for this turn, when Codex sent a
+    /// `thread/tokenUsageUpdated` notification before `turn/completed`.
+    /// `None` when Codex didn't emit one (older daemon, errored turn, …).
+    pub tokens: Option<TokenUsage>,
+}
+
+/// Per-turn token breakdown captured from Codex's
+/// `thread/tokenUsageUpdated` notification (or an HTTP `response.completed`
+/// event for the HttpPlanner path). All counters are cumulative for the
+/// turn; sum across turns for run totals.
+///
+/// `cached_input_tokens` is broken out separately because Codex's pricing
+/// (and most providers') discounts cached input — surfacing it lets a
+/// future cost dashboard render an accurate effective rate without us
+/// hard-coding price tables.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub total_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -549,6 +571,11 @@ impl CodexAppServerClient {
         let deadline = Instant::now() + Duration::from_secs(self.cfg.turn_timeout_secs);
         let mut text = String::new();
         let mut events_seen = 0usize;
+        // RF35-1: capture the most recent token-usage notification for
+        // this turn. Codex emits `thread/tokenUsageUpdated` one or more
+        // times before `turn/completed`; the last one before completion
+        // is the authoritative per-turn breakdown.
+        let mut tokens: Option<TokenUsage> = None;
 
         while Instant::now() < deadline {
             let Some(message) = self.recv(Duration::from_millis(500))? else {
@@ -567,12 +594,18 @@ impl CodexAppServerClient {
                         on_delta(delta);
                     }
                 }
+                "thread/tokenUsageUpdated" => {
+                    if let Some(usage) = parse_thread_token_usage(params) {
+                        tokens = Some(usage);
+                    }
+                }
                 "turn/completed" if message_mentions_turn(params, &turn_id) => {
                     return Ok(CodexRunResult {
                         thread_id,
                         turn_id,
                         text,
                         events_seen,
+                        tokens,
                     });
                 }
                 "error" => {
@@ -734,6 +767,33 @@ pub fn approval_response(method: &str, mode: ApprovalMode) -> Value {
     json!({ "response": "decline" })
 }
 
+/// RF35-1: extract a [`TokenUsage`] from a `thread/tokenUsageUpdated`
+/// notification's params. Per the schema:
+///   `params.tokenUsage.last.{inputTokens, outputTokens, …}`
+///
+/// We use `.last` (per-turn delta) rather than `.total` (running total
+/// for the thread) because Codex calls `start_thread` per `run_prompt`,
+/// so `total` == `last` in practice for us — but `last` is the safer
+/// semantic if that ever changes.
+///
+/// Returns `None` on shape mismatch — defensive against schema drift in
+/// Codex updates.
+fn parse_thread_token_usage(params: &Value) -> Option<TokenUsage> {
+    let breakdown = params.get("tokenUsage")?.get("last")?;
+    fn read_u64(b: &Value, field: &str) -> u64 {
+        b.get(field)
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    }
+    Some(TokenUsage {
+        input_tokens: read_u64(breakdown, "inputTokens"),
+        cached_input_tokens: read_u64(breakdown, "cachedInputTokens"),
+        output_tokens: read_u64(breakdown, "outputTokens"),
+        reasoning_output_tokens: read_u64(breakdown, "reasoningOutputTokens"),
+        total_tokens: read_u64(breakdown, "totalTokens"),
+    })
+}
+
 fn matches_turn(params: &Value, thread_id: &str, turn_id: &str) -> bool {
     let thread_matches = params
         .get("threadId")
@@ -864,6 +924,74 @@ mod tests {
     fn turn_match_accepts_nested_turn() {
         let params = json!({ "turn": { "id": "turn_1" } });
         assert!(message_mentions_turn(&params, "turn_1"));
+    }
+
+    // --- RF35-1 token usage parsing -------------------------------------
+
+    #[test]
+    fn parse_token_usage_extracts_full_breakdown() {
+        let params = json!({
+            "threadId": "t1",
+            "turnId": "u1",
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 1234,
+                    "cachedInputTokens": 200,
+                    "outputTokens": 456,
+                    "reasoningOutputTokens": 89,
+                    "totalTokens": 1779
+                },
+                "total": {
+                    "inputTokens": 99999,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 0,
+                    "reasoningOutputTokens": 0,
+                    "totalTokens": 99999
+                }
+            }
+        });
+        let usage = parse_thread_token_usage(&params).expect("parses");
+        assert_eq!(usage.input_tokens, 1234);
+        assert_eq!(usage.cached_input_tokens, 200);
+        assert_eq!(usage.output_tokens, 456);
+        assert_eq!(usage.reasoning_output_tokens, 89);
+        assert_eq!(usage.total_tokens, 1779);
+    }
+
+    #[test]
+    fn parse_token_usage_tolerates_missing_fields() {
+        // Older codex daemons (or schema drift) might omit some fields.
+        // We default to 0 rather than reject.
+        let params = json!({
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 10,
+                    "outputTokens": 5,
+                    "totalTokens": 15
+                    // cachedInputTokens, reasoningOutputTokens omitted
+                }
+            }
+        });
+        let usage = parse_thread_token_usage(&params).expect("parses");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cached_input_tokens, 0);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.reasoning_output_tokens, 0);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn parse_token_usage_returns_none_for_unrelated_params() {
+        // Not a tokenUsageUpdated notification → no usage to extract.
+        let params = json!({ "delta": "hello" });
+        assert!(parse_thread_token_usage(&params).is_none());
+    }
+
+    #[test]
+    fn token_usage_default_is_all_zeros() {
+        let u = TokenUsage::default();
+        assert_eq!(u.total_tokens, 0);
+        assert_eq!(u.input_tokens, 0);
     }
 
     #[test]
