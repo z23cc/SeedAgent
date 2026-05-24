@@ -58,6 +58,37 @@ SeedAgent is a self-bootstrapping agent kernel. The CLI `seed` drives a small pl
 - **Library crates expose typed errors** (RF10): `agent-plan`, `agent-memory`, `agent-session`, `agent-skills`, `agent-repoprompt`, plus the pre-existing `agent-core`/`agent-llm`/`agent-runtime`/`agent-delegate`. Public fns return `XxxResult<T> = Result<T, XxxError>`; each `XxxError` carries a small set of pattern-matchable variants (e.g. `PlanError::ItemNotFound { index }`, `SkillError::NotFound { name, skills_dir }`) plus an `Other(#[from] anyhow::Error)` escape hatch so internal `?` keeps working. Borrowed from forge's `forge_domain::Error` pattern — when adding a new library error, name the variants callers will want to switch on, leave everything else as `Other`.
 - **Adding planner errors** (RF14): use `RuntimeError::Planner(_)` only for transient failures (network/transport/stdio hiccup that retrying might fix). Use `RuntimeError::PlannerFatal(_)` (or `RuntimeError::planner_fatal(msg)`) for permanent failures (auth rejection, model returned non-success response, runtime decided to give up). The runtime's retry loop only re-arms on `Planner` + `InvalidPlannerJson`.
 
+### Deliberately closed (not "TODO" — design decisions)
+
+These came up during RF24–RF29 analysis and were considered, sized, then
+declined. Don't reopen without new data:
+
+- **Codex daemon mode (`codex app-server daemon` + `remote-control`).** After
+  RF25-1 a long-lived REPL session reuses one app-server subprocess, so
+  daemon mode only helps the "10 successive `seed run …` invocations
+  from a shell" case. Daemon lifecycle management (auto-start, ownership,
+  cross-process state) is non-trivial; the saved 300ms × N isn't worth it
+  until that becomes someone's bottleneck.
+- **Skill autobind also updates `workspace.cwd` / Codex cwd.** Currently
+  skill bindings are transient (RF24-4): they hijack one rp call's
+  working_dirs and then RP falls back to `ctx.cwd`. Making the binding
+  sticky would cross into "skill silently `/cd`-ed me", which is
+  surprising. The transient model is intentional; explicit `/cd` is the
+  user-visible workspace switch.
+- **Per-turn tool-description culling in the planner prompt.** Real prompt-
+  token savings, but the safety net (planner picks wrong tool because it
+  didn't see the description) needs data. Codex's prompt cache likely
+  recovers most of the wasted bytes anyway. Re-evaluate if a profile
+  shows the prompt-build path is the bottleneck.
+- **Cross-turn memory-context cache (manual prefix-prompt cache).** Codex's
+  server-side prompt caching almost certainly already does this — adding
+  our own layer risks fighting it. Leave to the backend.
+- **`HttpPlanner` streaming.** Codex is the default planner; HTTP providers
+  are opt-in (`--provider openai|…`). Adding SSE streaming touches
+  `agent_llm::ProviderClient` (currently `reqwest::blocking`) and would
+  cascade async-ness through `Planner::plan`. Defer until a real HTTP-only
+  user shows up.
+
 ### Environment variables
 
 - `OPENAI_API_KEY` — required only for HTTP OpenAI provider paths (`llm ask`, `run --llm --provider openai`).
