@@ -425,7 +425,10 @@ impl Tool for ToolDescribeTool {
 
 #[derive(Debug, Deserialize)]
 struct MemorySearchArgs {
+    // RF38-2: planners often use `q` for query and `top_k`/`n` for limit.
+    #[serde(alias = "q", alias = "search", alias = "term", alias = "needle")]
     query: String,
+    #[serde(default, alias = "top_k", alias = "n", alias = "max_results")]
     limit: Option<usize>,
 }
 
@@ -466,7 +469,10 @@ impl Tool for MemorySearchTool {
 
 #[derive(Debug, Deserialize)]
 struct MemoryFetchArgs {
+    // RF38-2: `name`/`key`/`path` synonyms — planners conflate them.
+    #[serde(alias = "name", alias = "key", alias = "path", alias = "memory_id")]
     id: String,
+    #[serde(default, alias = "max_size", alias = "byte_limit")]
     max_bytes: Option<usize>,
 }
 
@@ -542,7 +548,9 @@ impl Tool for SkillListTool {
 
 #[derive(Debug, Deserialize)]
 struct SkillSearchArgs {
+    #[serde(alias = "q", alias = "search", alias = "term", alias = "needle")]
     query: String,
+    #[serde(default, alias = "top_k", alias = "n", alias = "max_results")]
     limit: Option<usize>,
 }
 
@@ -1654,10 +1662,16 @@ impl Tool for RepoPromptCallTool {
 
 #[derive(Debug, Deserialize)]
 struct ReadFileArgs {
+    // RF38-2: accept the synonym `file` that planners often emit.
+    #[serde(alias = "file", alias = "filename", alias = "filepath")]
     path: String,
+    #[serde(default, alias = "start_line", alias = "from")]
     start: Option<usize>,
+    #[serde(default, alias = "limit", alias = "lines", alias = "max_lines")]
     count: Option<usize>,
+    #[serde(default, alias = "pattern", alias = "needle")]
     keyword: Option<String>,
+    #[serde(default, alias = "line_numbers")]
     show_line_numbers: Option<bool>,
 }
 
@@ -1701,14 +1715,16 @@ impl Tool for ReadFileTool {
 
 #[derive(Debug, Deserialize)]
 struct ReadFilesArgs {
+    // RF38-2: accept `files`/`filenames` as synonyms for `paths`.
+    #[serde(alias = "files", alias = "filenames", alias = "filepaths")]
     paths: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "start_line", alias = "from")]
     start: Option<usize>,
-    #[serde(default)]
+    #[serde(default, alias = "limit", alias = "lines", alias = "max_lines")]
     count: Option<usize>,
-    #[serde(default)]
+    #[serde(default, alias = "pattern", alias = "needle")]
     keyword: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "line_numbers")]
     show_line_numbers: Option<bool>,
 }
 
@@ -1788,8 +1804,13 @@ impl Tool for ReadFilesTool {
 
 #[derive(Debug, Deserialize)]
 struct PatchFileArgs {
+    // RF38-2: `file`/`filename` synonyms for `path`. `old`/`new` shorthand
+    // synonyms for the content fields (Anthropic tool-use style).
+    #[serde(alias = "file", alias = "filename", alias = "filepath")]
     path: String,
+    #[serde(alias = "old", alias = "before", alias = "search")]
     old_content: String,
+    #[serde(alias = "new", alias = "after", alias = "replace")]
     new_content: String,
 }
 
@@ -1845,8 +1866,12 @@ impl Tool for PatchFileTool {
 
 #[derive(Debug, Deserialize)]
 struct WriteFileArgs {
+    // RF38-2: `file`/`filename` for `path`, `text`/`body`/`data` for content.
+    #[serde(alias = "file", alias = "filename", alias = "filepath")]
     path: String,
+    #[serde(alias = "text", alias = "body", alias = "data")]
     content: String,
+    #[serde(default)]
     mode: Option<WriteMode>,
 }
 
@@ -1939,9 +1964,32 @@ impl From<WriteMode> for DurableWriteMode {
 
 #[derive(Debug, Deserialize)]
 struct ShellArgs {
+    // RF38-2: planners often emit `cmd` instead of `command`. Same for
+    // `timeout_ms` vs `timeout_secs`, `dir` vs `cwd`. Accept the
+    // synonyms so we don't waste a turn on a self-correctable mistake.
+    #[serde(alias = "cmd", alias = "shell", alias = "script")]
     command: String,
+    #[serde(default, alias = "dir", alias = "working_dir")]
     cwd: Option<String>,
+    #[serde(default, alias = "timeout", alias = "timeout_seconds")]
     timeout_secs: Option<u64>,
+    // RF38-2: planners that came from Claude tool-use sometimes send
+    // `timeout_ms`. Accept it as a denominator-converted hint — we don't
+    // expose it in the canonical struct (it'd duplicate timeout_secs),
+    // but #[serde(deny_unknown_fields)] would otherwise reject it.
+    // Default behavior: silently ignored if the canonical field is also
+    // present; otherwise convert.
+    #[serde(default, alias = "timeoutMs")]
+    timeout_ms: Option<u64>,
+}
+
+impl ShellArgs {
+    /// Resolve the timeout in seconds with synonym fallback.
+    fn resolved_timeout_secs(&self) -> Option<u64> {
+        self.timeout_secs.or_else(|| {
+            self.timeout_ms.map(|ms| (ms + 999) / 1000)
+        })
+    }
 }
 
 /// Classification of a shell command's intent for the read-only guard.
@@ -2122,7 +2170,11 @@ impl Tool for ShellTool {
             .as_deref()
             .map(|path| resolve_path(&ctx.cwd, path))
             .unwrap_or_else(|| ctx.cwd.clone());
-        let output = run_shell(&args.command, &cwd, args.timeout_secs.unwrap_or(60))
+        let output = run_shell(
+            &args.command,
+            &cwd,
+            args.resolved_timeout_secs().unwrap_or(60),
+        )
             .map_err(|err| ToolError::Failed(err.to_string()))?;
         Ok(ToolResult::ok(call, output))
     }
@@ -2683,6 +2735,14 @@ fn resolve_repoprompt_window(
         raw_json: true,
         ..Default::default()
     };
+    // RF38-1: default to `create_if_missing: true` so an `seed`/agent
+    // invocation in a cwd that RepoPrompt has never seen auto-registers
+    // it as a workspace instead of failing the entire rp call. Live RP
+    // CLI honors this — `bind_context op=bind working_dirs=[…] create_if_missing=true`
+    // returns `"created_workspace": true` and a fresh window_id when the
+    // dir isn't already a workspace. The historical `false` here turned
+    // "first time using rp in a new repo" into a hard error and forced
+    // the planner to fall back to `run_shell find`, costing a turn.
     let output = agent_repoprompt::RepoPromptClient::new(bind_cfg)
         .call_tool(
             agent_repoprompt::RepoPromptTool::BindContext,
@@ -2693,14 +2753,20 @@ fn resolve_repoprompt_window(
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>(),
-                "create_if_missing": false,
+                "create_if_missing": true,
             }),
         )
         .map_err(|err| ToolError::Failed(format!("RepoPrompt bind failed: {err}")))?;
     if output.timed_out || output.exit_code != Some(0) {
+        // RF38-3: translate the raw rp-cli/JSON-RPC error into one
+        // actionable line. Common case after RF38-1's fix is now narrow:
+        // RP CLI absent or RP app not running. Other cases (workspace
+        // disambiguation conflicts, malformed dir paths) keep the raw
+        // tail for debugging.
+        let raw = compact_single_line(&repoprompt_report_text(&output), 800);
+        let friendly = humanize_rp_bind_failure(&raw);
         return Err(ToolError::Failed(format!(
-            "RepoPrompt bind failed before routed call: {}",
-            compact_single_line(&repoprompt_report_text(&output), 800)
+            "RepoPrompt bind failed before routed call: {friendly} (raw: {raw})"
         )));
     }
     if let Some(window_id) = repoprompt_output_u32(&output, &["window_id", "windowID"]) {
@@ -2710,6 +2776,39 @@ fn resolve_repoprompt_window(
     Err(ToolError::Failed(
         "RepoPrompt bind succeeded but did not return a window_id".to_string(),
     ))
+}
+
+/// RF38-3: translate an `rp-cli` raw error tail into a one-line message
+/// telling the user what's wrong and how to recover. Pattern-matches on
+/// the substrings RP CLI emits (we don't have a typed error from RP);
+/// any unmatched raw text falls through to "(see raw error)" so we never
+/// drop information silently.
+pub fn humanize_rp_bind_failure(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("no exact workspace match") || lower.contains("no exact match") {
+        // After RF38-1 this should be rare — implicit bind defaults to
+        // `create_if_missing: true` now. If we still hit it, it means
+        // either a planner-provided `create_if_missing: false` override
+        // or RP itself refused to create (permissions, disk full).
+        "RepoPrompt couldn't bind to this cwd and wouldn't auto-create. \
+         Try `rp-cli -e 'bind_context op=bind working_dirs=[\"<path>\"] create_if_missing=true'` manually."
+    } else if lower.contains("connection refused")
+        || lower.contains("failed to connect")
+        || lower.contains("no such process")
+    {
+        "RepoPrompt app isn't running — launch it (open RepoPrompt.app) or \
+         run `repoprompt_cli --launch-app`, then retry."
+    } else if lower.contains("multiple repoprompt windows")
+        || lower.contains("disambiguate")
+    {
+        "RepoPrompt has multiple windows open and can't disambiguate. \
+         Pass `window_id` explicitly via routing args or close extra RP windows."
+    } else if lower.contains("permission denied") {
+        "RepoPrompt refused the bind (permissions). Check filesystem ACLs \
+         on the target dir, or try a different cwd."
+    } else {
+        "see raw error tail"
+    }
 }
 
 fn repoprompt_output_json(output: agent_repoprompt::RepoPromptOutput) -> serde_json::Value {
@@ -3924,6 +4023,113 @@ mod tests {
         assert!(!skill_tools_guard::permits("read_file"));
         assert!(skill_tools_guard::permits("run_shell"));
         skill_tools_guard::reset();
+    }
+
+    // --- RF38-2 serde aliases on arg structs ----------------------------
+
+    #[test]
+    fn shell_args_accept_cmd_alias() {
+        // The case from the user's trace: planner sent `cmd` not `command`.
+        // After RF38-2 this should now parse cleanly.
+        let v = serde_json::json!({"cmd": "echo hi"});
+        let args: ShellArgs = serde_json::from_value(v).expect("cmd alias parses");
+        assert_eq!(args.command, "echo hi");
+    }
+
+    #[test]
+    fn shell_args_accept_shell_and_script_aliases() {
+        for synonym in ["shell", "script"] {
+            let v = serde_json::json!({ synonym: "ls" });
+            let args: ShellArgs = serde_json::from_value(v).unwrap_or_else(|e| {
+                panic!("alias `{synonym}` should parse: {e}")
+            });
+            assert_eq!(args.command, "ls");
+        }
+    }
+
+    #[test]
+    fn shell_args_timeout_ms_converts_to_secs() {
+        // Planner sends timeout_ms=10000; we have no canonical timeout_ms
+        // field but the helper rounds up to 10s.
+        let v = serde_json::json!({"command": "ls", "timeout_ms": 10000});
+        let args: ShellArgs = serde_json::from_value(v).unwrap();
+        assert_eq!(args.resolved_timeout_secs(), Some(10));
+    }
+
+    #[test]
+    fn shell_args_timeout_seconds_alias_works() {
+        let v = serde_json::json!({"command": "ls", "timeout_seconds": 30});
+        let args: ShellArgs = serde_json::from_value(v).unwrap();
+        assert_eq!(args.resolved_timeout_secs(), Some(30));
+    }
+
+    #[test]
+    fn read_file_args_accept_file_alias() {
+        let v = serde_json::json!({"file": "Cargo.toml"});
+        let args: ReadFileArgs = serde_json::from_value(v).unwrap();
+        assert_eq!(args.path, "Cargo.toml");
+    }
+
+    #[test]
+    fn read_files_args_accept_files_alias() {
+        let v = serde_json::json!({"files": ["a", "b"]});
+        let args: ReadFilesArgs = serde_json::from_value(v).unwrap();
+        assert_eq!(args.paths, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn patch_file_args_accept_anthropic_style_aliases() {
+        // Anthropic tool-use shape: {old, new} not {old_content, new_content}.
+        let v = serde_json::json!({
+            "path": "f.rs",
+            "old": "foo",
+            "new": "bar"
+        });
+        let args: PatchFileArgs = serde_json::from_value(v).unwrap();
+        assert_eq!(args.old_content, "foo");
+        assert_eq!(args.new_content, "bar");
+    }
+
+    #[test]
+    fn write_file_args_accept_text_alias() {
+        let v = serde_json::json!({"path": "out.txt", "text": "hi"});
+        let args: WriteFileArgs = serde_json::from_value(v).unwrap();
+        assert_eq!(args.content, "hi");
+    }
+
+    #[test]
+    fn memory_search_args_accept_q_alias() {
+        let v = serde_json::json!({"q": "foo", "top_k": 5});
+        let args: MemorySearchArgs = serde_json::from_value(v).unwrap();
+        assert_eq!(args.query, "foo");
+        assert_eq!(args.limit, Some(5));
+    }
+
+    // --- RF38-3 humanize_rp_bind_failure --------------------------------
+
+    #[test]
+    fn humanize_recognizes_no_match_error() {
+        let raw = r#"{"error":"No exact workspace match for /tmp/foo"}"#;
+        let msg = humanize_rp_bind_failure(raw);
+        assert!(msg.contains("auto-create") || msg.contains("create_if_missing"));
+    }
+
+    #[test]
+    fn humanize_recognizes_connection_refused() {
+        let msg = humanize_rp_bind_failure("connection refused");
+        assert!(msg.contains("RepoPrompt app isn't running"));
+    }
+
+    #[test]
+    fn humanize_recognizes_multiple_windows() {
+        let msg = humanize_rp_bind_failure("Multiple RepoPrompt windows detected");
+        assert!(msg.contains("window_id") || msg.contains("disambiguate"));
+    }
+
+    #[test]
+    fn humanize_falls_back_when_unrecognized() {
+        let msg = humanize_rp_bind_failure("some new error message we haven't seen");
+        assert!(msg.contains("see raw"));
     }
 
     // --- RF34-1 repair_tool_args ----------------------------------------
