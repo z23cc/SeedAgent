@@ -242,6 +242,12 @@ pub enum LlmError {
     HttpStatus { status: u16, body: String },
     #[error("response did not include text output")]
     MissingOutputText,
+    /// Catch-all for unexpected conditions surfaced by HTTP backends —
+    /// SSE parse errors, premature stream end, malformed events. Kept as
+    /// a single bucket because callers always treat it the same as Http:
+    /// "this request failed, retry/abort".
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,6 +486,103 @@ impl ProviderClient {
         }
     }
 
+    /// RF32: streaming variant of `chat`. Posts with `stream: true`, parses
+    /// the SSE event stream incrementally, calls `on_delta` for each text
+    /// chunk, and returns the accumulated `ChatResponse` at end.
+    ///
+    /// The non-streaming `chat()` path stays the default for callers (and
+    /// for non-streamable backends — currently nothing else). HttpPlanner
+    /// opts in via this method so users on `--provider openai` see live
+    /// progress in the spinner subtitle, matching the Codex path.
+    ///
+    /// On any parse/transport error mid-stream we abort with `LlmError` —
+    /// partial output is discarded rather than silently returned, because
+    /// `parse_planned_action` downstream would only confuse the planner.
+    pub fn chat_streaming<F>(
+        &self,
+        provider: Provider,
+        request: ChatRequest,
+        on_delta: F,
+    ) -> Result<ChatResponse, LlmError>
+    where
+        F: FnMut(&str),
+    {
+        let provider = resolve_provider_templates(provider)?;
+        let request = self.pipeline.transform(&provider, request);
+        let route = self.router.route(&provider, &request.model);
+        match route.response {
+            ProviderResponse::OpenAiResponses => {
+                self.openai_responses_streaming(provider, route, request, on_delta)
+            }
+            response => Err(LlmError::UnsupportedResponse(response)),
+        }
+    }
+
+    fn openai_responses_streaming<F>(
+        &self,
+        provider: Provider,
+        route: BackendRoute,
+        request: ChatRequest,
+        mut on_delta: F,
+    ) -> Result<ChatResponse, LlmError>
+    where
+        F: FnMut(&str),
+    {
+        let api_key = provider_api_key(&provider)?;
+        let mut body = responses_body(&request);
+        if let Value::Object(map) = &mut body {
+            map.insert("stream".to_string(), Value::Bool(true));
+        }
+        let response = self
+            .http
+            .post(&route.endpoint)
+            .bearer_auth(api_key)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(&body)
+            .send()?;
+        let status = response.status();
+        if !status.is_success() {
+            // For non-2xx we still try to read JSON body for the error
+            // detail; on read failure the bare status code is still useful.
+            let body = response.text().unwrap_or_default();
+            return Err(LlmError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let reader = std::io::BufReader::new(response);
+        let mut accumulated = String::new();
+        let mut last_event_json: Option<Value> = None;
+        for line in std::io::BufRead::lines(reader) {
+            let line = line
+                .map_err(|err| LlmError::Other(anyhow::anyhow!("sse read failed: {err}")))?;
+            match decode_responses_sse_line(&line)? {
+                SseEvent::Delta(delta) => {
+                    on_delta(&delta);
+                    accumulated.push_str(&delta);
+                }
+                SseEvent::Completed(final_response) => {
+                    last_event_json = Some(final_response);
+                }
+                SseEvent::Ignore => {}
+            }
+        }
+        // Prefer the accumulated delta stream — that's what we showed the
+        // user incrementally. Fall back to extract_response_text on the
+        // final event if streaming produced nothing (unlikely but defensive).
+        let text = if accumulated.is_empty() {
+            last_event_json
+                .as_ref()
+                .and_then(extract_response_text)
+                .ok_or(LlmError::MissingOutputText)?
+        } else {
+            accumulated
+        };
+        let raw = last_event_json.unwrap_or(Value::Null);
+        Ok(ChatResponse { text, raw, route })
+    }
+
     fn openai_responses(
         &self,
         provider: Provider,
@@ -532,6 +635,68 @@ pub fn resolve_provider_templates(mut provider: Provider) -> Result<Provider, Ll
         *value = render_env_template(value)?;
     }
     Ok(provider)
+}
+
+/// One unit of meaning extracted from an SSE line on the OpenAI Responses
+/// streaming endpoint.
+#[derive(Debug)]
+pub(crate) enum SseEvent {
+    /// `response.output_text.delta` — incremental text to append + show.
+    Delta(String),
+    /// `response.completed` — final response object (for fallback text
+    /// extraction if streaming produced nothing).
+    Completed(Value),
+    /// Keepalive, comment, `[DONE]`, in-progress events, or any other
+    /// event we don't need to act on.
+    Ignore,
+}
+
+/// Parse one SSE line into an event. Extracted from `openai_responses_streaming`
+/// so we can unit-test the parser without spinning up a real HTTP server.
+///
+/// Returns `Err(LlmError::Other(...))` only for `response.error` payloads
+/// where the API itself reported failure. All other parsing oddities
+/// (malformed JSON keepalives, unknown event types) map to `SseEvent::Ignore`
+/// — defensive, since unknown SSE events from a backend update should not
+/// crash the planner.
+pub(crate) fn decode_responses_sse_line(line: &str) -> Result<SseEvent, LlmError> {
+    // SSE chunks: `data: <json>\n\n`. Other prefixes (event:, id:, retry:,
+    // comments starting with `:`) are skipped here.
+    let Some(payload) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) else {
+        return Ok(SseEvent::Ignore);
+    };
+    let payload = payload.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return Ok(SseEvent::Ignore);
+    }
+    let event: Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(_) => return Ok(SseEvent::Ignore),
+    };
+    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+    match kind {
+        "response.output_text.delta" => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                Ok(SseEvent::Delta(delta.to_string()))
+            } else {
+                Ok(SseEvent::Ignore)
+            }
+        }
+        "response.completed" => Ok(SseEvent::Completed(
+            event.get("response").cloned().unwrap_or(Value::Null),
+        )),
+        "response.error" => {
+            let msg = event
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("(no error message)");
+            Err(LlmError::Other(anyhow::anyhow!(
+                "openai responses stream error: {msg}"
+            )))
+        }
+        _ => Ok(SseEvent::Ignore),
+    }
 }
 
 pub fn responses_body(request: &ChatRequest) -> Value {
@@ -775,5 +940,90 @@ mod tests {
         }
         let rendered = render_env_template("{{SEED_AGENT_TEST_BASE_URL}}/v1/responses").unwrap();
         assert_eq!(rendered, "https://example.test/v1/responses");
+    }
+
+    // --- RF32 SSE event parser ------------------------------------------
+
+    #[test]
+    fn decode_sse_extracts_text_delta() {
+        let line = r#"data: {"type":"response.output_text.delta","delta":"hello"}"#;
+        let ev = decode_responses_sse_line(line).unwrap();
+        match ev {
+            SseEvent::Delta(s) => assert_eq!(s, "hello"),
+            _ => panic!("expected Delta, got {ev:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_sse_accepts_no_space_after_data_colon() {
+        // Some SSE producers emit `data:{json}` without the space — be
+        // liberal in what we accept.
+        let line = r#"data:{"type":"response.output_text.delta","delta":"x"}"#;
+        match decode_responses_sse_line(line).unwrap() {
+            SseEvent::Delta(s) => assert_eq!(s, "x"),
+            other => panic!("expected Delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_sse_ignores_done_keepalive_and_unknown() {
+        for line in [
+            "",
+            ":  ping",                          // SSE comment
+            "data: [DONE]",
+            "data:  ",
+            "event: response.created",
+            "id: abc123",
+            r#"data: {"type":"response.in_progress"}"#, // unknown but harmless
+            r#"data: not-json"#,                       // malformed payload
+        ] {
+            assert!(
+                matches!(decode_responses_sse_line(line).unwrap(), SseEvent::Ignore),
+                "expected Ignore for: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_sse_completed_carries_response_object() {
+        let line = r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#;
+        match decode_responses_sse_line(line).unwrap() {
+            SseEvent::Completed(v) => {
+                assert_eq!(v.get("id").and_then(|x| x.as_str()), Some("resp_1"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_sse_completed_without_response_field_is_null() {
+        let line = r#"data: {"type":"response.completed"}"#;
+        match decode_responses_sse_line(line).unwrap() {
+            SseEvent::Completed(v) => assert_eq!(v, serde_json::Value::Null),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_sse_error_event_returns_err() {
+        let line = r#"data: {"type":"response.error","error":{"message":"rate limited"}}"#;
+        let err = decode_responses_sse_line(line).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rate limited"),
+            "expected error to mention the API message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_sse_delta_without_delta_field_is_ignored() {
+        // Defensive: if the API ships `output_text.delta` without a `delta`
+        // string (unlikely but possible during schema migration), we Ignore
+        // rather than panic.
+        let line = r#"data: {"type":"response.output_text.delta"}"#;
+        assert!(matches!(
+            decode_responses_sse_line(line).unwrap(),
+            SseEvent::Ignore
+        ));
     }
 }

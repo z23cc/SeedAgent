@@ -83,11 +83,13 @@ declined. Don't reopen without new data:
 - **Cross-turn memory-context cache (manual prefix-prompt cache).** Codex's
   server-side prompt caching almost certainly already does this — adding
   our own layer risks fighting it. Leave to the backend.
-- **`HttpPlanner` streaming.** Codex is the default planner; HTTP providers
-  are opt-in (`--provider openai|…`). Adding SSE streaming touches
-  `agent_llm::ProviderClient` (currently `reqwest::blocking`) and would
-  cascade async-ness through `Planner::plan`. Defer until a real HTTP-only
-  user shows up.
+- ~~**`HttpPlanner` streaming.**~~ Done in RF32: `ProviderClient::chat_streaming`
+  posts with `stream: true` and parses OpenAI Responses SSE events
+  (`response.output_text.delta` → on_delta callback; `response.completed`
+  for fallback text extraction). HttpPlanner uses it with the same
+  spinner-subtitle callback as Codex, so `--provider openai` users get
+  live token counts. No async cascade — the blocking reqwest client's
+  `Response` impls `std::io::Read`, which is enough for line-based SSE.
 
 ### Environment variables
 

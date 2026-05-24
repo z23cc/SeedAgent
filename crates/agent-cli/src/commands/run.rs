@@ -1246,17 +1246,37 @@ impl Planner for HttpPlanner {
         tool_infos: &[ToolInfo],
         state: &agent_runtime::AgentLoopState,
         memory: &agent_runtime::PlannerMemoryContext,
-        _spinner: &agent_tui::Spinner,
+        spinner: &agent_tui::Spinner,
     ) -> Result<(agent_runtime::PlannedAction, usize), agent_runtime::RuntimeError> {
-        let action = agent_runtime::plan_next_action_with_state_and_memory(
-            &self.provider_id,
+        // RF32: stream HTTP responses so the user sees live token counts in
+        // the spinner subtitle, matching the Codex path. The blocking
+        // ProviderClient internally posts with `stream: true` and parses
+        // SSE incrementally; we accumulate the text via the on_delta
+        // callback below.
+        let provider = agent_llm::find_provider(&self.provider_id).ok_or_else(|| {
+            agent_runtime::RuntimeError::PlannerFatal(format!(
+                "provider not found: {}",
+                self.provider_id
+            ))
+        })?;
+        let request = agent_runtime::planner_request_with_state_and_memory(
             ModelId::from(self.model.clone()),
             goal,
             tool_infos,
             state,
             memory,
-        )?;
-        Ok((action, 0))
+        );
+        let delta_chars: Cell<usize> = Cell::new(0);
+        let response = agent_llm::ProviderClient::new()
+            .chat_streaming(provider, request, |delta| {
+                delta_chars.set(delta_chars.get() + delta.chars().count());
+                spinner.set_subtitle(Some(format_token_subtitle(delta_chars.get())));
+            })
+            .map_err(|err| {
+                agent_runtime::RuntimeError::Planner(format!("HTTP planner failed: {err}"))
+            })?;
+        let action = agent_runtime::parse_planned_action(&response.text)?;
+        Ok((action, delta_chars.get()))
     }
 }
 
