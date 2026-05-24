@@ -74,6 +74,14 @@ impl CodexSession {
         self.inner.as_ref().and_then(|c| c.cwd().cloned())
     }
 
+    /// Mutable accessor for the inner client. Returns `None` if no client
+    /// is held. Currently only used by `/sync` to push a new cwd into the
+    /// live client without going through `ensure()` (which would have to
+    /// re-check the fingerprint).
+    pub(crate) fn client_mut(&mut self) -> Option<&mut CodexAppServerClient> {
+        self.inner.as_mut()
+    }
+
     #[cfg(test)]
     pub(crate) fn fingerprint(&self) -> Option<&CodexLaunchFingerprint> {
         self.fingerprint.as_ref()

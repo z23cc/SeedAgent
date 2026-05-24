@@ -321,6 +321,10 @@ fn handle_interactive_command(
             handle_cd_command(workspace, rest);
             Ok(false)
         }
+        "/sync" => {
+            handle_sync_command(workspace, codex_session);
+            Ok(false)
+        }
         "/mode" => {
             handle_mode_command(args, rest);
             Ok(false)
@@ -774,6 +778,79 @@ fn handle_mode_command(args: &mut InteractiveArgs, rest: &str) {
         println!("mode: {prev} → {label}");
         println!("  applies to subsequent goals in this REPL session");
     }
+}
+
+// --- /sync -------------------------------------------------------------------
+
+/// `/sync` — force every subsystem to realign to `workspace.cwd` *now*.
+///
+/// Normally the cwd-sync layer is lazy: a `/cd` invalidates the RP bound
+/// cache, the next rp tool call rebinds, the next Codex turn picks up the
+/// new cwd from the (already updated) per-turn `cfg.cwd`. That works for
+/// the common case but leaves "I think the agent is wrong about where it
+/// is, but it hasn't done anything to surface that" with no recovery path
+/// short of `/cd .` (which is a no-op) or `/new` (which drops more state
+/// than the user wants).
+///
+/// This command is the escape hatch:
+///   - Clear the RP `bound` cache so next rp call definitely re-binds.
+///   - Drop any pending skill override.
+///   - Push `workspace.cwd` into the cached Codex client (so the next
+///     turn's `cfg.cwd` is exactly what we expect, no matter what set it).
+///
+/// We do NOT restart the Codex subprocess — that's `/new`'s job, and
+/// restarting here would surprise users who assumed `/sync` was cheap.
+fn handle_sync_command(
+    workspace: &SeedWorkspace,
+    codex_session: &mut crate::commands::codex_session::CodexSession,
+) {
+    let had_bound = agent_tools::repoprompt_sync::peek_bound_window().is_some();
+    let had_override = agent_tools::repoprompt_sync::peek_pending_override().is_some();
+    agent_tools::repoprompt_sync::reset();
+
+    let codex_was_live = codex_session.is_live();
+    let codex_prev_cwd = codex_session.client_cwd();
+    if let Some(client) = codex_session_client_mut(codex_session) {
+        client.set_cwd(workspace.cwd.clone());
+    }
+
+    println!("sync: realigned to {}", workspace.cwd.display());
+    if had_bound {
+        println!("  - cleared rp bound-window cache");
+    }
+    if had_override {
+        println!("  - dropped pending skill override");
+    }
+    if codex_was_live {
+        match codex_prev_cwd {
+            Some(prev) if prev == workspace.cwd => {
+                println!("  - codex client already at this cwd (no-op)");
+            }
+            Some(prev) => {
+                println!(
+                    "  - codex client cwd: {} → {}",
+                    prev.display(),
+                    workspace.cwd.display()
+                );
+            }
+            None => {
+                println!("  - codex client cwd set (was unset)");
+            }
+        }
+    } else {
+        println!("  - codex client not spawned (nothing to realign)");
+    }
+    if !had_bound && !had_override && !codex_was_live {
+        println!("  (nothing to realign — already aligned)");
+    }
+}
+
+/// Tiny accessor so `/sync` can mutate the cached Codex client's cwd
+/// without making the whole `inner` field of `CodexSession` public.
+fn codex_session_client_mut(
+    session: &mut crate::commands::codex_session::CodexSession,
+) -> Option<&mut agent_delegate::CodexAppServerClient> {
+    session.client_mut()
 }
 
 // --- /cd ---------------------------------------------------------------------
@@ -1282,6 +1359,46 @@ mod tests {
             agent_tools::repoprompt_sync::peek_bound_window().is_some(),
             "no-op /cd must preserve the RP bound-window cache"
         );
+    }
+
+    // --- RF31 /sync ------------------------------------------------------
+
+    #[test]
+    fn sync_command_clears_rp_state_and_realigns_codex() {
+        let _g = rp_sync_test_guard();
+        // Prime: bind cache + pending override + live Codex client at the
+        // wrong cwd. After /sync the cache should be empty and Codex's
+        // client_cwd should match workspace.cwd.
+        agent_tools::repoprompt_sync::record_bound_window(
+            vec![PathBuf::from("/old/dir")],
+            7,
+        );
+        agent_tools::repoprompt_sync::set_pending_override(vec![PathBuf::from(
+            "/skill/override",
+        )]);
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        let mut cfg = agent_delegate::CodexAppServerConfig::default();
+        cfg.cwd = Some(PathBuf::from("/stale/codex/cwd"));
+        cs.ensure(cfg).unwrap();
+        let ws = SeedWorkspace::new(PathBuf::from("/correct/workspace"));
+        handle_sync_command(&ws, &mut cs);
+        // RP state fully cleared (both halves).
+        assert!(agent_tools::repoprompt_sync::peek_bound_window().is_none());
+        assert!(agent_tools::repoprompt_sync::peek_pending_override().is_none());
+        // Codex client's cwd pushed to workspace.cwd.
+        assert_eq!(cs.client_cwd(), Some(PathBuf::from("/correct/workspace")));
+    }
+
+    #[test]
+    fn sync_command_is_safe_when_nothing_is_live() {
+        let _g = rp_sync_test_guard();
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        let ws = SeedWorkspace::new(PathBuf::from("/anywhere"));
+        // No RP state, no codex session. Should print "nothing to realign"
+        // and not panic.
+        handle_sync_command(&ws, &mut cs);
+        assert!(agent_tools::repoprompt_sync::peek_bound_window().is_none());
+        assert!(!cs.is_live());
     }
 
     // --- RF28-2 /provider ------------------------------------------------
