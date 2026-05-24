@@ -58,6 +58,14 @@ pub struct RepoPromptBinding {
     pub oracle_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_name: Option<String>,
+    /// RF33-2 opt-in: when true, skill_fetch makes the binding STICKY by
+    /// also queuing a workspace.cwd change (caught by run_goal between
+    /// turns). Default false preserves the transient behavior (RF24-4) —
+    /// the binding affects only the very next rp call, then cwd snaps
+    /// back to user's. Set this in skill frontmatter only when the skill
+    /// is genuinely a "work in /other-repo for this whole task" recipe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sticky_cwd: bool,
 }
 
 impl RepoPromptBinding {
@@ -66,6 +74,7 @@ impl RepoPromptBinding {
             && self.context_id.is_none()
             && self.oracle_mode.is_none()
             && self.workspace_name.is_none()
+            && !self.sticky_cwd
     }
 }
 
@@ -148,6 +157,9 @@ pub fn parse_repoprompt_status(value: &serde_json::Value) -> Option<RepoPromptBi
         context_id,
         oracle_mode: None,
         workspace_name,
+        // sticky_cwd is never inferred from RP CLI's status output — it's
+        // an explicit user choice in skill frontmatter.
+        sticky_cwd: false,
     })
 }
 
@@ -757,11 +769,18 @@ fn parse_repoprompt_binding(front_matter: &str) -> Option<RepoPromptBinding> {
     let context_id = front_matter_value(front_matter, "repoprompt_context_id");
     let oracle_mode = front_matter_value(front_matter, "repoprompt_oracle_mode");
     let workspace_name = front_matter_value(front_matter, "repoprompt_workspace_name");
+    // RF33-2: parse opt-in `repoprompt_sticky_cwd: true|false`. Missing
+    // or non-bool defaults to false → transient (RF24-4) behavior.
+    let sticky_cwd = front_matter_value(front_matter, "repoprompt_sticky_cwd")
+        .as_deref()
+        .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
+        .unwrap_or(false);
     let binding = RepoPromptBinding {
         working_dirs,
         context_id,
         oracle_mode,
         workspace_name,
+        sticky_cwd,
     };
     if binding.is_empty() { None } else { Some(binding) }
 }

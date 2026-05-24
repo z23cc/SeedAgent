@@ -39,6 +39,19 @@ pub(crate) struct Cli {
     command: Option<Command>,
 }
 
+/// Subcommands for `seed codex-daemon`. Thin wrappers around
+/// `codex app-server daemon ...` so users don't have to remember the
+/// full codex CLI path. RF33-4.
+#[derive(Debug, Subcommand)]
+pub(crate) enum CodexDaemonAction {
+    /// Start the daemon (no-op if already running).
+    Start,
+    /// Stop the running daemon.
+    Stop,
+    /// Print local CLI + running daemon versions as JSON.
+    Status,
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Start an interactive prompt.
@@ -80,6 +93,11 @@ pub(crate) enum Command {
             help = "Read-only/write mode: auto (classify), read (force read-only), write (force implementation)"
         )]
         mode: commands::run::ModeArg,
+        #[arg(
+            long = "use-daemon",
+            help = "Connect Codex via `app-server proxy` (running daemon) instead of spawning fresh stdio app-server"
+        )]
+        use_daemon: bool,
     },
     Doctor,
     Run {
@@ -121,6 +139,11 @@ pub(crate) enum Command {
             help = "Read-only/write mode: auto (classify), read (force read-only), write (force implementation)"
         )]
         mode: commands::run::ModeArg,
+        #[arg(
+            long = "use-daemon",
+            help = "Connect Codex via `app-server proxy` (running daemon) instead of spawning fresh stdio app-server"
+        )]
+        use_daemon: bool,
     },
     Tool {
         #[command(subcommand)]
@@ -191,6 +214,14 @@ pub(crate) enum Command {
             help = "Also show models with visibility=hide (e.g. codex-auto-review)"
         )]
         show_hidden: bool,
+    },
+    /// RF33-4: thin wrapper over `codex app-server daemon …` so users can
+    /// start/stop/status the codex daemon from `seed` directly. Pair with
+    /// `--use-daemon` on `seed run` / `chat` to actually consume it.
+    #[command(name = "codex-daemon", alias = "codex_daemon")]
+    CodexDaemon {
+        #[command(subcommand)]
+        action: CodexDaemonAction,
     },
     Delegate {
         #[command(subcommand)]
@@ -264,6 +295,7 @@ fn main() -> Result<()> {
             codex,
             record_only,
             mode,
+            use_daemon,
         } => run_interactive(
             &cli,
             &store,
@@ -282,6 +314,7 @@ fn main() -> Result<()> {
                 codex,
                 record_only,
                 mode,
+                use_daemon,
             },
         ),
         Command::Doctor => doctor::doctor(&cli.skills_dir, &store),
@@ -301,6 +334,7 @@ fn main() -> Result<()> {
             mcp_allow,
             plugins,
             mode,
+            use_daemon,
         } => run_goal(RunGoalArgs {
             store: &store,
             goal,
@@ -324,6 +358,7 @@ fn main() -> Result<()> {
                 plugins,
             },
             mode,
+            use_daemon,
             // One-shot `seed run` — no REPL session to inherit, fall back
             // to the local throwaway session built inside run_goal.
             codex_session: None,
@@ -388,6 +423,7 @@ fn main() -> Result<()> {
         Command::CodexModels { json, show_hidden } => {
             commands::codex::run_codex_models(json, show_hidden)
         }
+        Command::CodexDaemon { action } => commands::codex::run_codex_daemon(action),
         Command::Delegate { command } => match command {
             DelegateCommand::Codex {
                 prompt,

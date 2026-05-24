@@ -278,18 +278,111 @@ pub fn fetch_memory(
 }
 
 pub fn planner_memory_context(paths: &MemoryPaths) -> MemoryResult<String> {
+    // RF33-1: process-global cache keyed on (memory_dir + mtime fingerprint).
+    // A REPL chain of read-only goals reuses the cached string when none of
+    // the inputs (meta_rules, l1_insight, global_facts, index, skills dir)
+    // have changed. Cache miss falls through to the full rebuild below.
+    if let Some(cached) = planner_memory_cache::get(paths) {
+        return Ok(cached);
+    }
     let index = load_or_rebuild_index(paths)?;
     let meta_rules = fs::read_to_string(paths.meta_rules_path())
         .unwrap_or_else(|_| DEFAULT_META_RULES.to_string());
     let l1_insight = fs::read_to_string(paths.l1_insight_path())
         .unwrap_or_else(|_| render_l1_insight(&index, 18));
-    Ok(format!(
+    let out = format!(
         "### [L0 META RULES]\n{}\n\n### [L1 INSIGHT]\n{}\n\n### [L1 MEMORY INDEX]\n{}",
         compact_text(&meta_rules, 2_500),
         compact_text(&l1_insight, 2_500),
         render_l1_index(&index, 40)
-    ))
+    );
+    planner_memory_cache::set(paths, &out);
+    Ok(out)
 }
+
+/// Process-wide cache for `planner_memory_context`. The cache key is the
+/// memory_dir path + a tiny "mtime fingerprint" computed from the files
+/// that contribute to the rendered string. Any of them changing → cache
+/// miss → rebuild. We intentionally include the skills_dir mtime so
+/// that creating/editing a skill invalidates the L1 index summary, even
+/// though the L1 file itself only gets rewritten by `rebuild_index`.
+mod planner_memory_cache {
+    use super::MemoryPaths;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::SystemTime;
+
+    static STATE: OnceLock<Mutex<Option<Cached>>> = OnceLock::new();
+
+    struct Cached {
+        key: CacheKey,
+        body: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CacheKey {
+        memory_dir: PathBuf,
+        skills_dir: PathBuf,
+        // mtimes are coarse-grained (filesystem dependent); we just compare
+        // the tuple verbatim. A None means "file didn't exist when we
+        // sampled" — also a valid value to compare.
+        meta_rules_mtime: Option<SystemTime>,
+        l1_insight_mtime: Option<SystemTime>,
+        global_facts_mtime: Option<SystemTime>,
+        index_mtime: Option<SystemTime>,
+        skills_dir_mtime: Option<SystemTime>,
+    }
+
+    fn state() -> &'static Mutex<Option<Cached>> {
+        STATE.get_or_init(|| Mutex::new(None))
+    }
+
+    fn mtime(path: &std::path::Path) -> Option<SystemTime> {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    fn build_key(paths: &MemoryPaths) -> CacheKey {
+        CacheKey {
+            memory_dir: paths.memory_dir.clone(),
+            skills_dir: paths.skills_dir.clone(),
+            meta_rules_mtime: mtime(&paths.meta_rules_path()),
+            l1_insight_mtime: mtime(&paths.l1_insight_path()),
+            global_facts_mtime: mtime(&paths.memory_dir.join("global_facts.md")),
+            index_mtime: mtime(&paths.index_path()),
+            skills_dir_mtime: mtime(&paths.skills_dir),
+        }
+    }
+
+    pub(super) fn get(paths: &MemoryPaths) -> Option<String> {
+        let key = build_key(paths);
+        state()
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().filter(|c| c.key == key).map(|c| c.body.clone()))
+    }
+
+    pub(super) fn set(paths: &MemoryPaths, body: &str) {
+        if let Ok(mut g) = state().lock() {
+            *g = Some(Cached {
+                key: build_key(paths),
+                body: body.to_string(),
+            });
+        }
+    }
+
+    /// Drop the cached entry. Tests use this; runtime code relies on
+    /// mtime-based invalidation which is automatic.
+    pub fn reset() {
+        if let Ok(mut g) = state().lock() {
+            *g = None;
+        }
+    }
+}
+
+/// Re-export so callers (run_goal / tests) can force-invalidate the cache
+/// without touching internals. Normal runtime paths don't need this —
+/// mtime checks handle invalidation transparently.
+pub use planner_memory_cache::reset as reset_planner_memory_cache;
 
 pub fn render_l1_insight(index: &MemoryIndex, skill_limit: usize) -> String {
     let l0 = ids_for_layer(index, MemoryLayer::L0MetaRules, usize::MAX);
@@ -1025,6 +1118,60 @@ mod tests {
         let root = temp_root();
         // dir doesn't exist either — should silently succeed.
         enforce_session_archive_cap(&root.join("nope.jsonl"), 10).unwrap();
+    }
+
+    // --- RF33-1 planner memory cache ------------------------------------
+
+    #[test]
+    fn planner_memory_context_caches_within_invocation_window() {
+        // Two back-to-back calls with no mtime change → second hits cache
+        // (same string is reused). We don't have a direct hit/miss
+        // counter, but we can verify the output is byte-identical and the
+        // cache key matches.
+        let root = temp_root();
+        let paths = MemoryPaths::new(
+            root.join("memory"),
+            root.join("skills"),
+            root.join("sessions"),
+        );
+        // Force a clean cache so a prior test doesn't poison this one.
+        reset_planner_memory_cache();
+        let first = planner_memory_context(&paths).unwrap();
+        let second = planner_memory_context(&paths).unwrap();
+        assert_eq!(first, second);
+        reset_planner_memory_cache();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn planner_memory_cache_invalidates_when_meta_rules_changes() {
+        // meta_rules.md gets compact_text'd into the L0 section directly, so
+        // mutating it is the easiest way to observe cache invalidation
+        // through the rendered output (without forcing an index rebuild).
+        let root = temp_root();
+        let paths = MemoryPaths::new(
+            root.join("memory"),
+            root.join("skills"),
+            root.join("sessions"),
+        );
+        reset_planner_memory_cache();
+        let first = planner_memory_context(&paths).unwrap();
+        // Touch mtime advances by sleeping past FS resolution + writing new
+        // content with a distinctive marker.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            paths.meta_rules_path(),
+            "# Meta Rules\n\nSENTINEL-XYZZY: cache invalidation test\n",
+        )
+        .unwrap();
+        let second = planner_memory_context(&paths).unwrap();
+        assert_ne!(first, second, "mutating meta_rules.md should invalidate cache");
+        assert!(
+            second.contains("SENTINEL-XYZZY"),
+            "second render must include the new meta_rules body"
+        );
+        reset_planner_memory_cache();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

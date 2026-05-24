@@ -58,6 +58,15 @@ pub struct CodexAppServerConfig {
     pub approval_mode: ApprovalMode,
     pub mcp_policy: McpPolicy,
     pub plugins_enabled: bool,
+    /// RF33-4: when true, launch via `codex app-server proxy` (which
+    /// connects to the running `codex app-server daemon`) instead of
+    /// spawning a fresh `codex app-server --listen stdio://`. Saves
+    /// startup across distinct `seed` invocations (RF25-1 already covers
+    /// the within-REPL case). User must have started the daemon
+    /// separately via `seed codex-daemon start` (or `codex app-server
+    /// daemon start`).
+    #[serde(default)]
+    pub use_daemon: bool,
 }
 
 impl Default for CodexAppServerConfig {
@@ -83,6 +92,22 @@ impl Default for CodexAppServerConfig {
             approval_mode: ApprovalMode::Deny,
             mcp_policy: McpPolicy::default(),
             plugins_enabled: false,
+            use_daemon: false,
+        }
+    }
+}
+
+impl CodexAppServerConfig {
+    /// RF33-4: when daemon mode is enabled, the argv changes from
+    /// `["codex", "app-server", "--listen", "stdio://"]` to
+    /// `["codex", "app-server", "proxy"]`. The proxy subcommand connects
+    /// stdin/stdout to a unix socket served by `codex app-server daemon`,
+    /// which the user must have started separately.
+    fn effective_args(&self) -> Vec<String> {
+        if self.use_daemon {
+            vec!["app-server".to_string(), "proxy".to_string()]
+        } else {
+            self.args.clone()
         }
     }
 }
@@ -103,14 +128,19 @@ impl CodexAppServerConfig {
 
     pub fn launch_command_with_mcp_servers(&self, mcp_server_names: &[String]) -> Vec<String> {
         let mut command = vec![self.command.clone()];
-        command.extend(self.args.clone());
-        if !self.plugins_enabled {
-            command.push("--disable".to_string());
-            command.push("plugins".to_string());
-        }
-        if let Some(override_value) = mcp_servers_override(&self.mcp_policy, mcp_server_names) {
-            command.push("-c".to_string());
-            command.push(override_value);
+        command.extend(self.effective_args());
+        // The daemon path (`codex app-server proxy`) inherits config from
+        // the running daemon — `--disable plugins` and `-c mcp_servers=...`
+        // would be no-ops at the proxy layer. Skip them in daemon mode.
+        if !self.use_daemon {
+            if !self.plugins_enabled {
+                command.push("--disable".to_string());
+                command.push("plugins".to_string());
+            }
+            if let Some(override_value) = mcp_servers_override(&self.mcp_policy, mcp_server_names) {
+                command.push("-c".to_string());
+                command.push(override_value);
+            }
         }
         command
     }
@@ -338,6 +368,10 @@ pub struct CodexLaunchFingerprint {
     pub command: String,
     pub args: Vec<String>,
     pub experimental_api: bool,
+    /// RF33-4: daemon vs stdio mode is a launch-time decision (different
+    /// argv → different subprocess shape) so it splits the fingerprint.
+    /// Flipping `--use-daemon` mid-REPL drops the cached client.
+    pub use_daemon: bool,
 }
 
 impl From<&CodexAppServerConfig> for CodexLaunchFingerprint {
@@ -348,6 +382,7 @@ impl From<&CodexAppServerConfig> for CodexLaunchFingerprint {
             command: cfg.command.clone(),
             args: cfg.args.clone(),
             experimental_api: cfg.experimental_api,
+            use_daemon: cfg.use_daemon,
         }
     }
 }
@@ -900,6 +935,70 @@ mod tests {
             CodexLaunchFingerprint::from(&a),
             CodexLaunchFingerprint::from(&b),
             "per-turn fields must not contribute to the fingerprint",
+        );
+    }
+
+    // --- RF33-4 daemon mode --------------------------------------------
+
+    #[test]
+    fn daemon_mode_swaps_argv_to_proxy() {
+        let mut cfg = CodexAppServerConfig::default();
+        cfg.use_daemon = true;
+        let cmd = cfg.launch_command_with_mcp_servers(&[]);
+        assert_eq!(
+            cmd,
+            vec![
+                "codex".to_string(),
+                "app-server".to_string(),
+                "proxy".to_string(),
+            ],
+            "use_daemon=true must produce `codex app-server proxy` argv only"
+        );
+    }
+
+    #[test]
+    fn daemon_mode_skips_plugins_and_mcp_flags() {
+        // The proxy path inherits config from the running daemon, so
+        // seed-level overrides (--disable plugins / -c mcp_servers=...)
+        // would be no-ops. Verify they're not added.
+        let mut cfg = CodexAppServerConfig::default();
+        cfg.use_daemon = true;
+        cfg.plugins_enabled = false; // would trigger --disable plugins in stdio mode
+        cfg.mcp_policy = McpPolicy::Allow(vec!["RepoPrompt".to_string()]);
+        let cmd = cfg.launch_command_with_mcp_servers(&["RepoPrompt".to_string()]);
+        assert!(!cmd.contains(&"--disable".to_string()));
+        assert!(!cmd.contains(&"-c".to_string()));
+    }
+
+    #[test]
+    fn stdio_mode_still_adds_plugins_and_mcp_flags() {
+        // Default (use_daemon=false) must preserve pre-RF33-4 behavior.
+        // Pass a discovered MCP server that's NOT in the Allow list so
+        // mcp_servers_override has something to disable (returns Some).
+        let cfg = CodexAppServerConfig::default();
+        let cmd = cfg.launch_command_with_mcp_servers(&[
+            "RepoPrompt".to_string(),
+            "OtherServer".to_string(),
+        ]);
+        assert!(cmd.contains(&"--disable".to_string()));
+        assert!(cmd.contains(&"-c".to_string()));
+    }
+
+    #[test]
+    fn launch_fingerprint_differs_on_use_daemon() {
+        let mut a = CodexAppServerConfig::default();
+        let mut b = CodexAppServerConfig::default();
+        b.use_daemon = true;
+        assert_ne!(
+            CodexLaunchFingerprint::from(&a),
+            CodexLaunchFingerprint::from(&b),
+            "flipping --use-daemon must split sessions (different argv)"
+        );
+        a = CodexAppServerConfig::default();
+        a.use_daemon = true;
+        assert_eq!(
+            CodexLaunchFingerprint::from(&a),
+            CodexLaunchFingerprint::from(&b),
         );
     }
 

@@ -109,6 +109,10 @@ The skill body is workflow instruction, not a request to edit the skill.\n\n\
     ))
 }
 
+/// Convenience wrapper: `codex_config_full` with `use_daemon = false`.
+/// Kept around so tests can still call the 8-arg shape; production code
+/// goes through `codex_config_full` directly to thread the daemon flag.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn codex_config(
     model: Option<String>,
@@ -120,6 +124,34 @@ pub(crate) fn codex_config(
     mcp_allow: Vec<String>,
     plugins: bool,
 ) -> Result<CodexAppServerConfig> {
+    codex_config_full(
+        model,
+        cwd,
+        approval,
+        effort,
+        turn_timeout_secs,
+        mcp,
+        mcp_allow,
+        plugins,
+        false,
+    )
+}
+
+/// RF33-4: extended config builder that takes `use_daemon`. The older
+/// `codex_config` keeps the no-daemon default for callers that don't care
+/// (synthesis pass, `seed codex` one-shot).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn codex_config_full(
+    model: Option<String>,
+    cwd: Option<PathBuf>,
+    approval: ApprovalArg,
+    effort: Option<String>,
+    turn_timeout_secs: u64,
+    mcp: Option<McpArg>,
+    mcp_allow: Vec<String>,
+    plugins: bool,
+    use_daemon: bool,
+) -> Result<CodexAppServerConfig> {
     Ok(CodexAppServerConfig {
         model,
         cwd,
@@ -128,8 +160,33 @@ pub(crate) fn codex_config(
         approval_mode: approval.into(),
         mcp_policy: codex_mcp_policy(mcp, mcp_allow)?,
         plugins_enabled: plugins,
+        use_daemon,
         ..Default::default()
     })
+}
+
+/// RF33-4: `seed codex-daemon start|stop|status`. Thin wrapper that
+/// shells out to `codex app-server daemon ...` and forwards stdout/stderr
+/// so users see codex's own success/failure messages without seed
+/// editorializing. We don't try to parse the output — codex is the source
+/// of truth for its own daemon lifecycle.
+pub(crate) fn run_codex_daemon(action: crate::CodexDaemonAction) -> Result<()> {
+    let sub = match action {
+        crate::CodexDaemonAction::Start => "start",
+        crate::CodexDaemonAction::Stop => "stop",
+        crate::CodexDaemonAction::Status => "version",
+    };
+    let status = std::process::Command::new("codex")
+        .args(["app-server", "daemon", sub])
+        .status()
+        .with_context(|| format!("spawn `codex app-server daemon {sub}`"))?;
+    if !status.success() {
+        bail!(
+            "`codex app-server daemon {sub}` exited with status {}",
+            status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+        );
+    }
+    Ok(())
 }
 
 fn codex_mcp_policy(mcp: Option<McpArg>, mcp_allow: Vec<String>) -> Result<McpPolicy> {
@@ -407,6 +464,36 @@ mod tests {
     fn format_models_table_handles_empty_list() {
         let rendered = format_models_table(&[], None);
         assert!(rendered.contains("no codex models found"));
+    }
+
+    #[test]
+    fn config_full_threads_use_daemon_flag() {
+        let cfg = codex_config_full(
+            None,
+            None,
+            ApprovalArg::Deny,
+            None,
+            600,
+            None,
+            Vec::new(),
+            false,
+            true, // use_daemon
+        )
+        .unwrap();
+        assert!(cfg.use_daemon);
+        // Default path should NOT set use_daemon (backward compat sanity).
+        let cfg2 = codex_config(
+            None,
+            None,
+            ApprovalArg::Deny,
+            None,
+            600,
+            None,
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        assert!(!cfg2.use_daemon);
     }
 
     #[test]

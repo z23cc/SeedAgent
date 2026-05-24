@@ -34,6 +34,7 @@ pub(crate) fn default_interactive_command() -> Command {
         codex: false,
         record_only: false,
         mode: crate::commands::run::ModeArg::Auto,
+        use_daemon: false,
     }
 }
 
@@ -54,6 +55,8 @@ pub(crate) struct InteractiveArgs {
     /// RF27-3: REPL-session mode override. `Auto` = auto-classify per-goal
     /// (default); `Read`/`Write` pin until `/mode` is changed.
     pub(crate) mode: crate::commands::run::ModeArg,
+    /// RF33-4: connect Codex via `app-server proxy` (daemon) when true.
+    pub(crate) use_daemon: bool,
 }
 
 /// Per-REPL session state that we keep outside `InteractiveArgs` because it's
@@ -217,10 +220,18 @@ pub(crate) fn run_interactive(
                         plugins: args.plugins,
                     },
                     mode: args.mode,
+                    use_daemon: args.use_daemon,
                     codex_session: Some(&mut codex_session),
                 }) {
                     agent_tui::print_error(err);
                 }
+                // RF33-2: poll for skill-requested sticky cwd change. If
+                // a skill_fetch during the run set `sticky_cwd: true`,
+                // apply the workspace switch now so the NEXT goal runs in
+                // the right place. We do this on both success and error
+                // paths because skill_fetch's queue happens before the
+                // result is known.
+                poll_sticky_cwd_into_workspace(&mut workspace, &mut codex_session);
             }
             agent_tui::ReplInput::Empty | agent_tui::ReplInput::Continue => {}
             agent_tui::ReplInput::Exit => break,
@@ -780,6 +791,46 @@ fn handle_mode_command(args: &mut InteractiveArgs, rest: &str) {
     }
 }
 
+// --- RF33-2 sticky-cwd polling ----------------------------------------------
+
+/// Drain the `repoprompt_sync::pending_sticky_cwd` queue and apply the
+/// requested cwd change to `workspace` and (if live) the cached Codex
+/// client. Called after every `run_goal` invocation. Prints a one-line
+/// notice when a change is applied so the user sees that a skill nudged
+/// their cwd — the whole point of opt-in `sticky_cwd: true` is that this
+/// IS user-visible.
+///
+/// No-op when no skill requested a sticky change (the common case).
+fn poll_sticky_cwd_into_workspace(
+    workspace: &mut SeedWorkspace,
+    codex_session: &mut crate::commands::codex_session::CodexSession,
+) {
+    let Some(target) = agent_tools::repoprompt_sync::take_pending_sticky_cwd() else {
+        return;
+    };
+    if target == workspace.cwd {
+        // Skill targeted the cwd we're already in — nothing to do, no need
+        // to print noise. The pending_override (transient bind) was set
+        // separately and consumed by the rp call already.
+        return;
+    }
+    let prev = workspace.set_cwd(target.clone());
+    // Push into the cached Codex client too so the next turn doesn't lag
+    // by one. /sync handles the rp side via clear_bound_window inside
+    // set_cwd above.
+    if let Some(client) = codex_session.client_mut() {
+        client.set_cwd(target.clone());
+    }
+    eprintln!(
+        "{}",
+        agent_tui::dim_text(&format!(
+            "(skill applied sticky cwd: {} → {})",
+            prev.display(),
+            target.display(),
+        ))
+    );
+}
+
 // --- /sync -------------------------------------------------------------------
 
 /// `/sync` — force every subsystem to realign to `workspace.cwd` *now*.
@@ -944,6 +995,7 @@ fn handle_retry_command(
             plugins: args.plugins,
         },
         mode: args.mode,
+        use_daemon: args.use_daemon,
         // Reuse the REPL-lifetime Codex client (RF25-1) — same fingerprint
         // means same subprocess, no respawn cost on retry.
         codex_session: Some(codex_session),
@@ -1015,6 +1067,7 @@ mod tests {
             codex: false,
             record_only: false,
             mode: crate::commands::run::ModeArg::Auto,
+            use_daemon: false,
         }
     }
 

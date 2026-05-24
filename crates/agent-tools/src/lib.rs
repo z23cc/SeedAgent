@@ -92,6 +92,12 @@ pub mod repoprompt_sync {
         /// consuming a `pending_override` (next call is intentionally
         /// targeting different dirs), and by `clear_bound_window`.
         bound: Option<BoundWindow>,
+        /// RF33-2: opt-in sticky cwd request from a skill whose frontmatter
+        /// set `sticky_cwd: true`. Polled by `run_goal` between turns; when
+        /// present, it applies workspace.set_cwd(path) (and pushes the new
+        /// cwd into the cached Codex client if live). Consumed on poll
+        /// regardless of whether the apply succeeded.
+        pending_sticky_cwd: Option<PathBuf>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,13 +111,36 @@ pub mod repoprompt_sync {
     }
 
     /// Clear all sync state. Call once at the start of a fresh run so stale
-    /// pending overrides + window caches from a prior REPL turn / aborted
-    /// run don't bleed in.
+    /// pending overrides + window caches + sticky-cwd requests from a prior
+    /// REPL turn / aborted run don't bleed in.
     pub fn reset() {
         if let Ok(mut st) = state().lock() {
             st.pending_override = None;
             st.bound = None;
+            st.pending_sticky_cwd = None;
         }
+    }
+
+    /// RF33-2: queue a sticky-cwd request. Called by `skill_fetch` when the
+    /// fetched skill has `sticky_cwd: true` + a non-empty working_dirs list.
+    /// The very next planner-loop iteration polls and applies it via
+    /// `take_pending_sticky_cwd`.
+    pub fn set_pending_sticky_cwd(path: PathBuf) {
+        if let Ok(mut st) = state().lock() {
+            st.pending_sticky_cwd = Some(path);
+        }
+    }
+
+    /// Consume the queued sticky-cwd request. Returns `None` if no skill
+    /// requested one. Caller (`run_goal`) is responsible for applying it
+    /// to `workspace.cwd` and (if live) `codex_session.client.set_cwd`.
+    pub fn take_pending_sticky_cwd() -> Option<PathBuf> {
+        state().lock().ok().and_then(|mut st| st.pending_sticky_cwd.take())
+    }
+
+    /// Inspect without consuming. For doctor / tests.
+    pub fn peek_pending_sticky_cwd() -> Option<PathBuf> {
+        state().lock().ok().and_then(|st| st.pending_sticky_cwd.clone())
     }
 
     /// Queue a one-shot override. The next RepoPrompt call that would
@@ -211,7 +240,65 @@ pub fn seed_registry() -> ToolRegistry {
     registry.register(SpawnSubagentMapTool);
     registry.register(SubagentNudgeTool);
     registry.register(AskUserTool);
+    registry.register(ToolDescribeTool);
     registry
+}
+
+/// RF33-3: planner-callable tool description lookup. Used in conjunction
+/// with the "send names-only after turn 1" prompt economy — if the planner
+/// needs a forgotten description, it calls this with `{name: "..."}` and
+/// gets the full text back.
+///
+/// Looked up against a fresh `seed_registry()` rather than a borrowed
+/// handle because `ToolContext` doesn't carry the registry (the registry
+/// owns the tools as `Box<dyn Tool>` and isn't `Clone`). Each call
+/// constructs a registry, fishes out the name, returns; cost is one
+/// allocation per call which is negligible against the LLM round-trip
+/// cost it saves.
+#[derive(Debug, Deserialize)]
+struct ToolDescribeArgs {
+    name: String,
+}
+
+pub struct ToolDescribeTool;
+
+impl Tool for ToolDescribeTool {
+    fn name(&self) -> &'static str {
+        "tool_describe"
+    }
+
+    fn description(&self) -> &'static str {
+        "Look up the full description of a registered tool by name. Useful after turn 1 when the planner prompt has switched to names-only and you need to refresh on what `xyz_tool` does."
+    }
+
+    fn execute(&self, _ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        let args: ToolDescribeArgs =
+            serde_json::from_value(call.args.clone()).map_err(|source| {
+                ToolError::InvalidArguments {
+                    tool: call.name.clone(),
+                    source,
+                }
+            })?;
+        let registry = seed_registry();
+        let info = registry
+            .infos()
+            .into_iter()
+            .find(|info| info.name == args.name);
+        match info {
+            Some(info) => Ok(ToolResult::ok(
+                call,
+                json!({
+                    "status": "success",
+                    "name": info.name,
+                    "description": info.description,
+                }),
+            )),
+            None => Ok(ToolResult::error(
+                call,
+                format!("unknown tool: {}", args.name),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,11 +521,28 @@ fn queue_skill_repoprompt_binding(binding: &agent_skills::RepoPromptBinding) -> 
         });
     }
     repoprompt_sync::set_pending_override(binding.working_dirs.clone());
+    // RF33-2: opt-in sticky_cwd. When the skill frontmatter requests it,
+    // also queue a workspace.cwd change that run_goal will poll between
+    // turns. We use working_dirs[0] (canonical first entry) as the cwd
+    // target — for multi-root skills the user should pick a primary in
+    // the skill design rather than relying on heuristics here.
+    let sticky_target = if binding.sticky_cwd {
+        let target = binding.working_dirs[0].clone();
+        repoprompt_sync::set_pending_sticky_cwd(target.clone());
+        Some(target)
+    } else {
+        None
+    };
     json!({
-        "status": "queued_transient",
-        "applies_to": "next repoprompt_* tool call",
+        "status": if binding.sticky_cwd { "queued_sticky" } else { "queued_transient" },
+        "applies_to": if binding.sticky_cwd {
+            "next rp call + workspace.cwd after current turn"
+        } else {
+            "next repoprompt_* tool call only"
+        },
         "working_dirs": binding.working_dirs,
         "context_id": binding.context_id,
+        "sticky_cwd_target": sticky_target,
     })
 }
 
@@ -3573,11 +3677,46 @@ mod tests {
             ..Default::default()
         };
         let v = queue_skill_repoprompt_binding(&binding);
+        // RF33-2: default sticky_cwd=false → transient classification.
         assert_eq!(v["status"], "queued_transient");
-        assert_eq!(v["applies_to"], "next repoprompt_* tool call");
+        assert_eq!(v["applies_to"], "next repoprompt_* tool call only");
+        assert_eq!(v["sticky_cwd_target"], serde_json::Value::Null);
         assert_eq!(
             repoprompt_sync::peek_pending_override(),
             Some(vec![PathBuf::from("/a"), PathBuf::from("/b")])
+        );
+        // No sticky_cwd → no sticky pending.
+        assert!(repoprompt_sync::peek_pending_sticky_cwd().is_none());
+        repoprompt_sync::reset();
+    }
+
+    #[test]
+    fn queue_skill_repoprompt_binding_queues_sticky_cwd_when_opted_in() {
+        let _g = rp_sync_setup();
+        let binding = agent_skills::RepoPromptBinding {
+            working_dirs: vec![PathBuf::from("/skill-root")],
+            sticky_cwd: true,
+            ..Default::default()
+        };
+        let v = queue_skill_repoprompt_binding(&binding);
+        assert_eq!(v["status"], "queued_sticky");
+        assert!(
+            v["applies_to"]
+                .as_str()
+                .unwrap_or("")
+                .contains("workspace.cwd"),
+            "applies_to should mention workspace.cwd, got: {}",
+            v["applies_to"]
+        );
+        assert_eq!(
+            v["sticky_cwd_target"]
+                .as_str()
+                .map(PathBuf::from),
+            Some(PathBuf::from("/skill-root"))
+        );
+        assert_eq!(
+            repoprompt_sync::peek_pending_sticky_cwd(),
+            Some(PathBuf::from("/skill-root"))
         );
         repoprompt_sync::reset();
     }

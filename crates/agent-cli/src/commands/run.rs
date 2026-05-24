@@ -19,7 +19,7 @@ use crate::display::{
     format_elapsed_cli, format_token_subtitle, reset_phase_tracker, set_display_cwd,
     short_failure_reason, short_failure_text,
 };
-use crate::commands::codex::{codex_config, codex_prompt_with_routed_skill};
+use crate::commands::codex::codex_prompt_with_routed_skill;
 use crate::commands::exec::{execute_call, execute_call_with_turn};
 use crate::{ApprovalArg, McpArg, consolidate_run_skill, memory_paths, parse_seed_goal};
 
@@ -436,6 +436,10 @@ pub(crate) struct RunGoalArgs<'a> {
     /// RF27-3: explicit mode override. `Auto` uses the keyword classifier;
     /// `Read`/`Write` pin the mode regardless of goal text.
     pub(crate) mode: ModeArg,
+    /// RF33-4: when true, codex_config sets use_daemon=true so the client
+    /// launches via `codex app-server proxy` (running daemon) instead of
+    /// spawning a fresh app-server. User opts in via `--use-daemon`.
+    pub(crate) use_daemon: bool,
     /// Optional REPL-lifetime Codex client cache. When `Some`, every Codex
     /// spawn site inside this `run_goal` will reuse the cached client (with
     /// per-turn cfg hot-swapped) instead of spawning a fresh `codex
@@ -591,6 +595,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 plugins,
             },
         mode: mode_arg,
+        use_daemon,
         codex_session,
     } = args;
     // Bridge: when we have no REPL-owned session we build a throwaway one
@@ -687,7 +692,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
 
     if use_codex {
         let spinner = agent_tui::Spinner::start("codex · running prompt");
-        let cfg = codex_config(
+        let cfg = crate::commands::codex::codex_config_full(
             model,
             Some(cwd.clone()),
             approval,
@@ -696,6 +701,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             mcp,
             mcp_allow,
             plugins,
+            use_daemon,
         )?;
         // RF25-1: reuse the REPL-lifetime client if its launch fingerprint
         // matches; otherwise this constructs a fresh one and stashes it for
@@ -768,6 +774,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             mcp,
             mcp_allow,
             plugins,
+            use_daemon,
             codex_session,
         ) {
             Ok(p) => p,
@@ -889,7 +896,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 }
                 }
                 PlannerProvider::Codex => {
-                let cfg = codex_config(
+                let cfg = crate::commands::codex::codex_config_full(
                     synthesis_model.clone(),
                     Some(cwd.clone()),
                     synthesis_approval.clone(),
@@ -898,6 +905,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                     synthesis_mcp,
                     synthesis_mcp_allow.clone(),
                     plugins,
+                    use_daemon,
                 )?;
                 // Reuse the REPL-lifetime session (RF25-1) — synthesis is
                 // a single extra Codex turn, so it benefits the same way
@@ -1299,6 +1307,7 @@ fn build_planner<'a>(
     mcp: Option<McpArg>,
     mcp_allow: Vec<String>,
     plugins: bool,
+    use_daemon: bool,
     codex_session: &'a mut crate::commands::codex_session::CodexSession,
 ) -> Result<Box<dyn Planner + 'a>> {
     match kind {
@@ -1327,7 +1336,7 @@ fn build_planner<'a>(
             }))
         }
         PlannerProvider::Codex => {
-            let cfg = codex_config(
+            let cfg = crate::commands::codex::codex_config_full(
                 model,
                 Some(cwd.to_path_buf()),
                 approval,
@@ -1336,6 +1345,7 @@ fn build_planner<'a>(
                 mcp,
                 mcp_allow,
                 plugins,
+                use_daemon,
             )?;
             // RF29-1: borrow the live client from the REPL-lifetime session.
             // If the launch fingerprint matches a previously-cached client,

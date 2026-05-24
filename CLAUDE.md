@@ -58,38 +58,33 @@ SeedAgent is a self-bootstrapping agent kernel. The CLI `seed` drives a small pl
 - **Library crates expose typed errors** (RF10): `agent-plan`, `agent-memory`, `agent-session`, `agent-skills`, `agent-repoprompt`, plus the pre-existing `agent-core`/`agent-llm`/`agent-runtime`/`agent-delegate`. Public fns return `XxxResult<T> = Result<T, XxxError>`; each `XxxError` carries a small set of pattern-matchable variants (e.g. `PlanError::ItemNotFound { index }`, `SkillError::NotFound { name, skills_dir }`) plus an `Other(#[from] anyhow::Error)` escape hatch so internal `?` keeps working. Borrowed from forge's `forge_domain::Error` pattern — when adding a new library error, name the variants callers will want to switch on, leave everything else as `Other`.
 - **Adding planner errors** (RF14): use `RuntimeError::Planner(_)` only for transient failures (network/transport/stdio hiccup that retrying might fix). Use `RuntimeError::PlannerFatal(_)` (or `RuntimeError::planner_fatal(msg)`) for permanent failures (auth rejection, model returned non-success response, runtime decided to give up). The runtime's retry loop only re-arms on `Planner` + `InvalidPlannerJson`.
 
-### Deliberately closed (not "TODO" — design decisions)
+### Recently shipped (formerly deferred)
 
-These came up during RF24–RF29 analysis and were considered, sized, then
-declined. Don't reopen without new data:
+All items originally considered in RF24–RF29 are now implemented (RF24–RF33).
+The deferred-by-design list is empty — what used to be there:
 
-- **Codex daemon mode (`codex app-server daemon` + `remote-control`).** After
-  RF25-1 a long-lived REPL session reuses one app-server subprocess, so
-  daemon mode only helps the "10 successive `seed run …` invocations
-  from a shell" case. Daemon lifecycle management (auto-start, ownership,
-  cross-process state) is non-trivial; the saved 300ms × N isn't worth it
-  until that becomes someone's bottleneck.
-- **Skill autobind also updates `workspace.cwd` / Codex cwd.** Currently
-  skill bindings are transient (RF24-4): they hijack one rp call's
-  working_dirs and then RP falls back to `ctx.cwd`. Making the binding
-  sticky would cross into "skill silently `/cd`-ed me", which is
-  surprising. The transient model is intentional; explicit `/cd` is the
-  user-visible workspace switch.
-- **Per-turn tool-description culling in the planner prompt.** Real prompt-
-  token savings, but the safety net (planner picks wrong tool because it
-  didn't see the description) needs data. Codex's prompt cache likely
-  recovers most of the wasted bytes anyway. Re-evaluate if a profile
-  shows the prompt-build path is the bottleneck.
-- **Cross-turn memory-context cache (manual prefix-prompt cache).** Codex's
-  server-side prompt caching almost certainly already does this — adding
-  our own layer risks fighting it. Leave to the backend.
-- ~~**`HttpPlanner` streaming.**~~ Done in RF32: `ProviderClient::chat_streaming`
-  posts with `stream: true` and parses OpenAI Responses SSE events
-  (`response.output_text.delta` → on_delta callback; `response.completed`
-  for fallback text extraction). HttpPlanner uses it with the same
-  spinner-subtitle callback as Codex, so `--provider openai` users get
-  live token counts. No async cascade — the blocking reqwest client's
-  `Response` impls `std::io::Read`, which is enough for line-based SSE.
+- **Codex daemon mode** → RF33-4: `--use-daemon` flag + `seed codex-daemon
+  start|stop|status` subcommand. Launches via `codex app-server proxy`
+  (connecting to running daemon) instead of stdio app-server.
+  `CodexLaunchFingerprint` includes `use_daemon` so session reuse splits
+  correctly when the flag flips.
+- **Skill autobind sticky** → RF33-2: opt-in `repoprompt_sticky_cwd: true`
+  in skill frontmatter. When set, `queue_skill_repoprompt_binding` ALSO
+  queues a sticky cwd change via `repoprompt_sync::set_pending_sticky_cwd`;
+  REPL polls between turns via `poll_sticky_cwd_into_workspace` and
+  applies to `workspace.cwd` + the cached Codex client. Default false
+  preserves the transient (RF24-4) behavior.
+- **Per-turn tool-description culling** → RF33-3: `planner_request_with_state_and_memory`
+  ships full descriptions on turns 1–4, names-only on turn 5+ with a hint
+  pointing at the new `tool_describe` planner tool. The planner can call
+  `tool_describe {name: "..."}` to recover any description it forgot.
+- **Cross-turn memory-context cache** → RF33-1: `agent_memory::planner_memory_context`
+  caches its output keyed on a tuple of mtimes
+  (meta_rules/l1_insight/global_facts/index/skills_dir). Mtime change →
+  cache miss → rebuild. `reset_planner_memory_cache` is exposed for tests.
+- **HttpPlanner streaming** → RF32: `ProviderClient::chat_streaming` posts
+  with `stream: true` and parses OpenAI Responses SSE events. HttpPlanner
+  uses it with the same spinner subtitle callback as Codex.
 
 ### Environment variables
 

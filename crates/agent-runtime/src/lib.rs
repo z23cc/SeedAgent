@@ -1036,11 +1036,40 @@ pub fn planner_request_with_state_and_memory(
     state: &AgentLoopState,
     memory_context: &PlannerMemoryContext,
 ) -> ChatRequest {
-    let tools_text = tools
-        .iter()
-        .map(|tool| format!("- {}: {}", tool.name, compact_tool_description(&tool.description)))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // RF33-3: per-turn tool catalog culling. The prompt currently ships
+    // ~30 tools × 1-line descriptions every turn. After turn 1 most of
+    // that is redundant repetition. We tier it:
+    //
+    //   turn 1     → full compact descriptions (~90 chars/tool)
+    //   turn 2-4   → compact descriptions (same as turn 1 — descriptions
+    //                are still cheap insurance for "what does X do?")
+    //   turn 5+    → names only + hint to call `tool_describe` if needed
+    //
+    // The threshold at turn 5 is empirical: most goals finish in <5
+    // turns; once you're past that, the planner has either picked a
+    // recipe or is stuck, and dropping descriptions saves ~3KB/turn of
+    // input tokens that the prompt cache may or may not dedupe.
+    let current_turn = state.working_memory.current_turn;
+    let tools_text = if current_turn >= 5 {
+        let mut lines: Vec<String> =
+            tools.iter().map(|tool| format!("- {}", tool.name)).collect();
+        lines.push(String::from(
+            "  (descriptions elided — call `tool_describe {name: \"...\"}` if you need one)",
+        ));
+        lines.join("\n")
+    } else {
+        tools
+            .iter()
+            .map(|tool| {
+                format!(
+                    "- {}: {}",
+                    tool.name,
+                    compact_tool_description(&tool.description)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let routing = planner_tool_routing_block(tools);
     let system = format!(
         "You are the planner for a minimal local agent. Choose exactly one next action.\n\
@@ -2292,6 +2321,80 @@ mod tests {
                 .key_info
                 .iter()
                 .any(|item| item.contains("Repo root verified"))
+        );
+    }
+
+    // --- RF33-3 per-turn tool-description culling ----------------------
+
+    #[test]
+    fn planner_prompt_includes_descriptions_through_turn_4() {
+        let tools = vec![
+            ToolInfo {
+                name: "read_file".to_string(),
+                description: "Read a UTF-8 file from disk.".to_string(),
+            },
+            ToolInfo {
+                name: "write_file".to_string(),
+                description: "Write or overwrite a file at the given path.".to_string(),
+            },
+        ];
+        // Turn 1 — full descriptions.
+        let mut state = AgentLoopState::from_observations(&[], 1, 0);
+        state.working_memory.current_turn = 1;
+        let req = planner_request_with_state(
+            ModelId::from("x"),
+            "demo",
+            &tools,
+            &state,
+        );
+        let sys = &req.messages[0].content;
+        assert!(sys.contains("Read a UTF-8 file from disk"));
+        assert!(sys.contains("Write or overwrite a file"));
+
+        // Turn 4 — descriptions still present (compact path).
+        state.working_memory.current_turn = 4;
+        let req = planner_request_with_state(
+            ModelId::from("x"),
+            "demo",
+            &tools,
+            &state,
+        );
+        assert!(req.messages[0].content.contains("Read a UTF-8 file"));
+    }
+
+    #[test]
+    fn planner_prompt_names_only_after_turn_5() {
+        let tools = vec![
+            ToolInfo {
+                name: "read_file".to_string(),
+                description: "Read a UTF-8 file from disk.".to_string(),
+            },
+            ToolInfo {
+                name: "write_file".to_string(),
+                description: "Write or overwrite a file at the given path.".to_string(),
+            },
+        ];
+        let mut state = AgentLoopState::from_observations(&[], 5, 0);
+        state.working_memory.current_turn = 5;
+        let req = planner_request_with_state(
+            ModelId::from("x"),
+            "demo",
+            &tools,
+            &state,
+        );
+        let sys = &req.messages[0].content;
+        // Names still present.
+        assert!(sys.contains("- read_file"));
+        assert!(sys.contains("- write_file"));
+        // Descriptions gone.
+        assert!(
+            !sys.contains("Read a UTF-8 file from disk"),
+            "turn 5+ should drop tool descriptions to save prompt tokens"
+        );
+        // Recovery hint present.
+        assert!(
+            sys.contains("tool_describe"),
+            "turn 5+ should hint at tool_describe for description recovery"
         );
     }
 }
