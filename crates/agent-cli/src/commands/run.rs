@@ -29,6 +29,8 @@ struct TurnTiming {
     planner_ms: u64,
     exec_ms: u64,
     planner_chars: usize,
+    /// RF36-1: assembled prompt size (input side). Set by `record_planner_timing`.
+    prompt_chars: usize,
 }
 
 fn record_planner_timing(
@@ -36,12 +38,14 @@ fn record_planner_timing(
     turn: usize,
     planner_elapsed: Duration,
     planner_chars: usize,
+    prompt_chars: usize,
 ) {
     timings.borrow_mut().push(TurnTiming {
         turn,
         planner_ms: planner_elapsed.as_millis() as u64,
         exec_ms: 0,
         planner_chars,
+        prompt_chars,
     });
 }
 
@@ -1067,6 +1071,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 planner_ms: timing.planner_ms,
                 exec_ms: timing.exec_ms,
                 planner_chars: timing.planner_chars,
+                prompt_chars: timing.prompt_chars,
             })?;
         }
         match loop_result.status {
@@ -1159,6 +1164,11 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         info = info
             .pair("planner avg", stats.planner_avg)
             .pair("exec avg", stats.exec_avg);
+        // RF36-1: input prompt size in front of response chars — "in/out"
+        // ordering reads naturally.
+        if let Some(chars) = stats.prompt_chars_total {
+            info = info.pair("prompt chars", chars);
+        }
         if let Some(chars) = stats.planner_chars_total {
             info = info.pair("planner chars", chars);
         }
@@ -1173,6 +1183,10 @@ struct TimingStats {
     planner_avg: String,
     exec_avg: String,
     planner_chars_total: Option<String>,
+    /// RF36-1: sum of `prompt_chars` across all turns. Shown in the run
+    /// footer alongside response char total so users can see "I sent 320k
+    /// chars in / 18k chars out" — useful for spotting prompt bloat.
+    prompt_chars_total: Option<String>,
 }
 
 fn build_timing_stats(session: &SessionWriter) -> Result<Option<TimingStats>> {
@@ -1180,18 +1194,21 @@ fn build_timing_stats(session: &SessionWriter) -> Result<Option<TimingStats>> {
     let mut planner_ms_total: u64 = 0;
     let mut exec_ms_total: u64 = 0;
     let mut planner_chars_total: usize = 0;
+    let mut prompt_chars_total: usize = 0;
     let mut count: u64 = 0;
     for record in records {
         if let AgentEvent::TurnTimings {
             planner_ms,
             exec_ms,
             planner_chars,
+            prompt_chars,
             ..
         } = record.event
         {
             planner_ms_total += planner_ms;
             exec_ms_total += exec_ms;
             planner_chars_total += planner_chars;
+            prompt_chars_total += prompt_chars;
             count += 1;
         }
     }
@@ -1205,10 +1222,16 @@ fn build_timing_stats(session: &SessionWriter) -> Result<Option<TimingStats>> {
     } else {
         None
     };
+    let prompt_chars = if prompt_chars_total > 0 {
+        Some(format_token_subtitle(prompt_chars_total))
+    } else {
+        None
+    };
     Ok(Some(TimingStats {
         planner_avg,
         exec_avg,
         planner_chars_total: chars,
+        prompt_chars_total: prompt_chars,
     }))
 }
 
@@ -1247,6 +1270,15 @@ trait Planner {
         memory: &agent_runtime::PlannerMemoryContext,
         spinner: &agent_tui::Spinner,
     ) -> Result<(agent_runtime::PlannedAction, usize), agent_runtime::RuntimeError>;
+
+    /// RF36-1: input char count of the most-recently-built planner prompt.
+    /// Returns `0` if the impl doesn't track it (default). CodexPlanner +
+    /// HttpPlanner override to surface accurate counts; OraclePlanner
+    /// could but the value is dominated by the working_memory section
+    /// which is identical across providers — skip for now.
+    fn last_prompt_chars(&self) -> usize {
+        0
+    }
 }
 
 struct OraclePlanner {
@@ -1314,6 +1346,9 @@ impl Planner for OraclePlanner {
 /// it through `build_planner`'s return type.
 struct CodexPlanner<'a> {
     client: &'a mut CodexAppServerClient,
+    /// RF36-1: char count of the last prompt we built. drive_planner_loop
+    /// reads this after each `plan()` to record in TurnTimings.
+    last_prompt_chars: usize,
 }
 
 impl<'a> Planner for CodexPlanner<'a> {
@@ -1331,6 +1366,10 @@ impl<'a> Planner for CodexPlanner<'a> {
     ) -> Result<(agent_runtime::PlannedAction, usize), agent_runtime::RuntimeError> {
         let prompt =
             agent_runtime::planner_prompt_with_state_and_memory(goal, tool_infos, state, memory);
+        // RF36-1: record prompt size so the loop driver can surface it
+        // in TurnTimings. Using .chars().count() matches the response-side
+        // metric — they're both rough proxies for token count.
+        self.last_prompt_chars = prompt.chars().count();
         let delta_chars: Cell<usize> = Cell::new(0);
         let result = self
             .client
@@ -1344,11 +1383,19 @@ impl<'a> Planner for CodexPlanner<'a> {
         let action = agent_runtime::parse_planned_action(&result.text)?;
         Ok((action, delta_chars.get()))
     }
+
+    fn last_prompt_chars(&self) -> usize {
+        self.last_prompt_chars
+    }
 }
 
 struct HttpPlanner {
     provider_id: String,
     model: String,
+    /// RF36-1: same role as `CodexPlanner.last_prompt_chars`. We compute
+    /// it by summing the rendered ChatRequest message content lengths,
+    /// since the HTTP body isn't a single string we can `.chars().count()`.
+    last_prompt_chars: usize,
 }
 
 impl Planner for HttpPlanner {
@@ -1382,6 +1429,14 @@ impl Planner for HttpPlanner {
             state,
             memory,
         );
+        // RF36-1: estimate prompt size by summing message content lengths.
+        // Approximate (ignores per-message JSON envelope overhead) but a
+        // good proxy for "how full is my context?".
+        self.last_prompt_chars = request
+            .messages
+            .iter()
+            .map(|m| m.content.chars().count())
+            .sum();
         let delta_chars: Cell<usize> = Cell::new(0);
         let response = agent_llm::ProviderClient::new()
             .chat_streaming(provider, request, |delta| {
@@ -1393,6 +1448,10 @@ impl Planner for HttpPlanner {
             })?;
         let action = agent_runtime::parse_planned_action(&response.text)?;
         Ok((action, delta_chars.get()))
+    }
+
+    fn last_prompt_chars(&self) -> usize {
+        self.last_prompt_chars
     }
 }
 
@@ -1460,11 +1519,16 @@ fn build_planner<'a>(
             // we reuse the subprocess (no spawn, ~0ms). Otherwise ensure()
             // drops the old one and spawns fresh.
             let client = codex_session.ensure(cfg)?;
-            Ok(Box::new(CodexPlanner { client }))
+            Ok(Box::new(CodexPlanner {
+                client,
+                last_prompt_chars: 0,
+            }))
         }
         PlannerProvider::Http(provider_id) => {
             let model = model.unwrap_or_else(|| "gpt-5.1".to_string());
+            #[allow(clippy::redundant_field_names)]
             Ok(Box::new(HttpPlanner {
+                last_prompt_chars: 0,
                 provider_id: provider_id.clone(),
                 model,
             }))
@@ -1526,11 +1590,15 @@ where
             let memory = build_memory();
             let planner_started = Instant::now();
             let (action, chars) = planner.plan(goal, tool_infos, state, &memory, spinner)?;
+            // RF36-1: capture prompt size for this turn (provider-specific;
+            // 0 if the planner doesn't track it).
+            let prompt_chars = planner.last_prompt_chars();
             record_planner_timing(
                 turn_timings,
                 state.next_turn,
                 planner_started.elapsed(),
                 chars,
+                prompt_chars,
             );
             Ok(action)
         },
@@ -1561,6 +1629,18 @@ where
 mod tests {
     use super::*;
     use agent_core::ToolInfo;
+
+    // --- RF36-1 prompt size visibility ----------------------------------
+
+    #[test]
+    fn planner_trait_default_last_prompt_chars_is_zero() {
+        // MockPlanner doesn't override last_prompt_chars(), so the default
+        // impl should return 0 — confirming OraclePlanner (which also
+        // doesn't override) won't accidentally report stale values.
+        let mut planner = MockPlanner::new(vec![]);
+        let p: &dyn Planner = &mut planner;
+        assert_eq!(p.last_prompt_chars(), 0);
+    }
 
     // --- RF35-2 tool memoization ----------------------------------------
 

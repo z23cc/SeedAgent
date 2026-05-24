@@ -222,7 +222,14 @@ pub enum AgentEvent {
         turn: usize,
         planner_ms: u64,
         exec_ms: u64,
+        /// Output char count from the planner's response (approximation for
+        /// output tokens when the provider doesn't report `tokens` directly).
         planner_chars: usize,
+        /// RF36-1: input char count of the assembled planner prompt for this
+        /// turn (system + user + memory + tool catalog). `serde(default)` so
+        /// older session JSONLs read back as `0`.
+        #[serde(default)]
+        prompt_chars: usize,
     },
     RunFinished {
         status: String,

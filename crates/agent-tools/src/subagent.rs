@@ -126,13 +126,8 @@ impl Tool for SpawnSubagentTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: SpawnSubagentArgs =
-            serde_json::from_value(call.args.clone()).map_err(|source| {
-                ToolError::InvalidArguments {
-                    tool: call.name.clone(),
-                    source,
-                }
-            })?;
+            let args: SpawnSubagentArgs = crate::parse_tool_args(call)?;
+
         match spawn_one_subagent(&ctx.cwd, &ctx.skills_dir, &args) {
             Ok(outcome) => Ok(ToolResult::ok(call, subagent_result_json(&outcome))),
             Err(SpawnError::Refused(msg)) | Err(SpawnError::Failed(msg)) => {
@@ -345,13 +340,8 @@ impl Tool for SpawnSubagentMapTool {
     }
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: SpawnSubagentMapArgs =
-            serde_json::from_value(call.args.clone()).map_err(|source| {
-                ToolError::InvalidArguments {
-                    tool: call.name.clone(),
-                    source,
-                }
-            })?;
+            let args: SpawnSubagentMapArgs = crate::parse_tool_args(call)?;
+
         if args.tasks.is_empty() {
             return Ok(ToolResult::error(call, "tasks array must not be empty"));
         }
@@ -446,13 +436,8 @@ impl Tool for SubagentNudgeTool {
     }
 
     fn execute(&self, _ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let args: SubagentNudgeArgs =
-            serde_json::from_value(call.args.clone()).map_err(|source| {
-                ToolError::InvalidArguments {
-                    tool: call.name.clone(),
-                    source,
-                }
-            })?;
+            let args: SubagentNudgeArgs = crate::parse_tool_args(call)?;
+
         let stop = args.stop.unwrap_or(false);
         if args.key_info.is_none() && args.intervene.is_none() && !stop {
             return Ok(ToolResult::error(
