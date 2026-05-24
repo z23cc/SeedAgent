@@ -768,6 +768,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             mcp,
             mcp_allow,
             plugins,
+            codex_session,
         ) {
             Ok(p) => p,
             Err(err) => {
@@ -1188,21 +1189,18 @@ impl Planner for OraclePlanner {
 
 /// Planner-loop backend for `--provider codex`.
 ///
-/// RF25-1 note: this planner OWNS its `CodexAppServerClient` because it
-/// lives inside a `Box<dyn Planner>` and we don't want to bleed lifetimes
-/// through the trait. As a result, planner-loop Codex sessions are NOT
-/// shared with the REPL-lifetime `codex_session` — every `run_goal` that
-/// uses `--provider codex` spawns one fresh `codex app-server` subprocess.
-/// The shared-session optimization covers the two higher-traffic paths
-/// (the `--codex` fast-path delegation and the post-loop synthesis pass);
-/// adding the planner-loop case would force a trait-object lifetime
-/// refactor and is deferred until that overhead actually shows up in a
-/// profile.
-struct CodexPlanner {
-    client: CodexAppServerClient,
+/// RF29-1: borrows `&'a mut CodexAppServerClient` from the REPL-lifetime
+/// `CodexSession`. The session's `ensure()` decides whether to reuse the
+/// existing subprocess or restart based on launch fingerprint, so a chain
+/// of REPL goals on `--provider codex` shares one `codex app-server`
+/// across goals instead of paying ~300ms startup per goal. The lifetime
+/// `'a` is the borrow on `CodexSession`; `Box<dyn Planner + 'a>` carries
+/// it through `build_planner`'s return type.
+struct CodexPlanner<'a> {
+    client: &'a mut CodexAppServerClient,
 }
 
-impl Planner for CodexPlanner {
+impl<'a> Planner for CodexPlanner<'a> {
     fn label(&self) -> &'static str {
         "planning"
     }
@@ -1271,7 +1269,7 @@ impl Planner for HttpPlanner {
 // run_goal where the post-loop synthesis pass needs separate copies of
 // model/approval/effort/mcp/mcp_allow; the explicit list is clearer here.
 #[allow(clippy::too_many_arguments)]
-fn build_planner(
+fn build_planner<'a>(
     kind: &PlannerProvider,
     cwd: &Path,
     model: Option<String>,
@@ -1281,7 +1279,8 @@ fn build_planner(
     mcp: Option<McpArg>,
     mcp_allow: Vec<String>,
     plugins: bool,
-) -> Result<Box<dyn Planner>> {
+    codex_session: &'a mut crate::commands::codex_session::CodexSession,
+) -> Result<Box<dyn Planner + 'a>> {
     match kind {
         PlannerProvider::Oracle => {
             let oracle_cfg = agent_repoprompt::RepoPromptClientConfig {
@@ -1318,9 +1317,12 @@ fn build_planner(
                 mcp_allow,
                 plugins,
             )?;
-            Ok(Box::new(CodexPlanner {
-                client: CodexAppServerClient::new(cfg),
-            }))
+            // RF29-1: borrow the live client from the REPL-lifetime session.
+            // If the launch fingerprint matches a previously-cached client,
+            // we reuse the subprocess (no spawn, ~0ms). Otherwise ensure()
+            // drops the old one and spawns fresh.
+            let client = codex_session.ensure(cfg)?;
+            Ok(Box::new(CodexPlanner { client }))
         }
         PlannerProvider::Http(provider_id) => {
             let model = model.unwrap_or_else(|| "gpt-5.1".to_string());

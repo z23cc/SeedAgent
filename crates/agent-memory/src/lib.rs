@@ -568,6 +568,24 @@ pub struct SessionArchiveRecord {
     pub finished_at: DateTime<Utc>,
 }
 
+/// RF29-2: FIFO cap on `session_archive.jsonl`. Each successful read-only
+/// run appends one record (see agent-cli/commands/run.rs build_session_archive_record),
+/// so without rotation this file grows monotonically. At ~1KB/record it
+/// takes thousands of runs before this matters, but the cost of capping
+/// is essentially zero so we do it now rather than wait for someone to
+/// hit it. Configurable via `SEED_SESSION_ARCHIVE_CAP` for tests / power
+/// users; default 500 keeps several months of typical usage and is far
+/// below any file-size concern.
+pub const DEFAULT_SESSION_ARCHIVE_CAP: usize = 500;
+
+fn session_archive_cap() -> usize {
+    std::env::var("SEED_SESSION_ARCHIVE_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SESSION_ARCHIVE_CAP)
+        .max(1)
+}
+
 pub fn append_session_archive_record(
     paths: &MemoryPaths,
     record: &SessionArchiveRecord,
@@ -582,6 +600,38 @@ pub fn append_session_archive_record(
     let line = serde_json::to_string(record).context("serialize session archive record")?;
     use std::io::Write;
     writeln!(file, "{line}").context("write session archive line")?;
+    drop(file);
+    // RF29-2: enforce FIFO cap. We do this AFTER appending so the failure
+    // mode (cap-enforcement IO error) doesn't lose the freshly-recorded
+    // session — the worst case is we have N+M lines for one run instead
+    // of the strict cap.
+    let _ = enforce_session_archive_cap(&archive_path, session_archive_cap());
+    Ok(())
+}
+
+/// Truncate `path` to its last `cap` lines (FIFO eviction of oldest).
+/// Returns `Ok(())` if no rotation was needed. Best-effort: any IO error
+/// is returned but callers may choose to ignore it (one bloated archive
+/// is better than losing the latest record).
+fn enforce_session_archive_cap(path: &Path, cap: usize) -> Result<()> {
+    let body = match fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(_) => return Ok(()),  // missing/unreadable → nothing to rotate
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= cap {
+        return Ok(());
+    }
+    let keep_from = lines.len() - cap;
+    let trimmed: String = lines[keep_from..]
+        .iter()
+        .fold(String::new(), |mut acc, line| {
+            acc.push_str(line);
+            acc.push('\n');
+            acc
+        });
+    fs::write(path, trimmed)
+        .with_context(|| format!("rotate {}", path.display()))?;
     Ok(())
 }
 
@@ -915,5 +965,119 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("seed-memory-test-{nanos}"))
+    }
+
+    // --- RF29-2 session archive rotation ---------------------------------
+
+    fn write_lines(path: &Path, lines: &[&str]) {
+        let body = lines
+            .iter()
+            .fold(String::new(), |mut acc, l| {
+                acc.push_str(l);
+                acc.push('\n');
+                acc
+            });
+        fs::write(path, body).unwrap();
+    }
+
+    fn line_count(path: &Path) -> usize {
+        fs::read_to_string(path).unwrap().lines().count()
+    }
+
+    #[test]
+    fn enforce_cap_is_noop_when_under_threshold() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("archive.jsonl");
+        write_lines(&path, &["a", "b", "c"]);
+        enforce_session_archive_cap(&path, 5).unwrap();
+        assert_eq!(line_count(&path), 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enforce_cap_is_noop_at_exact_threshold() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("archive.jsonl");
+        write_lines(&path, &["a", "b", "c"]);
+        enforce_session_archive_cap(&path, 3).unwrap();
+        assert_eq!(line_count(&path), 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enforce_cap_drops_oldest_lines_fifo() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("archive.jsonl");
+        write_lines(&path, &["one", "two", "three", "four", "five"]);
+        enforce_session_archive_cap(&path, 3).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        // Should keep last 3: three, four, five.
+        let kept: Vec<&str> = body.lines().collect();
+        assert_eq!(kept, vec!["three", "four", "five"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enforce_cap_missing_file_is_ok() {
+        let root = temp_root();
+        // dir doesn't exist either — should silently succeed.
+        enforce_session_archive_cap(&root.join("nope.jsonl"), 10).unwrap();
+    }
+
+    #[test]
+    fn append_session_archive_rotates_to_cap() {
+        let root = temp_root();
+        let paths = MemoryPaths::new(
+            root.join("memory"),
+            root.join("skills"),
+            root.join("sessions"),
+        );
+        ensure_memory_layout(&paths).unwrap();
+        // Set the cap small via env var so we don't have to write 500 records.
+        // Safe because we serialize with our test mutex via test ordering —
+        // memory tests don't run in parallel through this code path.
+        unsafe {
+            std::env::set_var("SEED_SESSION_ARCHIVE_CAP", "3");
+        }
+        for i in 0..6 {
+            append_session_archive_record(
+                &paths,
+                &SessionArchiveRecord {
+                    session_id: format!("sess-{i}"),
+                    session_path: PathBuf::from(format!("/fake/{i}.jsonl")),
+                    goal: format!("goal {i}"),
+                    status: "completed".to_string(),
+                    summary: format!("summary {i}"),
+                    turns: i,
+                    key_facts: vec![],
+                    related_skills: vec![],
+                    finished_at: Utc::now(),
+                },
+            )
+            .unwrap();
+        }
+        unsafe {
+            std::env::remove_var("SEED_SESSION_ARCHIVE_CAP");
+        }
+        // After 6 appends with cap 3, only the last 3 sessions should survive.
+        let body =
+            fs::read_to_string(paths.memory_dir.join("session_archive.jsonl")).unwrap();
+        let kept_ids: Vec<String> = body
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("session_id")
+                            .and_then(|s| s.as_str())
+                            .map(ToString::to_string)
+                    })
+            })
+            .collect();
+        assert_eq!(kept_ids, vec!["sess-3", "sess-4", "sess-5"]);
+        let _ = fs::remove_dir_all(root);
     }
 }
