@@ -60,6 +60,49 @@ SeedAgent is a self-bootstrapping agent kernel. The CLI `seed` drives a small pl
 - **Library crates expose typed errors** (RF10): `agent-plan`, `agent-memory`, `agent-session`, `agent-skills`, `agent-repoprompt`, plus the pre-existing `agent-core`/`agent-llm`/`agent-runtime`/`agent-delegate`. Public fns return `XxxResult<T> = Result<T, XxxError>`; each `XxxError` carries a small set of pattern-matchable variants (e.g. `PlanError::ItemNotFound { index }`, `SkillError::NotFound { name, skills_dir }`) plus an `Other(#[from] anyhow::Error)` escape hatch so internal `?` keeps working. Borrowed from forge's `forge_domain::Error` pattern — when adding a new library error, name the variants callers will want to switch on, leave everything else as `Other`.
 - **Adding planner errors** (RF14): use `RuntimeError::Planner(_)` only for transient failures (network/transport/stdio hiccup that retrying might fix). Use `RuntimeError::PlannerFatal(_)` (or `RuntimeError::planner_fatal(msg)`) for permanent failures (auth rejection, model returned non-success response, runtime decided to give up). The runtime's retry loop only re-arms on `Planner` + `InvalidPlannerJson`.
 
+### Architecture polish (RF40)
+
+- **Thread-local sync state (A2)**: the three process-wide guards in
+  `agent-tools::sync` (`skill_tools_guard`, `run_mode_guard`,
+  `repoprompt_sync`) migrated from `OnceLock<Mutex<...>>` to
+  `thread_local!{}`. Each test thread gets independent state; concurrent
+  `run_goal` calls (e.g. embedded-as-library) are safe by construction.
+  API surface unchanged.
+- **Sync module extracted (A1 partial)**: the 3 sync submodules live in
+  `agent-tools/src/sync.rs` instead of inline in `lib.rs`. lib.rs
+  dropped 248 lines; tests + call sites unchanged via re-exports.
+- **Planner extracted (A3 partial)**: `Planner` trait + Oracle / Codex /
+  Http impls + `build_planner` live in
+  `agent-cli/src/commands/run_planners.rs`. `run.rs` dropped 282 lines;
+  MockPlanner stays in run.rs because it's a test fixture for the loop
+  driver, not the trait.
+- **Slash command groups (B3)**: `SLASH_COMMANDS` table carries a
+  `SlashCategory` (`View`/`Configure`/`Operate`/`Exit`); `print_help`
+  groups by category instead of one alphabetical wall. `/providers`
+  (plural) is an alias for `/provider list` so muscle memory from
+  pre-RF28 still works.
+
+### Deferred (architectural debt, needs dedicated effort)
+
+- **Per-tool file split in `agent-tools` (A1 deeper)**: pulling each
+  tool family (memory / skill / plan / fs / shell / repoprompt /
+  memory_protocol) into its own `tools/<name>.rs` file would drop
+  `lib.rs` from 4398 to ~600 lines but requires careful cross-reference
+  unwinding (plan tools use repoprompt helpers and vice versa). Estimated
+  1-2 hours of focused mechanical work.
+- **Run phase split (A3 deeper)**: `run_goal` is still ~700 lines with
+  three execution branches (`use_codex` fast path / `use_llm` planner
+  loop / `record_only`) plus synthesis decision, memoization, retries
+  flush, archive, learn consolidation. Splitting requires either
+  threading 8+ refs across `Cell`/`RefCell` parameters or moving state
+  into a `RunSession` struct. Estimated 1-2 hours.
+- **Crate collapse 14→7 (B1)**: `agent-session` (146 lines), `agent-tui`
+  (255 lines), and probably `agent-llm + agent-delegate + agent-repoprompt`
+  → `agent-providers` would compile ~30% faster and simplify the mental
+  model. Requires touching every `use agent_X::...` import (50+ sites)
+  + Cargo workspace + dep graph cycles check. Estimated 2-3 hours;
+  high-risk if rushed.
+
 ### Recently shipped (formerly deferred)
 
 All items originally considered in RF24–RF29 are now implemented (RF24–RF33).
