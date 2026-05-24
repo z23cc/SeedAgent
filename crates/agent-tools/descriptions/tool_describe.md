@@ -1,0 +1,1 @@
+Look up the full description of a registered tool by name. Useful after turn 1 when the planner prompt has switched to names-only and you need to refresh on what `xyz_tool` does.

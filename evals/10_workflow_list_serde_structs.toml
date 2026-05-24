@@ -1,0 +1,22 @@
+# Workflow eval — pattern: "list all things matching attribute X in
+# module Y". Reusable recipe (rg for derive macros).
+
+name = "workflow_list_serde_structs"
+goal = "List 3 struct names in the agent-core crate that derive Serialize or Deserialize. Just the names, comma-separated."
+mode = "read"
+max_turns = 4
+
+[grade]
+kind = "judge"
+rubric = '''
+PASS criteria:
+- Names 3 struct names (comma-separated or numbered list, both OK).
+- Each name is plausibly a Rust struct (PascalCase).
+- At least 2 of the 3 are in agent-core (ToolCall, ToolInfo,
+  ToolContext, ToolResult, AgentEvent — these all derive Serialize/Deserialize).
+
+FAIL if:
+- Fewer than 3 names.
+- Names something that isn't an agent-core struct (e.g. picks from agent-tools).
+- Names a function instead of a struct.
+'''

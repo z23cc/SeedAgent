@@ -19,7 +19,7 @@ pub use style::{
 };
 
 const HISTORY_CAPACITY: usize = 10_000;
-/// RF40-B3: slash-command categories drive `print_help`'s grouped output
+/// slash-command categories drive `print_help`'s grouped output
 /// so 20 commands aren't presented as one undifferentiated alphabetical
 /// list. Each command tags its category; the help printer iterates by
 /// category and prints a header + the matching rows.
@@ -46,7 +46,11 @@ impl SlashCategory {
     }
 }
 
-const SLASH_COMMANDS: &[(&str, SlashCategory, &str)] = &[
+// exposed so the agent-cli dispatcher test can verify the
+// table and the match-arm list in `interactive.rs::HANDLED_SLASH_COMMANDS`
+// stay in sync. Adding to one side without the other now fails
+// `cargo test` instead of silently shipping.
+pub const SLASH_COMMANDS: &[(&str, SlashCategory, &str)] = &[
     // View / inspect
     ("/help", SlashCategory::View, "show commands"),
     ("/doctor", SlashCategory::View, "print diagnostics"),
@@ -244,7 +248,7 @@ pub fn print_banner() {
 }
 
 pub fn print_help() {
-    // RF40-B3: group by SlashCategory so users see related commands
+    // group by SlashCategory so users see related commands
     // together instead of one alphabetical wall. Category labels are
     // dim section headers; rows under each align to the longest
     // command name in that category.

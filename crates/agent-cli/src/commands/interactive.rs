@@ -1,11 +1,5 @@
-//! `seed chat` (and `seed` with no args): reedline REPL that loops
-//! `agent_core::tui::Repl::read` → planner / codex / record-only depending on flags.
-//!
-//! Slash commands short-circuit before the planner. We keep the full handler
-//! set here (rather than splitting per-command) because each handler is small
-//! and they share the same `InteractiveArgs` + `last_goal` state — splitting
-//! would create more boilerplate than the file saves. If this file passes
-//! ~700 lines, consider extracting handlers to `commands/slash.rs`.
+//! `seed chat` REPL — reedline loop that dispatches to planner / codex /
+//! record-only based on flags. Slash commands short-circuit the planner.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -52,29 +46,20 @@ pub(crate) struct InteractiveArgs {
     pub(crate) plugins: bool,
     pub(crate) codex: bool,
     pub(crate) record_only: bool,
-    /// RF27-3: REPL-session mode override. `Auto` = auto-classify per-goal
-    /// (default); `Read`/`Write` pin until `/mode` is changed.
     pub(crate) mode: crate::commands::run::ModeArg,
-    /// RF33-4: connect Codex via `app-server proxy` (daemon) when true.
+    /// Connect Codex via `app-server proxy` (daemon).
     pub(crate) use_daemon: bool,
 }
 
-/// Per-REPL session state that we keep outside `InteractiveArgs` because it's
-/// REPL-local, not "what flags did the user pass on the command line."
 #[derive(Default)]
 struct ReplState {
-    /// Last non-slash goal the user submitted. Used by `/retry`.
+    /// Used by `/retry`.
     last_goal: Option<String>,
 }
 
-/// Single source of truth for "where the agent thinks it is" during a REPL
-/// session. Codex picks this up at next `start_turn` (via the per-turn
-/// `cwd` field documented as "Override the working directory for this turn
-/// and subsequent turns"). RepoPrompt picks it up lazily on the next
-/// `repoprompt_*` tool call (see `agent-tools::default_repoprompt_working_dirs`).
-///
-/// Mutated by `/cd <path>` and (RF24-5) by skill autobind. Read by `run_goal`
-/// at the top of each REPL iteration to pass as the run's cwd.
+/// Source of truth for "where the agent thinks it is" during a REPL
+/// session. Mutated by `/cd` and skill autobind; picked up lazily by
+/// Codex (next `start_turn`) and RepoPrompt (next `repoprompt_*` call).
 #[derive(Debug, Clone)]
 pub(crate) struct SeedWorkspace {
     pub(crate) cwd: PathBuf,
@@ -85,29 +70,16 @@ impl SeedWorkspace {
         Self { cwd }
     }
 
-    /// Update the cwd. Caller is expected to flush downstream effects
-    /// (Codex `set_cwd`, RepoPrompt rebind) lazily on the next op.
-    /// Returns the previous cwd so callers can show "OLD → NEW".
-    ///
-    /// Also clears the process-global RepoPrompt bound-window cache
-    /// (RF25-2): the cached window_id is for the old cwd; the next rp call
-    /// will have a different `working_dirs` and must re-bind to a fresh
-    /// window (or no-op if RP already has one open for the new dir).
+    /// Returns the previous cwd. Also clears the RP bound-window cache —
+    /// the cached window_id is for the old cwd, the next rp call rebinds.
     pub(crate) fn set_cwd(&mut self, new_cwd: PathBuf) -> PathBuf {
         agent_tools::repoprompt_sync::clear_bound_window();
         std::mem::replace(&mut self.cwd, new_cwd)
     }
 }
 
-/// Resolve a user-supplied `/cd` target into an absolute, canonicalized
-/// directory path.
-///
-/// Supports:
-///   - `~` and `~/...` (tilde expansion via `$HOME`)
-///   - relative paths (joined against the current REPL cwd)
-///   - absolute paths
-///
-/// Validates that the target exists and is a directory.
+/// Tilde-expands, joins against `current_cwd` if relative, canonicalizes,
+/// and verifies the result is an existing directory.
 pub(crate) fn resolve_cd_target(target: &str, current_cwd: &Path) -> Result<PathBuf> {
     let expanded: PathBuf = if target == "~" {
         std::env::var_os("HOME")
@@ -153,10 +125,6 @@ pub(crate) fn run_interactive(
         "planner"
     };
     let mut state = ReplState::default();
-    // RF25-1: REPL-lifetime Codex client cache. First codex call in the
-    // session spawns; subsequent calls (with matching launch fingerprint)
-    // hot-swap cfg fields and reuse the subprocess. `/new` and REPL exit
-    // both drop it, which kills the subprocess via Drop.
     let mut codex_session = crate::commands::codex_session::CodexSession::default();
 
     agent_core::tui::print_banner();
@@ -170,9 +138,7 @@ pub(crate) fn run_interactive(
 
         match repl.read(&prompt)? {
             agent_core::tui::ReplInput::Line(input) => {
-                // Shell escape: `!cmd` runs `cmd` in cwd via the user's shell
-                // and prints its output. Must precede the slash dispatcher so
-                // `!` is not mistaken for an unknown command.
+                // `!cmd` shell escape — must precede the slash dispatcher.
                 if let Some(rest) = input.strip_prefix(agent_core::tui::SHELL_ESCAPE_PREFIX) {
                     if let Err(err) = run_shell_escape(&workspace.cwd, rest.trim()) {
                         agent_core::tui::print_error(err);
@@ -225,12 +191,7 @@ pub(crate) fn run_interactive(
                 }) {
                     agent_core::tui::print_error(err);
                 }
-                // RF33-2: poll for skill-requested sticky cwd change. If
-                // a skill_fetch during the run set `sticky_cwd: true`,
-                // apply the workspace switch now so the NEXT goal runs in
-                // the right place. We do this on both success and error
-                // paths because skill_fetch's queue happens before the
-                // result is known.
+                // Apply skill-requested sticky cwd before the next goal.
                 poll_sticky_cwd_into_workspace(&mut workspace, &mut codex_session);
             }
             agent_core::tui::ReplInput::Empty | agent_core::tui::ReplInput::Continue => {}
@@ -240,6 +201,34 @@ pub(crate) fn run_interactive(
 
     Ok(())
 }
+
+/// When adding a slash command: append to `SLASH_COMMANDS` (agent-core::tui),
+/// add the head here, add a match arm below. The
+/// `slash_table_and_dispatch_stay_in_sync` test fails if any are missed.
+pub(crate) const HANDLED_SLASH_COMMANDS: &[&str] = &[
+    "/exit",
+    "/quit",
+    ":q",
+    "/help",
+    "?",
+    "/doctor",
+    "/providers",
+    "/skills",
+    "/tools",
+    "/model",
+    "/provider",
+    "/effort",
+    "/memory",
+    "/plan",
+    "/plans",
+    "/dump",
+    "/compact",
+    "/new",
+    "/retry",
+    "/cd",
+    "/sync",
+    "/mode",
+];
 
 fn handle_interactive_command(
     cli: &Cli,
@@ -251,9 +240,6 @@ fn handle_interactive_command(
     input: &str,
 ) -> Result<bool> {
     let trimmed = input.trim();
-    // We split into (head, rest) once so handlers can ignore the leading verb
-    // and just look at the args. `split_once(' ')` returns None for bare
-    // commands like `/help`, which we treat as `head=trimmed, rest=""`.
     let (head, rest) = match trimmed.split_once(char::is_whitespace) {
         Some((h, r)) => (h, r.trim()),
         None => (trimmed, ""),
@@ -266,19 +252,13 @@ fn handle_interactive_command(
         }
         "/doctor" => {
             doctor::doctor(&cli.skills_dir, store)?;
-            // REPL-only addendum: re-run health checks with our live state
-            // so the printed cwd reflects /cd mutations, the codex line
-            // shows the cached client's cwd instead of "N/A", and the
-            // run-mode line reflects /mode pinning.
+            // Re-run with live REPL state so cwd/codex/mode reflect /cd, /mode, etc.
             doctor::cwd_health_check(&workspace.cwd, Some(codex_session))?;
             doctor::run_mode_health_check(Some(args.mode))?;
             Ok(false)
         }
         "/providers" => {
-            // RF40-B3: `/providers` is an alias for `/provider list` so users
-            // who learned the plural form before RF28 still hit the same
-            // output. The route-detail `show_providers` is still reachable
-            // via `seed providers` (the CLI subcommand) when needed.
+            // Alias for `/provider list`.
             handle_provider_command(args, codex_session, "list");
             Ok(false)
         }
@@ -467,15 +447,8 @@ fn handle_model_command(args: &mut InteractiveArgs, rest: &str) -> Result<()> {
 
 /// `/provider [<id>|list]` — view or switch the planner provider.
 ///
-/// Empty arg prints the current setting. `list` shows the built-in
-/// providers (same as `seed providers`). Setting a new provider:
-///   - updates `args.provider`
-///   - tears down the cached Codex client when leaving codex (the next
-///     codex-bound goal would respawn anyway, but explicit shutdown
-///     prevents a dangling subprocess that no goal will reuse)
-///
-/// No validation here — provider id correctness is checked when the next
-/// goal fires (`PlannerProvider::from_id` decides how to route).
+/// Empty prints current, `list` shows built-ins, otherwise sets.
+/// Tears down the cached Codex client when leaving codex.
 fn handle_provider_command(
     args: &mut InteractiveArgs,
     codex_session: &mut crate::commands::codex_session::CodexSession,
@@ -515,10 +488,8 @@ fn handle_provider_command(
         println!("provider: already {}", args.provider);
         return;
     }
-    // Leaving codex → drop the cached app-server subprocess. If we'd kept
-    // it, the next ensure() in a non-codex run would never reuse it (the
-    // route doesn't go through codex_session at all) so it'd just sit there
-    // idle until REPL exit. Explicit shutdown is cleaner.
+    // Leaving codex → drop the cached client; non-codex runs would
+    // never reuse it, leaving an idle subprocess until REPL exit.
     let was_codex = prev == "codex";
     let now_codex = args.provider == "codex";
     if was_codex && !now_codex {
@@ -530,12 +501,8 @@ fn handle_provider_command(
     println!("  next goal will use the new provider");
 }
 
-// --- /effort -----------------------------------------------------------------
-
-/// Implements `/effort [low|medium|high|minimal|none]`. Symmetric with
-/// `/model`: empty prints current, "none"/"default"/"-" clears, anything else
-/// sets the value. Soft-warns when the provider doesn't honor effort but does
-/// not block the set — the user might switch provider next.
+/// `/effort [low|medium|high|minimal|none]` — empty prints, none/default/-
+/// clears, anything else sets. Soft-warns for non-codex providers.
 fn handle_effort_command(args: &mut InteractiveArgs, rest: &str) {
     if rest.is_empty() {
         match args.effort.as_deref() {
@@ -569,7 +536,6 @@ fn handle_effort_command(args: &mut InteractiveArgs, rest: &str) {
         return;
     }
     if args.provider != "codex" {
-        // Soft warning — set anyway since the user may switch provider.
         eprintln!(
             "note: effort is honored by codex; current provider is {} so this is a no-op until you switch",
             args.provider
@@ -741,20 +707,7 @@ fn handle_compact_command(cli: &Cli, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-// --- /mode -------------------------------------------------------------------
-
 /// `/mode [auto|read|write]` — view or set the REPL-session run mode.
-///
-/// `auto` (default): each goal is classified by `agent_runtime::classify_run_mode`.
-/// `read`: pin to ReadOnly — write tools blocked, `run_shell` rejects
-///   write-shaped commands, synthesis pass still eligible.
-/// `write`: pin to Implementation — full toolset, no read-only gating, no
-///   synthesis pass.
-///
-/// The chosen mode is stored on `args.mode` and applied to every subsequent
-/// `run_goal` invocation from this REPL (including `/retry`). It does NOT
-/// retroactively affect a currently-running goal — switching while the
-/// planner is busy is impossible because the REPL is blocked.
 fn handle_mode_command(args: &mut InteractiveArgs, rest: &str) {
     use crate::commands::run::ModeArg;
     if rest.is_empty() {
@@ -795,16 +748,9 @@ fn handle_mode_command(args: &mut InteractiveArgs, rest: &str) {
     }
 }
 
-// --- RF33-2 sticky-cwd polling ----------------------------------------------
-
-/// Drain the `repoprompt_sync::pending_sticky_cwd` queue and apply the
-/// requested cwd change to `workspace` and (if live) the cached Codex
-/// client. Called after every `run_goal` invocation. Prints a one-line
-/// notice when a change is applied so the user sees that a skill nudged
-/// their cwd — the whole point of opt-in `sticky_cwd: true` is that this
-/// IS user-visible.
-///
-/// No-op when no skill requested a sticky change (the common case).
+/// Drain `pending_sticky_cwd` and apply it to `workspace` + the cached
+/// Codex client. Prints a one-line notice — sticky-cwd is user-visible
+/// by design.
 fn poll_sticky_cwd_into_workspace(
     workspace: &mut SeedWorkspace,
     codex_session: &mut crate::commands::codex_session::CodexSession,
@@ -813,15 +759,9 @@ fn poll_sticky_cwd_into_workspace(
         return;
     };
     if target == workspace.cwd {
-        // Skill targeted the cwd we're already in — nothing to do, no need
-        // to print noise. The pending_override (transient bind) was set
-        // separately and consumed by the rp call already.
         return;
     }
     let prev = workspace.set_cwd(target.clone());
-    // Push into the cached Codex client too so the next turn doesn't lag
-    // by one. /sync handles the rp side via clear_bound_window inside
-    // set_cwd above.
     if let Some(client) = codex_session.client_mut() {
         client.set_cwd(target.clone());
     }
@@ -835,26 +775,10 @@ fn poll_sticky_cwd_into_workspace(
     );
 }
 
-// --- /sync -------------------------------------------------------------------
-
-/// `/sync` — force every subsystem to realign to `workspace.cwd` *now*.
-///
-/// Normally the cwd-sync layer is lazy: a `/cd` invalidates the RP bound
-/// cache, the next rp tool call rebinds, the next Codex turn picks up the
-/// new cwd from the (already updated) per-turn `cfg.cwd`. That works for
-/// the common case but leaves "I think the agent is wrong about where it
-/// is, but it hasn't done anything to surface that" with no recovery path
-/// short of `/cd .` (which is a no-op) or `/new` (which drops more state
-/// than the user wants).
-///
-/// This command is the escape hatch:
-///   - Clear the RP `bound` cache so next rp call definitely re-binds.
-///   - Drop any pending skill override.
-///   - Push `workspace.cwd` into the cached Codex client (so the next
-///     turn's `cfg.cwd` is exactly what we expect, no matter what set it).
-///
-/// We do NOT restart the Codex subprocess — that's `/new`'s job, and
-/// restarting here would surprise users who assumed `/sync` was cheap.
+/// `/sync` — escape hatch when the lazy cwd-sync layer isn't visibly
+/// catching up. Clears the RP bound cache, drops pending skill overrides,
+/// pushes `workspace.cwd` into the cached Codex client. Does NOT
+/// restart the Codex subprocess (that's `/new`).
 fn handle_sync_command(
     workspace: &SeedWorkspace,
     codex_session: &mut crate::commands::codex_session::CodexSession,
@@ -900,27 +824,14 @@ fn handle_sync_command(
     }
 }
 
-/// Tiny accessor so `/sync` can mutate the cached Codex client's cwd
-/// without making the whole `inner` field of `CodexSession` public.
 fn codex_session_client_mut(
     session: &mut crate::commands::codex_session::CodexSession,
 ) -> Option<&mut agent_delegate::CodexAppServerClient> {
     session.client_mut()
 }
 
-// --- /cd ---------------------------------------------------------------------
-
-/// `/cd [<path>]` — change the REPL workspace cwd.
-///
-/// Empty arg prints the current cwd. A valid path updates `workspace.cwd`;
-/// both Codex and RepoPrompt pick it up on their next op:
-///   - Codex via per-turn `TurnStartParams.cwd` (always read fresh from
-///     `CodexAppServerConfig.cwd`, set at `run_goal` construction time).
-///   - RepoPrompt via `default_repoprompt_working_dirs(ctx.cwd)` and (RF24-5)
-///     the lazy `bind_context` alignment that runs before each rp tool call.
-///
-/// Invalid paths print an error and leave state unchanged — we never want
-/// to land the REPL in a phantom cwd that future commands silently fail on.
+/// `/cd [<path>]` — empty prints; valid path updates `workspace.cwd`
+/// (Codex + RepoPrompt pick up lazily). Invalid path leaves state alone.
 fn handle_cd_command(workspace: &mut SeedWorkspace, rest: &str) {
     if rest.is_empty() {
         println!("cwd: {}", workspace.cwd.display());
@@ -1000,12 +911,9 @@ fn handle_retry_command(
         },
         mode: args.mode,
         use_daemon: args.use_daemon,
-        // Reuse the REPL-lifetime Codex client (RF25-1) — same fingerprint
-        // means same subprocess, no respawn cost on retry.
         codex_session: Some(codex_session),
     });
-    // Refresh last_goal even on failure — the user clearly wants to keep
-    // iterating on this goal, so /retry should keep working.
+    // Refresh last_goal even on failure so further /retry keeps working.
     state.last_goal = Some(goal);
     if let Err(err) = result {
         agent_core::tui::print_error(err);
@@ -1019,9 +927,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Unique-per-test scratch dir under /tmp. Mirrors the convention used in
-    /// `agent-skills`, `agent-memory`, etc. — we don't pull in `tempfile` just
-    /// for this since the workspace already has a pattern.
     fn scratch_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -1035,9 +940,6 @@ mod tests {
         path
     }
 
-    /// Serial lock for tests that read/write `agent_tools::repoprompt_sync`'s
-    /// process-global state. Mirrors the pattern in `agent-tools::tests`.
-    /// Hold the returned guard for the test body via `let _g = ...`.
     static RP_SYNC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn rp_sync_test_guard() -> std::sync::MutexGuard<'static, ()> {
         let g = RP_SYNC_TEST_LOCK
@@ -1113,14 +1015,11 @@ mod tests {
         let mut a = args();
         a.model = Some("gpt-5.5".to_string());
         handle_model_command(&mut a, "").unwrap();
-        // Empty just prints; state unchanged.
         assert_eq!(a.model.as_deref(), Some("gpt-5.5"));
     }
 
     #[test]
     fn model_command_list_with_non_codex_provider_does_not_panic() {
-        // For non-codex providers we print an error and bail — should not
-        // touch args.model and must not panic on filesystem reads.
         let mut a = args();
         a.provider = "openai".to_string();
         a.model = Some("gpt-4o".to_string());
@@ -1278,9 +1177,6 @@ mod tests {
 
     #[test]
     fn tools_command_renders_without_panicking() {
-        // No state mutations — just exercise the formatter against the real
-        // registry to catch regressions like an empty registry or a panic
-        // inside `infos()`.
         handle_tools_command();
         let registry = agent_tools::seed_registry();
         assert!(!registry.infos().is_empty());
@@ -1291,14 +1187,11 @@ mod tests {
     #[test]
     fn shell_escape_empty_input_does_not_run_command() {
         let root = scratch_dir("shell-empty");
-        // Should not error and should not actually shell out.
         run_shell_escape(&root, "").unwrap();
     }
 
     #[test]
     fn shell_escape_runs_true_successfully() {
-        // `true` exists on every POSIX system; on Windows the test compiles
-        // out under cfg(not(windows)) so skip there.
         #[cfg(not(windows))]
         {
             let root = scratch_dir("shell-true");
@@ -1311,8 +1204,6 @@ mod tests {
     #[test]
     fn workspace_set_cwd_returns_previous_and_invalidates_bound() {
         let _g = rp_sync_test_guard();
-        // Seed a cached binding in the process-global sync state so we can
-        // assert set_cwd clears it.
         agent_tools::repoprompt_sync::record_bound_window(
             vec![PathBuf::from("/tmp/seed-A")],
             42,
@@ -1321,9 +1212,6 @@ mod tests {
         let prev = ws.set_cwd(PathBuf::from("/tmp/seed-B"));
         assert_eq!(prev, PathBuf::from("/tmp/seed-A"));
         assert_eq!(ws.cwd, PathBuf::from("/tmp/seed-B"));
-        // Critical: changing cwd must invalidate the cached binding so the
-        // next rp call re-binds. Otherwise the lazy-align layer thinks
-        // we're still good and the agent talks to the wrong workspace.
         assert!(agent_tools::repoprompt_sync::peek_bound_window().is_none());
     }
 
@@ -1331,8 +1219,6 @@ mod tests {
     fn resolve_cd_absolute_existing_dir() {
         let root = scratch_dir("cd-abs");
         let resolved = resolve_cd_target(root.to_str().unwrap(), Path::new("/")).unwrap();
-        // canonicalize() may turn /var → /private/var on macOS; just check
-        // that the result exists and is a directory.
         assert!(resolved.is_dir(), "{} not a dir", resolved.display());
     }
 
@@ -1349,8 +1235,6 @@ mod tests {
     fn resolve_cd_nonexistent_errors() {
         let root = scratch_dir("cd-nope");
         let err = resolve_cd_target("does-not-exist-xyz", &root).unwrap_err();
-        // We don't pin the exact message — `canonicalize` errors vary by OS —
-        // but it should mention the bad path so the user can debug.
         let msg = format!("{err:#}");
         assert!(
             msg.contains("does-not-exist-xyz") || msg.contains("cannot resolve"),
@@ -1370,8 +1254,6 @@ mod tests {
 
     #[test]
     fn resolve_cd_tilde_expands_to_home() {
-        // Skip if HOME isn't set (some CI). When it is, "~" should resolve
-        // to the canonical home dir if it exists.
         if let Some(home) = std::env::var_os("HOME") {
             let home_path = PathBuf::from(home);
             if home_path.is_dir() {
@@ -1411,21 +1293,17 @@ mod tests {
         agent_tools::repoprompt_sync::record_bound_window(vec![ws.cwd.clone()], 13);
         let same_path = ws.cwd.to_string_lossy().to_string();
         handle_cd_command(&mut ws, &same_path);
-        // Same target → no change → binding cache should NOT be invalidated.
         assert!(
             agent_tools::repoprompt_sync::peek_bound_window().is_some(),
             "no-op /cd must preserve the RP bound-window cache"
         );
     }
 
-    // --- RF31 /sync ------------------------------------------------------
+    // --- /sync ------------------------------------------------------
 
     #[test]
     fn sync_command_clears_rp_state_and_realigns_codex() {
         let _g = rp_sync_test_guard();
-        // Prime: bind cache + pending override + live Codex client at the
-        // wrong cwd. After /sync the cache should be empty and Codex's
-        // client_cwd should match workspace.cwd.
         agent_tools::repoprompt_sync::record_bound_window(
             vec![PathBuf::from("/old/dir")],
             7,
@@ -1439,10 +1317,8 @@ mod tests {
         cs.ensure(cfg).unwrap();
         let ws = SeedWorkspace::new(PathBuf::from("/correct/workspace"));
         handle_sync_command(&ws, &mut cs);
-        // RP state fully cleared (both halves).
         assert!(agent_tools::repoprompt_sync::peek_bound_window().is_none());
         assert!(agent_tools::repoprompt_sync::peek_pending_override().is_none());
-        // Codex client's cwd pushed to workspace.cwd.
         assert_eq!(cs.client_cwd(), Some(PathBuf::from("/correct/workspace")));
     }
 
@@ -1458,7 +1334,7 @@ mod tests {
         assert!(!cs.is_live());
     }
 
-    // --- RF28-2 /provider ------------------------------------------------
+    // --- /provider ------------------------------------------------
 
     #[test]
     fn provider_command_empty_does_not_mutate() {
@@ -1500,7 +1376,6 @@ mod tests {
     fn provider_command_leaving_codex_shuts_down_session() {
         let mut a = args();
         let mut cs = crate::commands::codex_session::CodexSession::default();
-        // Prime the codex session (no spawn — just constructs inner client).
         let _ = cs.ensure(agent_delegate::CodexAppServerConfig::default()).unwrap();
         assert!(cs.is_live());
         a.provider = "codex".to_string();
@@ -1508,7 +1383,7 @@ mod tests {
         assert_eq!(a.provider, "openai");
         assert!(
             !cs.is_live(),
-            "leaving codex must drop the cached client to avoid orphaned subprocess"
+            "leaving codex must drop the cached client"
         );
     }
 
@@ -1516,21 +1391,19 @@ mod tests {
     fn provider_command_entering_codex_from_other_does_not_shutdown_session() {
         let mut a = args();
         let mut cs = crate::commands::codex_session::CodexSession::default();
-        // No session live to start with — entering codex shouldn't create one.
         a.provider = "openai".to_string();
         handle_provider_command(&mut a, &mut cs, "codex");
         assert_eq!(a.provider, "codex");
         assert!(!cs.is_live(), "switching INTO codex should not eagerly spawn");
     }
 
-    // --- RF27-3 /mode ----------------------------------------------------
+    // --- /mode ----------------------------------------------------
 
     #[test]
     fn mode_command_empty_arg_does_not_mutate() {
         let mut a = args();
         a.mode = crate::commands::run::ModeArg::Read;
         handle_mode_command(&mut a, "");
-        // Empty just prints; state unchanged.
         assert_eq!(a.mode, crate::commands::run::ModeArg::Read);
     }
 
@@ -1565,7 +1438,6 @@ mod tests {
         let mut a = args();
         a.mode = crate::commands::run::ModeArg::Read;
         handle_mode_command(&mut a, "yolo");
-        // Bad input → state unchanged, error printed.
         assert_eq!(a.mode, crate::commands::run::ModeArg::Read);
     }
 
@@ -1578,11 +1450,55 @@ mod tests {
         agent_tools::repoprompt_sync::record_bound_window(vec![ws.cwd.clone()], 99);
         handle_cd_command(&mut ws, target.to_str().unwrap());
         assert_eq!(ws.cwd, target.canonicalize().unwrap());
-        // Successful change invalidates the binding cache so the next rp
-        // call rebinds to the new cwd's window.
         assert!(
             agent_tools::repoprompt_sync::peek_bound_window().is_none(),
             "successful /cd must clear the RP bound-window cache"
+        );
+    }
+}
+
+#[cfg(test)]
+mod slash_sync_tests {
+    use super::HANDLED_SLASH_COMMANDS;
+    use agent_core::tui::SLASH_COMMANDS;
+
+    /// Aliases (`:q`, `?`) live only in `HANDLED_SLASH_COMMANDS` to
+    /// keep `/help` uncluttered — hence subset, not equality.
+    #[test]
+    fn slash_table_and_dispatch_stay_in_sync() {
+        let table: std::collections::BTreeSet<&str> = SLASH_COMMANDS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        let dispatch: std::collections::BTreeSet<&str> =
+            HANDLED_SLASH_COMMANDS.iter().copied().collect();
+        let missing: Vec<&&str> = table.iter().filter(|n| !dispatch.contains(*n)).collect();
+        assert!(
+            missing.is_empty(),
+            "these slash commands are in the SLASH_COMMANDS table but not handled \
+             in interactive.rs::handle_interactive_command: {missing:?}. \
+             Add the match arm AND the entry in HANDLED_SLASH_COMMANDS."
+        );
+    }
+
+    /// HANDLED entries missing from `SLASH_COMMANDS` must be known
+    /// aliases; otherwise they're dispatched but not shown in `/help`.
+    #[test]
+    fn handled_slash_entries_are_table_entries_or_aliases() {
+        const KNOWN_ALIASES: &[&str] = &[":q", "?", "/quit"];
+        let table: std::collections::BTreeSet<&str> = SLASH_COMMANDS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        let orphans: Vec<&&str> = HANDLED_SLASH_COMMANDS
+            .iter()
+            .filter(|n| !table.contains(*n) && !KNOWN_ALIASES.contains(n))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "these heads are dispatched but missing from SLASH_COMMANDS table \
+             (so they won't show in /help): {orphans:?}. Either add a table row \
+             or add to KNOWN_ALIASES in this test."
         );
     }
 }

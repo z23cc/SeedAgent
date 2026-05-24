@@ -1,0 +1,1 @@
+Mark one plan item complete by item index, or mark the current next item when omitted. Args JSON: {"id":"plan-...","item":1,"note":"done"}. Aliases: plan_id->id, item_index/index->item.

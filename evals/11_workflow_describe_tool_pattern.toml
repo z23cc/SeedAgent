@@ -1,0 +1,22 @@
+# Workflow eval — synthesis: "describe pattern X in this codebase".
+# A learned skill could capture "to describe a Tool, read the trait
+# in agent-core + one example impl in agent-tools/*.rs".
+
+name = "workflow_describe_tool_pattern"
+goal = "What macros does this codebase use to declare per-tool metadata (args schema, description, pure-read)? Name the 3 macros."
+mode = "read"
+max_turns = 5
+
+[grade]
+kind = "judge"
+rubric = '''
+PASS criteria:
+- Names all 3 macros: `impl_args_schema!`, `tool_description!`, `impl_pure_read!`
+  (RF45-Phase1, RF47, RF51-#1 respectively).
+- Names can be exact or with `crate::` prefix.
+
+FAIL if:
+- Names fewer than 3.
+- Invents macros that don't exist.
+- Names other macros that aren't the per-tool-metadata trio.
+'''

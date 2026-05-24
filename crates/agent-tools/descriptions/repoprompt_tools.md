@@ -1,0 +1,1 @@
+List all RepoPrompt tools wrapped by SeedAgent, grouped by capability.

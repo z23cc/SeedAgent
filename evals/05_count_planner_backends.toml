@@ -1,0 +1,12 @@
+# Code-shape understanding: PlannerProvider enum variants.
+# Tests: can the planner find an enum and count variants?
+
+name = "count_planner_backends"
+goal = "How many variants does the PlannerProvider enum in agent-cli have? Reply with just the number."
+mode = "read"
+max_turns = 5
+
+[grade]
+kind = "regex"
+# Variants: Codex, Oracle, RepoPromptAgent, Http(String) — that's 4.
+pattern = '\b4\b'

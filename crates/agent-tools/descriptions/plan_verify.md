@@ -1,0 +1,1 @@
+Create verify_context.json and run an independent RepoPrompt agent_run verifier; PASS marks the plan verified, FAIL appends a [FIX] item. Args JSON: {"id":"plan-...","dry_run":false,"timeout_secs":300}. Alias plan_id is accepted.

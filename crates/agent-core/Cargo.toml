@@ -12,6 +12,10 @@ rust-version.workspace = true
 # transitive deps below.
 serde.workspace = true
 serde_json.workspace = true
+# RF45-Phase1: ToolInfo now carries a JSON Schema for tool args.
+# Per-tool Args structs derive JsonSchema in their owning crate
+# (agent-tools); agent-core only needs the Schema type and a generator.
+schemars.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 # RF41-B1 from agent-session:

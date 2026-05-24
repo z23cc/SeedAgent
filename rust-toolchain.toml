@@ -1,0 +1,7 @@
+# RF46-B: pin the toolchain so all developers + CI use the same rustc
+# version. Matches the `rust-version = "1.95"` declared in Cargo.toml
+# `[workspace.package]`. profile = "default" gives us cargo, clippy,
+# rustfmt, rust-docs out of the box.
+[toolchain]
+channel = "1.95"
+profile = "default"

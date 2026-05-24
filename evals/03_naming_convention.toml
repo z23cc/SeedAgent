@@ -1,0 +1,12 @@
+# Eval: a question that requires reading multiple files.
+# Tests: does the planner use read_files (batch) rather than N sequential read_file?
+
+name = "naming_convention"
+goal = "What naming convention do the crates in this workspace use? Reply with one of: kebab-case, snake_case, camelCase, PascalCase."
+mode = "read"
+max_turns = 4
+
+[grade]
+kind = "regex"
+# crates are agent-core, agent-cli, etc — kebab-case.
+pattern = '(?i)kebab-case'

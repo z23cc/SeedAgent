@@ -1,0 +1,1 @@
+Record verified short-term task context to anchor future planner turns; args: key_info, optional related_skill.

@@ -1,0 +1,1 @@
+Prompt the human operator via stdin when the task cannot proceed without clarification or a decision. Args: question (string), optional candidates (list of suggested answers). Fails on non-interactive stdin so it cannot deadlock CI.

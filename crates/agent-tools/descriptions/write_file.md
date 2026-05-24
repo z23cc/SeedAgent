@@ -1,0 +1,1 @@
+Create, overwrite, append, or prepend a file; args: path, content, optional mode overwrite|append|prepend.

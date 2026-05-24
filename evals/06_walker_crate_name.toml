@@ -1,0 +1,13 @@
+# Code citation: requires reading agent-tools/src/walk.rs to find the
+# external crate used for gitignore-aware walking.
+# Tests: does the planner go to the source file or guess?
+
+name = "walker_crate_name"
+goal = "What external Rust crate does agent-tools::walk use for the gitignore-aware walker? Reply with just the crate name."
+mode = "read"
+max_turns = 4
+
+[grade]
+kind = "regex"
+# RF50-A added the `ignore` crate (the rg/fd engine).
+pattern = '(?i)\bignore\b'

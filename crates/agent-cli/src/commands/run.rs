@@ -27,7 +27,7 @@ struct TurnTiming {
     planner_ms: u64,
     exec_ms: u64,
     planner_chars: usize,
-    /// RF36-1: assembled prompt size (input side). Set by `record_planner_timing`.
+    /// assembled prompt size (input side). Set by `record_planner_timing`.
     prompt_chars: usize,
 }
 
@@ -93,15 +93,8 @@ fn build_session_archive_record(
     }
 }
 
-/// For read-only analysis / investigation / review-shaped goals, look up the
-/// bundled RepoPrompt routing skill and inline its body once as a `### RELEVANT
-/// SKILL` block. This lets the planner pick up an existing recipe on turn 1
-/// instead of re-deriving the exploration pattern from scratch — concretely
-/// cuts turn count on "analyze this project" / "review the auth module" /
-/// "explain the build" tasks.
-///
-/// Skill body is loaded once at run start, NOT per-turn (it does not change),
-/// so the extra prompt cost is amortized across the whole loop.
+/// Inline the bundled RepoPrompt routing skill (analysis / investigation
+/// / review goals) as a `### RELEVANT SKILL` block on turn 1.
 fn relevant_skill_for_goal(goal: &str, skills_dir: &Path) -> Option<String> {
     let route = agent_skills::route_repoprompt_skill(goal)?;
     let doc = agent_skills::fetch_skill(skills_dir, route.slug).ok()?;
@@ -115,134 +108,6 @@ fn relevant_skill_for_goal(goal: &str, skills_dir: &Path) -> Option<String> {
         "Follow the recipe above when it fits the goal; deviate if observed evidence demands.\n",
     );
     Some(block)
-}
-
-/// Build the prompt for the synthesis-only final turn. The planner's first
-/// `Finish` answer is treated as a DRAFT — this prompt asks it to rewrite the
-/// draft strictly to the FINISH ANSWER SCHEMA defined in `planner_goal_guidance`,
-/// using only what's already in working memory. No tool calls allowed.
-fn build_synthesis_prompt(
-    goal: &str,
-    draft: &str,
-    working_memory: &agent_runtime::WorkingMemory,
-    observations: &[agent_runtime::ToolObservation],
-) -> String {
-    let anchor = working_memory.render_anchor();
-    let obs_summary = observations
-        .iter()
-        .map(|obs| {
-            format!(
-                "- turn {} tool={} ok={} summary={}",
-                obs.turn,
-                obs.call.name,
-                obs.result.ok,
-                compact_single_line_cli(&obs.summary, 160),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "You just finished a read-only analysis. Your DRAFT answer was:\n\n\
-        <draft_answer>\n{draft}\n</draft_answer>\n\n\
-        Your working memory anchor at end of run:\n{anchor}\n\
-        \nObserved tool calls (most recent last):\n{obs_summary}\n\n\
-        \nThe user's goal was:\n  {goal}\n\n\
-        \nREWRITE the draft as a single final answer that strictly follows the FINISH ANSWER SCHEMA from your system prompt:\n\
-        - Bottom line: one sentence ≤30 words, no preamble. Must contain a concrete, non-trivial finding (not a goal restatement or README paraphrase).\n\
-        - Evidence: 2–5 bullets, each starting with [via <tool_name>], citing the tool that produced the observation (use the names from the observation log above). At least one bullet MUST name a specific code element (function, struct, test, file:line, dependency, line count) — pure README/config restatements are insufficient.\n\
-        - Counter-intuitive / risk: 1–2 real findings ABOUT THE PROJECT (code smell, missing test, recent direction in git, suspicious boundary, hidden coupling). \
-          FORBIDDEN in this section: meta-observations about your own runtime mode, about read-only constraints, about other active plans/sessions, or about what the agent itself can or cannot do. \
-          If you genuinely found nothing surprising about the project, write a single line `- (none — surface-level analysis only)` and do not pad.\n\
-        - Action items: 1–4 imperative items, each naming a concrete target (file:line, cargo command, function/struct name). Reject vague items like `Inspect X` / `Trace Y` / `Run cargo test --workspace` (the last is generic — only include if a specific test name is given).\n\
-        - Explicitly NOT doing: include only if you actually rejected an alternative for a reason; do NOT use this section to restate goal-mode constraints.\n\
-        - Do NOT begin with banned openers (`整体来看`, `当前... 是`, `如果想要继续`, `This project is`, `Overall,`, etc.).\n\
-        - Do NOT add or invent observations the draft and working memory don't already support.\n\
-        \nReturn EXACTLY one JSON object: \
-        {{\"summary\":\"<≤30 char meta-summary>\",\"action\":\"finish\",\"answer\":\"<the rewritten markdown answer>\"}}\n\
-        \nNo markdown fences around the JSON. No extra commentary."
-    )
-}
-
-fn extract_synthesized_answer(text: &str) -> Result<String> {
-    let action = agent_runtime::parse_planned_action(text)
-        .map_err(|err| anyhow::anyhow!("synthesis response did not parse: {err}"))?;
-    match action {
-        agent_runtime::PlannedAction::Finish { answer, .. } => {
-            if answer.trim().is_empty() {
-                anyhow::bail!("synthesis returned an empty answer");
-            }
-            Ok(answer)
-        }
-        agent_runtime::PlannedAction::Tool { tool_name, .. } => {
-            anyhow::bail!(
-                "synthesis must return Finish but returned tool={tool_name}"
-            )
-        }
-    }
-}
-
-/// RF26-1: cheap structural check for "does this draft already follow the
-/// FINISH ANSWER SCHEMA that the synthesis pass would rewrite it into?"
-///
-/// The synthesis pass costs one full Codex turn (~60s in real runs). For
-/// reasonably-disciplined drafts that already have the four mandatory
-/// sections and at least one `[via <tool>]` citation, the rewrite is
-/// usually a paraphrase — net negative on latency and tokens, no
-/// correctness win.
-///
-/// We err on the side of running synthesis when in doubt: returning `false`
-/// here just means "do the extra turn, like before". Returning `true`
-/// short-circuits to the draft. So the cost of a false positive (skip
-/// when we shouldn't) is "the answer is structurally fine but might have
-/// banned openers"; the cost of a false negative (run synthesis when we
-/// could've skipped) is the wasted 60s. Bias toward true is fine.
-///
-/// Strategy:
-///   - Must mention all four required section labels ("Bottom line",
-///     "Evidence", "Counter-intuitive / risk" OR "Counter-intuitive", "Action items").
-///   - Must contain at least one `[via ` citation (proves Evidence
-///     section has tool-grounded bullets, not just header).
-///   - Must not start with a banned opener (these are forbidden by the
-///     synthesis prompt — if a draft starts with one, the synthesis would
-///     do real work).
-///   - Total length > 200 chars to filter out shape-only stubs.
-fn draft_already_conforms(draft: &str) -> bool {
-    let body = draft.trim();
-    if body.len() < 200 {
-        return false;
-    }
-    // Required sections. Each `find` is case-sensitive on purpose — the
-    // schema we ship in the prompt uses these exact strings, so a draft
-    // that paraphrased them ("# Conclusion" instead of "Bottom line:")
-    // probably *does* need the rewrite.
-    let has_bottom_line = body.contains("Bottom line");
-    let has_evidence = body.contains("Evidence");
-    let has_counter = body.contains("Counter-intuitive");
-    let has_actions = body.contains("Action items");
-    if !(has_bottom_line && has_evidence && has_counter && has_actions) {
-        return false;
-    }
-    // Evidence section integrity: at least one [via TOOL] citation.
-    if !body.contains("[via ") {
-        return false;
-    }
-    // Banned opener check (subset — schema lists more; this catches the
-    // common ones). If the draft opens with one of these, synthesis can
-    // still salvage the answer, so don't skip.
-    let banned_openers = [
-        "整体来看",
-        "当前", // weak — but the schema lists it explicitly
-        "如果想要继续",
-        "This project is",
-        "Overall,",
-    ];
-    let first_para = body.lines().next().unwrap_or("").trim();
-    for banned in banned_openers {
-        if first_para.starts_with(banned) {
-            return false;
-        }
-    }
-    true
 }
 
 fn active_plan_brief_for_prompt(plans_root: &Path) -> Option<String> {
@@ -330,20 +195,16 @@ fn apply_subagent_signals(
 }
 
 /// What the planner loop talks to each turn.
-///
-/// String CLI flag `--provider <id>` collapses into one of three concrete
-/// shapes via [`PlannerProvider::from_id`]. Match-dispatch in `run_goal`
-/// replaces the previous string compares — the borrow checker can prove
-/// every arm is handled and the synthesis pass keeps the same shape.
 #[derive(Debug, Clone)]
 pub(crate) enum PlannerProvider {
     /// Local `codex app-server` over stdio JSON-RPC (default).
     Codex,
-    /// RepoPrompt `ask_oracle` — planner prompts inherit RepoPrompt's
-    /// curated context. `--model` selects the oracle mode (`chat|plan|edit|review`).
+    /// RepoPrompt `ask_oracle`. `--model` selects oracle mode.
     Oracle,
-    /// HTTP provider (`openai`, `openai_compatible`, etc.) — the inner
-    /// String is the provider id used by `agent_llm::find_provider`.
+    /// RepoPrompt `agent_run` — full Agent Mode with `steer` continuity.
+    /// `--model` selects role label (default `pair`).
+    RepoPromptAgent,
+    /// HTTP provider id resolved via `agent_llm::find_provider`.
     Http(String),
 }
 
@@ -352,18 +213,16 @@ impl PlannerProvider {
         match id {
             "codex" => Self::Codex,
             "repoprompt_oracle" | "repoprompt" => Self::Oracle,
+            // new alias set for the agent_run-backed planner.
+            "repoprompt_agent" | "rp_agent" | "rp-agent" => Self::RepoPromptAgent,
             other => Self::Http(other.to_string()),
         }
     }
 }
 
-/// Loop-control knobs that aren't provider-specific. Kept separate so the
-/// run_goal signature collects "how to drive the loop" in one place — no
-/// magic numbers leaking through positional arguments.
-///
-/// `Setters` lets callers override one field fluently:
-/// `RunPolicy::default().max_turns(40)`. Defaults mirror the CLI defaults
-/// (24 turns, 10-minute per-turn timeout, 5 consecutive tool failures).
+/// Provider-agnostic loop-control knobs. `Setters` enables fluent
+/// `RunPolicy::default().max_turns(40)`. Defaults: 24 turns,
+/// 10-minute per-turn timeout, 5 consecutive tool failures.
 #[derive(Debug, Clone, Copy, derive_setters::Setters)]
 #[setters(into)]
 pub(crate) struct RunPolicy {
@@ -387,9 +246,6 @@ impl Default for RunPolicy {
     }
 }
 
-/// Provider-specific configuration. Cloned into the post-loop synthesis
-/// pass so a Codex-backed run can recreate its config without re-borrowing
-/// the original RunGoalArgs.
 #[derive(Debug, Clone, derive_setters::Setters)]
 #[setters(into, strip_option)]
 pub(crate) struct ProviderSpec {
@@ -402,24 +258,17 @@ pub(crate) struct ProviderSpec {
     pub(crate) plugins: bool,
 }
 
-/// User-visible mode override exposed via `--mode` and `/mode`.
-///
-/// `Auto` is the default and matches pre-RF27 behavior: the goal text gets
-/// classified via `agent_runtime::classify_run_mode`. `Read` and `Write`
-/// pin the mode regardless of goal text, which is useful when the
-/// keyword heuristic guesses wrong (e.g. "implement an analysis of foo"
-/// → currently classifies read-only because "analysis" is matched first).
+/// `--mode` / `/mode` override. `Auto` uses the keyword classifier;
+/// `Read`/`Write` pin the mode regardless of goal text — useful when
+/// "implement an analysis of foo" gets misclassified as read-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
 #[clap(rename_all = "lowercase")]
 pub(crate) enum ModeArg {
-    /// Auto-classify via keyword heuristic (default, historical behavior).
     #[default]
     Auto,
-    /// Pin to read-only: write tools blocked, run_shell writes refused,
-    /// synthesis pass eligible.
+    /// Write tools blocked, run_shell writes refused.
     Read,
-    /// Pin to implementation: full tool catalog, no run_shell gating, no
-    /// synthesis pass (treated as non-read-only).
+    /// Full tool catalog, no run_shell gating.
     Write,
 }
 
@@ -435,18 +284,12 @@ pub(crate) struct RunGoalArgs<'a> {
     pub(crate) skills_dir: PathBuf,
     pub(crate) policy: RunPolicy,
     pub(crate) provider: ProviderSpec,
-    /// RF27-3: explicit mode override. `Auto` uses the keyword classifier;
-    /// `Read`/`Write` pin the mode regardless of goal text.
     pub(crate) mode: ModeArg,
-    /// RF33-4: when true, codex_config sets use_daemon=true so the client
-    /// launches via `codex app-server proxy` (running daemon) instead of
-    /// spawning a fresh app-server. User opts in via `--use-daemon`.
+    /// Launch Codex via `app-server proxy` (running daemon) instead of
+    /// spawning fresh. Opt-in via `--use-daemon`.
     pub(crate) use_daemon: bool,
-    /// Optional REPL-lifetime Codex client cache. When `Some`, every Codex
-    /// spawn site inside this `run_goal` will reuse the cached client (with
-    /// per-turn cfg hot-swapped) instead of spawning a fresh `codex
-    /// app-server` subprocess. One-shot `seed run` callers pass `None`,
-    /// which falls back to the previous "fresh client per call" behavior.
+    /// REPL-lifetime Codex client cache. `Some` reuses with per-turn
+    /// cfg hot-swap; `None` spawns fresh per call.
     pub(crate) codex_session: Option<&'a mut crate::commands::codex_session::CodexSession>,
 }
 
@@ -454,10 +297,8 @@ fn planner_tool_infos_for_mode(
     tools: Vec<ToolInfo>,
     mode: agent_core::RunMode,
 ) -> Vec<ToolInfo> {
-    // RF37: if a previously-fetched skill narrowed the catalog, intersect
-    // first. Empty narrow set (no skill restriction) = identity. We do
-    // this BEFORE the read-only filter so the read-only filter still
-    // catches mutating tools the skill mistakenly listed.
+    // Apply the skill narrow set BEFORE the read-only filter so
+    // mutating tools the skill mistakenly listed still get caught.
     let tools = tools
         .into_iter()
         .filter(|t| agent_tools::skill_tools_guard::permits(&t.name))
@@ -475,7 +316,6 @@ fn planner_tool_infos_for_mode(
 fn is_read_only_planner_tool(name: &str) -> bool {
     matches!(
         name,
-        // Pure discovery
         "memory_search"
             | "memory_fetch"
             | "skill_list"
@@ -487,24 +327,18 @@ fn is_read_only_planner_tool(name: &str) -> bool {
             | "read_file"
             | "read_files"
             | "run_shell"
-            // Working-memory anchors (in-process state, no FS writes that would
-            // mutate the project).
             | "update_working_checkpoint"
-            // Long-term memory protocol — the gate + settlement decision are
-            // metadata-only; the actual durable write (if it happens) goes
-            // through patch_file / write_file which stay blocked in read-only.
+            // Long-term memory protocol is metadata-only; the durable
+            // write goes through patch_file/write_file (blocked in read-only).
             | "start_long_term_update"
             | "complete_long_term_update"
-            // Parent-side nudges for any subagent the read-only run may have
-            // spawned (no FS mutation of the project).
             | "subagent_nudge"
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-/// RF35-2: cache key for within-run tool memoization. We canonicalize the
-/// args via `to_string` (which sorts object keys deterministically in
-/// serde_json) so `{"a":1,"b":2}` and `{"b":2,"a":1}` hash the same.
+/// `serde_json::to_string` sorts object keys deterministically so
+/// `{"a":1,"b":2}` and `{"b":2,"a":1}` hash the same.
 fn memoize_key(name: &str, args: &serde_json::Value) -> (String, String) {
     (
         name.to_string(),
@@ -512,30 +346,16 @@ fn memoize_key(name: &str, args: &serde_json::Value) -> (String, String) {
     )
 }
 
-/// RF35-2: allowlist of tools whose result is a pure function of their
-/// args within one run. Repeated calls (planner double-checking, multiple
-/// turns asking the same question) return the cached value.
-///
-/// Excluded by default: anything with side effects (write/patch/shell/
-/// spawn/plan-mutating/long-term-memory-mutating/checkpoint/ask_user),
-/// repoprompt_exec/repoprompt_call (they can perform edits or oracle
-/// chats that aren't reproducible).
-fn is_memoizable_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file"
-            | "read_files"
-            | "memory_search"
-            | "memory_fetch"
-            | "skill_list"
-            | "skill_search"
-            | "skill_fetch"
-            | "plan_status"
-            | "plan_next"
-            | "plan_list"
-            | "tool_describe"
-            | "repoprompt_tools"
-    )
+/// Names of tools whose result is a pure function of args within one
+/// run. Adding a new pure-read tool requires only
+/// `crate::impl_pure_read!()` in its impl block.
+fn pure_read_tool_names() -> std::collections::BTreeSet<String> {
+    agent_tools::seed_registry()
+        .infos()
+        .into_iter()
+        .filter(|info| info.is_pure_read)
+        .map(|info| info.name)
+        .collect()
 }
 
 fn run_planner_tool(
@@ -616,6 +436,191 @@ fn run_planner_tool(
     }
 }
 
+pub(crate) struct FinalizeInputs<'a> {
+    pub(crate) goal: &'a str,
+    pub(crate) memory_paths: &'a agent_memory::MemoryPaths,
+    pub(crate) skills_dir: &'a Path,
+    pub(crate) learn: bool,
+}
+
+/// Returns `loop_result.turns` for the run-footer counter. Incomplete
+/// runs (`MaxTurnsExceeded`) skip the archive append to avoid skewing
+/// the index.
+fn finalize_llm_run_outcome(
+    session: &mut agent_core::session::SessionWriter,
+    loop_result: &agent_runtime::AgentLoopResult,
+    turn_timings: &[TurnTiming],
+    inputs: FinalizeInputs<'_>,
+) -> Result<usize> {
+    for turn_summary in &loop_result.turn_summaries {
+        session.append(AgentEvent::TurnSummary {
+            turn: turn_summary.turn,
+            summary: turn_summary.summary.clone(),
+        })?;
+    }
+    for timing in turn_timings {
+        session.append(AgentEvent::TurnTimings {
+            turn: timing.turn,
+            planner_ms: timing.planner_ms,
+            exec_ms: timing.exec_ms,
+            planner_chars: timing.planner_chars,
+            prompt_chars: timing.prompt_chars,
+        })?;
+    }
+    match loop_result.status {
+        agent_runtime::AgentLoopStatus::Finished => {
+            session.append(AgentEvent::Reflection {
+                summary: loop_result.summary.clone(),
+            })?;
+            session.append(AgentEvent::RunFinished {
+                status: "completed".to_string(),
+                summary: format!(
+                    "Finished after {} turns: {}",
+                    loop_result.turns, loop_result.summary
+                ),
+            })?;
+            println!("{}", loop_result.summary);
+            let archive_record = build_session_archive_record(
+                inputs.goal,
+                "completed",
+                loop_result,
+                session.path(),
+            );
+            agent_memory::append_session_archive_record(inputs.memory_paths, &archive_record)?;
+            agent_memory::rebuild_index(inputs.memory_paths)?;
+            if inputs.learn {
+                let consolidation =
+                    consolidate_run_skill(inputs.skills_dir, inputs.goal, session.path())?;
+                agent_memory::rebuild_index(inputs.memory_paths)?;
+                let decision = match consolidation.decision {
+                    agent_skills::SkillConsolidationDecision::Created => {
+                        "create_l3_skill".to_string()
+                    }
+                    agent_skills::SkillConsolidationDecision::Updated => {
+                        "update_l3_skill".to_string()
+                    }
+                };
+                session.append(AgentEvent::CheckpointUpdated {
+                    key_info: format!(
+                        "Learned skill consolidated via {decision}: {}",
+                        consolidation.path.display()
+                    ),
+                    related_skill: consolidation
+                        .path
+                        .parent()
+                        .and_then(Path::file_name)
+                        .and_then(|name| name.to_str())
+                        .map(ToString::to_string),
+                })?;
+                session.append(AgentEvent::LongTermUpdateSettled {
+                    decision,
+                    target: Some(consolidation.path.display().to_string()),
+                    reason: consolidation.reason,
+                    evidence: Some(format!(
+                        "run --learn session {}",
+                        session.path().display()
+                    )),
+                    changed: true,
+                })?;
+                println!("learned skill: {}", consolidation.path.display());
+            }
+        }
+        agent_runtime::AgentLoopStatus::MaxTurnsExceeded => {
+            session.append(AgentEvent::RunFinished {
+                status: "max_turns_exceeded".to_string(),
+                summary: loop_result.summary.clone(),
+            })?;
+            println!("{}", loop_result.summary);
+        }
+    }
+    Ok(loop_result.turns)
+}
+
+/// Records Reflection + RunFinished, prints the answer, surfaces token
+/// usage when Codex sent it. Err propagates transport failures.
+fn record_codex_fast_path_outcome(
+    session: &mut agent_core::session::SessionWriter,
+    outcome: anyhow::Result<agent_delegate::CodexRunResult>,
+) -> Result<()> {
+    match outcome {
+        Ok(result) => {
+            session.append(AgentEvent::Reflection {
+                summary: result.text.clone(),
+            })?;
+            if let Some(t) = result.tokens.as_ref() {
+                eprintln!(
+                    "{}",
+                    agent_core::tui::dim_text(&format!(
+                        "(tokens: {} in / {} cached / {} out / {} reasoning · {} total)",
+                        t.input_tokens,
+                        t.cached_input_tokens,
+                        t.output_tokens,
+                        t.reasoning_output_tokens,
+                        t.total_tokens
+                    ))
+                );
+            }
+            session.append(AgentEvent::RunFinished {
+                status: "completed".to_string(),
+                summary: format!(
+                    "Codex completed turn {} after {} events.{}",
+                    result.turn_id,
+                    result.events_seen,
+                    result
+                        .tokens
+                        .as_ref()
+                        .map(|t| format!(" tokens: {}", t.total_tokens))
+                        .unwrap_or_default()
+                ),
+            })?;
+            println!("{}", result.text);
+            Ok(())
+        }
+        Err(err) => {
+            session.append(AgentEvent::RunFinished {
+                status: "failed".to_string(),
+                summary: format!("Codex failed: {err}"),
+            })?;
+            Err(err)
+        }
+    }
+}
+
+/// Resolve `RunMode`, install the global guard, and print the dim
+/// "mode: …" trace.
+fn resolve_and_announce_run_mode(
+    goal: &str,
+    mode_arg: ModeArg,
+) -> (agent_core::RunMode, agent_core::ModeSource) {
+    let (run_mode, mode_source) = match mode_arg {
+        ModeArg::Read => (agent_core::RunMode::ReadOnly, agent_core::ModeSource::Explicit),
+        ModeArg::Write => (
+            agent_core::RunMode::Implementation,
+            agent_core::ModeSource::Explicit,
+        ),
+        ModeArg::Auto => (
+            agent_runtime::classify_run_mode(goal),
+            agent_core::ModeSource::Auto,
+        ),
+    };
+    agent_tools::run_mode_guard::set(run_mode);
+    eprintln!(
+        "{}",
+        agent_core::tui::dim_text(&format!(
+            "mode: {} ({})",
+            match run_mode {
+                agent_core::RunMode::ReadOnly => "read-only",
+                agent_core::RunMode::Implementation => "implementation",
+            },
+            match mode_source {
+                agent_core::ModeSource::Auto => "auto-classified from goal",
+                agent_core::ModeSource::Explicit => "explicit via --mode",
+            },
+        ))
+    );
+    (run_mode, mode_source)
+}
+
 pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
     let RunGoalArgs {
         store,
@@ -644,60 +649,17 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         use_daemon,
         codex_session,
     } = args;
-    // Bridge: when we have no REPL-owned session we build a throwaway one
-    // locally so the rest of this function can speak the same API. The
-    // local session's drop kills the subprocess at function exit, restoring
-    // the pre-RF25 "fresh codex per run_goal" behavior.
+    // When we have no REPL-owned session we build a throwaway one locally;
+    // its drop kills the subprocess at function exit (fresh codex per
+    // run_goal).
     let mut local_codex_session = crate::commands::codex_session::CodexSession::default();
     let codex_session: &mut crate::commands::codex_session::CodexSession =
         codex_session.unwrap_or(&mut local_codex_session);
-    // RF27: resolve effective mode + provenance.
-    //
-    //   --mode auto  (default) → classify by goal keywords; source = Auto
-    //   --mode read           → ReadOnly,         source = Explicit
-    //   --mode write          → Implementation,   source = Explicit
-    //
-    // Set the process-global guard right after so ShellTool (and any
-    // future tool that wants to check) sees the right value for the
-    // entirety of the run. The previous run's value persists otherwise
-    // — fine for one-shot processes, dangerous for the REPL.
-    let (run_mode, mode_source) = match mode_arg {
-        ModeArg::Read => (agent_core::RunMode::ReadOnly, agent_core::ModeSource::Explicit),
-        ModeArg::Write => (
-            agent_core::RunMode::Implementation,
-            agent_core::ModeSource::Explicit,
-        ),
-        ModeArg::Auto => (
-            agent_runtime::classify_run_mode(&goal),
-            agent_core::ModeSource::Auto,
-        ),
-    };
-    agent_tools::run_mode_guard::set(run_mode);
-    // Surface the decision so the user can tell from the trace which
-    // toolset the planner has access to. Dimmed so it doesn't compete with
-    // the goal text — but always present.
-    eprintln!(
-        "{}",
-        agent_core::tui::dim_text(&format!(
-            "mode: {} ({})",
-            match run_mode {
-                agent_core::RunMode::ReadOnly => "read-only",
-                agent_core::RunMode::Implementation => "implementation",
-            },
-            match mode_source {
-                agent_core::ModeSource::Auto => "auto-classified from goal",
-                agent_core::ModeSource::Explicit => "explicit via --mode",
-            },
-        ))
-    );
+    let (run_mode, mode_source) = resolve_and_announce_run_mode(&goal, mode_arg);
     let cwd = cwd.unwrap_or(env::current_dir()?);
-    // RF26-2 / RF27: for read-only runs, default codex `reasoning_effort`
-    // to "low" when the user didn't explicitly set one. Codex's default is
-    // "medium" which is overkill for "summarize / explain / explore" tasks
-    // — `low` typically cuts per-turn planner time roughly in half on those
-    // shapes. User-set --effort (or /effort in REPL) always wins. We key
-    // off the resolved `run_mode` (not the raw classifier) so `--mode read`
-    // on an implementation-shaped goal still gets the cheap effort.
+    // Read-only runs default codex reasoning_effort to "low" when the
+    // user didn't set one; "summarize/explain" goals don't need the
+    // medium-effort default. User-set --effort always wins.
     let effort = effort.or_else(|| {
         if matches!(run_mode, agent_core::RunMode::ReadOnly) {
             Some("low".to_string())
@@ -711,7 +673,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
     // first rp tool call would mysteriously bind to the previous run's
     // skill dir.
     agent_tools::repoprompt_sync::reset();
-    // RF37: same logic for the skill-driven tool narrow set — a previous
+    // same logic for the skill-driven tool narrow set — a previous
     // skill_fetch shouldn't restrict this run's tool catalog unless this
     // run also fetches that skill.
     agent_tools::skill_tools_guard::reset();
@@ -753,11 +715,6 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             plugins,
             use_daemon,
         )?;
-        // RF25-1: reuse the REPL-lifetime client if its launch fingerprint
-        // matches; otherwise this constructs a fresh one and stashes it for
-        // next time. For one-shot `seed run --codex` callers, `codex_session`
-        // is the throwaway local one, so behavior matches the pre-RF25
-        // "fresh client per run" path.
         let client = codex_session.ensure(cfg)?;
         let codex_goal = codex_prompt_with_routed_skill(&goal, &skills_dir)?;
         let delta_chars: Cell<usize> = Cell::new(0);
@@ -766,51 +723,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             spinner.set_subtitle(Some(format_token_subtitle(delta_chars.get())));
         });
         spinner.stop();
-        match outcome {
-            Ok(result) => {
-                session.append(AgentEvent::Reflection {
-                    summary: result.text.clone(),
-                })?;
-                // RF35-1: surface token usage when Codex sent the
-                // `thread/tokenUsageUpdated` notification. Single dim line
-                // so it doesn't compete with the answer; absent when the
-                // daemon/server didn't emit usage data.
-                if let Some(t) = result.tokens.as_ref() {
-                    eprintln!(
-                        "{}",
-                        agent_core::tui::dim_text(&format!(
-                            "(tokens: {} in / {} cached / {} out / {} reasoning · {} total)",
-                            t.input_tokens,
-                            t.cached_input_tokens,
-                            t.output_tokens,
-                            t.reasoning_output_tokens,
-                            t.total_tokens
-                        ))
-                    );
-                }
-                session.append(AgentEvent::RunFinished {
-                    status: "completed".to_string(),
-                    summary: format!(
-                        "Codex completed turn {} after {} events.{}",
-                        result.turn_id,
-                        result.events_seen,
-                        result
-                            .tokens
-                            .as_ref()
-                            .map(|t| format!(" tokens: {}", t.total_tokens))
-                            .unwrap_or_default()
-                    ),
-                })?;
-                println!("{}", result.text);
-            }
-            Err(err) => {
-                session.append(AgentEvent::RunFinished {
-                    status: "failed".to_string(),
-                    summary: format!("Codex failed: {err}"),
-                })?;
-                return Err(err);
-            }
-        }
+        record_codex_fast_path_outcome(&mut session, outcome)?;
     } else if use_llm {
         let registry = agent_tools::seed_registry();
         let tool_infos = planner_tool_infos_for_mode(registry.infos(), run_mode);
@@ -821,22 +734,10 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         let spinner = agent_core::tui::Spinner::start(format!("planning · turn 1/{max_turns}"));
         let turn_timings: RefCell<Vec<TurnTiming>> = RefCell::new(Vec::new());
         let active_turn: Cell<usize> = Cell::new(1);
-        // Track consecutive tool failures. Reset on any successful tool call;
-        // when it exceeds `max_consecutive_failures`, the planner closure bails
-        // out with a synthetic RuntimeError so the loop unwinds cleanly through
-        // the normal error path (session.append RunFinished + eprintln hint).
+        // Crosses `max_consecutive_failures` → planner bails with a
+        // synthetic RuntimeError, unwinding via the error path.
         let failure_streak: Cell<usize> = Cell::new(0);
-        // Reset the per-run phase divider so each REPL turn starts fresh and
-        // the first tool prints its own `── phase ──` header.
         reset_phase_tracker();
-        // Stash a copy of the planner config bits before the per-provider
-        // branches consume them, so the post-loop synthesis pass can recreate
-        // a fresh client without fighting the borrow checker.
-        let synthesis_model = model.clone();
-        let synthesis_approval = approval.clone();
-        let synthesis_effort = effort.clone();
-        let synthesis_mcp = mcp.clone();
-        let synthesis_mcp_allow = mcp_allow.clone();
         let mut planner = match build_planner(
             &provider_kind,
             &cwd,
@@ -860,13 +761,13 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             }
         };
         let retries: RefCell<Vec<agent_runtime::PlannerRetryInfo>> = RefCell::new(Vec::new());
-        // RF35-2: per-run cache for pure-read tools. Saves the planner
-        // re-reading Cargo.toml three times in one goal (a common pattern
-        // when it's exploring → answers → double-checks before finishing).
+        // Per-run cache for pure-read tools — avoids re-reading the
+        // same file across exploration/answer/double-check turns.
         let tool_cache: RefCell<std::collections::HashMap<(String, String), ToolResult>> =
             RefCell::new(std::collections::HashMap::new());
-        let mut loop_result = match drive_planner_loop(
-            planner.as_mut(),
+        let pure_reads = pure_read_tool_names();
+        let loop_result = match drive_planner_loop(
+            &mut planner,
             max_turns,
             &goal,
             &tool_infos,
@@ -878,11 +779,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             &retries,
             build_planner_memory,
             |call| {
-                // RF35-2: short-circuit if we already have a cached
-                // result for this exact (name, args). We emit a dim
-                // "(cached)" line via the spinner so the trace makes the
-                // skip visible.
-                if is_memoizable_tool(&call.name) {
+                if pure_reads.contains(&call.name) {
                     let key = memoize_key(&call.name, &call.args);
                     if let Some(cached) = tool_cache.borrow().get(&key).cloned() {
                         let (inner_tool, args_text) =
@@ -895,8 +792,10 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                             None,
                             "cached",
                         );
-                        // Cached read = always "success" from streak POV.
-                        failure_streak.set(0);
+                        // A cache hit is NOT fresh progress — the planner
+                        // already saw these bytes. Don't reset
+                        // failure_streak; that would cloak a stuck loop
+                        // pattern like "fail-fail-fail-recheck-cached-fail".
                         return cached;
                     }
                 }
@@ -912,7 +811,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 );
                 if result.ok {
                     failure_streak.set(0);
-                    if is_memoizable_tool(&call.name) {
+                    if pure_reads.contains(&call.name) {
                         tool_cache
                             .borrow_mut()
                             .insert(memoize_key(&call.name, &call.args), result.clone());
@@ -939,10 +838,9 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         drop(planner);
         spinner.stop();
 
-        // RF34-2: flush retry events captured during the loop. We defer
-        // session writes here because the in-loop on_retry closure can't
-        // hold &mut session (run_tool already does). Chronology is
-        // preserved by the JSONL timestamps.
+        // Deferred from in-loop because the on_retry closure can't
+        // hold &mut session while run_tool does. JSONL timestamps
+        // preserve chronology.
         for info in retries.into_inner() {
             session.append(AgentEvent::PlannerRetry {
                 turn: info.turn,
@@ -954,199 +852,17 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             })?;
         }
 
-        // Synthesis pass: read-only analysis goals that reach Finish get one
-        // extra LLM call to rewrite the draft answer strictly to schema. This
-        // separates "what to explore next" from "how to present what I found",
-        // which the planner conflates when given both jobs in the same turn.
-        //
-        // RF26-1: skip the entire synthesis turn (~60s) when the draft
-        // already structurally conforms — same content, half the latency.
-        let synthesis_eligible = matches!(
-            loop_result.status,
-            agent_runtime::AgentLoopStatus::Finished
-        ) && matches!(run_mode, agent_core::RunMode::ReadOnly)
-            && !loop_result.summary.trim().is_empty();
-        if synthesis_eligible && draft_already_conforms(&loop_result.summary) {
-            // Skip path. Leave loop_result.summary as the draft; log so the
-            // user sees from the trace whether synthesis fired.
-            eprintln!(
-                "{}",
-                agent_core::tui::dim_text(
-                    "(synthesis pass skipped: draft already conforms to schema)"
-                )
-            );
-        } else if synthesis_eligible {
-            let synthesis_spinner = agent_core::tui::Spinner::start("synthesizing answer · turn final");
-            let synthesis_prompt = build_synthesis_prompt(
-                &goal,
-                &loop_result.summary,
-                &loop_result.working_memory,
-                &loop_result.observations,
-            );
-            let synthesis_outcome: Result<String> = match &provider_kind {
-                PlannerProvider::Oracle => {
-                let oracle_cfg = agent_repoprompt::RepoPromptClientConfig {
-                    cli_path: agent_repoprompt::default_cli_path(),
-                    timeout_secs: turn_timeout_secs.max(60),
-                    raw_json: true,
-                    working_dirs: vec![cwd.clone()],
-                    ..Default::default()
-                };
-                let oracle = agent_repoprompt::RepoPromptClient::new(oracle_cfg);
-                if let Err(err) = oracle.check_available() {
-                    Err(anyhow::anyhow!(
-                        "RepoPrompt oracle unavailable for synthesis: {err}"
-                    ))
-                } else {
-                    oracle
-                        .send_oracle(
-                            &synthesis_prompt,
-                            agent_repoprompt::OracleMode::Chat,
-                            None,
-                            true,
-                        )
-                        .map_err(anyhow::Error::from)
-                        .and_then(|resp| {
-                            if !resp.is_success() {
-                                anyhow::bail!(
-                                    "oracle synthesis returned exit_code={:?}",
-                                    resp.raw_output.exit_code
-                                );
-                            }
-                            extract_synthesized_answer(&resp.response_text)
-                        })
-                }
-                }
-                PlannerProvider::Codex => {
-                let cfg = crate::commands::codex::codex_config_full(
-                    synthesis_model.clone(),
-                    Some(cwd.clone()),
-                    synthesis_approval.clone(),
-                    synthesis_effort.clone(),
-                    turn_timeout_secs,
-                    synthesis_mcp,
-                    synthesis_mcp_allow.clone(),
-                    plugins,
-                    use_daemon,
-                )?;
-                // Reuse the REPL-lifetime session (RF25-1) — synthesis is
-                // a single extra Codex turn, so it benefits the same way
-                // as the main path.
-                let codex = codex_session.ensure(cfg)?;
-                codex
-                    .run_prompt(&synthesis_prompt)
-                    .and_then(|result| extract_synthesized_answer(&result.text))
-                }
-                PlannerProvider::Http(provider_id) => {
-                // openai-style provider: skip synthesis (would need plumbing
-                // through plan_one_tool_call / ProviderClient; defer until
-                // there's a real user of the HTTP provider path).
-                Err(anyhow::anyhow!(
-                    "synthesis not implemented for provider `{provider_id}` — using draft"
-                ))
-                }
-            };
-            synthesis_spinner.stop();
-            match synthesis_outcome {
-                Ok(rewritten) => {
-                    eprintln!(
-                        "{}",
-                        agent_core::tui::dim_text(
-                            "(synthesis pass applied: draft rewritten to schema)"
-                        )
-                    );
-                    loop_result.summary = rewritten;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "{}",
-                        agent_core::tui::dim_text(&format!(
-                            "(synthesis pass skipped: {err}; using draft answer)"
-                        ))
-                    );
-                }
-            }
-        }
-
-        run_turns = loop_result.turns;
-        for turn_summary in &loop_result.turn_summaries {
-            session.append(AgentEvent::TurnSummary {
-                turn: turn_summary.turn,
-                summary: turn_summary.summary.clone(),
-            })?;
-        }
-        for timing in turn_timings.borrow().iter() {
-            session.append(AgentEvent::TurnTimings {
-                turn: timing.turn,
-                planner_ms: timing.planner_ms,
-                exec_ms: timing.exec_ms,
-                planner_chars: timing.planner_chars,
-                prompt_chars: timing.prompt_chars,
-            })?;
-        }
-        match loop_result.status {
-            agent_runtime::AgentLoopStatus::Finished => {
-                session.append(AgentEvent::Reflection {
-                    summary: loop_result.summary.clone(),
-                })?;
-                session.append(AgentEvent::RunFinished {
-                    status: "completed".to_string(),
-                    summary: format!(
-                        "Finished after {} turns: {}",
-                        loop_result.turns, loop_result.summary
-                    ),
-                })?;
-                println!("{}", loop_result.summary);
-                let archive_record = build_session_archive_record(
-                    &goal,
-                    "completed",
-                    &loop_result,
-                    session.path(),
-                );
-                agent_memory::append_session_archive_record(&memory_paths, &archive_record)?;
-                agent_memory::rebuild_index(&memory_paths)?;
-                if learn {
-                    let consolidation =
-                        consolidate_run_skill(&skills_dir, &goal, session.path())?;
-                    agent_memory::rebuild_index(&memory_paths)?;
-                    let decision = match consolidation.decision {
-                        agent_skills::SkillConsolidationDecision::Created => {
-                            "create_l3_skill".to_string()
-                        }
-                        agent_skills::SkillConsolidationDecision::Updated => {
-                            "update_l3_skill".to_string()
-                        }
-                    };
-                    session.append(AgentEvent::CheckpointUpdated {
-                        key_info: format!(
-                            "Learned skill consolidated via {decision}: {}",
-                            consolidation.path.display()
-                        ),
-                        related_skill: consolidation
-                            .path
-                            .parent()
-                            .and_then(Path::file_name)
-                            .and_then(|name| name.to_str())
-                            .map(ToString::to_string),
-                    })?;
-                    session.append(AgentEvent::LongTermUpdateSettled {
-                        decision,
-                        target: Some(consolidation.path.display().to_string()),
-                        reason: consolidation.reason,
-                        evidence: Some(format!("run --learn session {}", session.path().display())),
-                        changed: true,
-                    })?;
-                    println!("learned skill: {}", consolidation.path.display());
-                }
-            }
-            agent_runtime::AgentLoopStatus::MaxTurnsExceeded => {
-                session.append(AgentEvent::RunFinished {
-                    status: "max_turns_exceeded".to_string(),
-                    summary: loop_result.summary.clone(),
-                })?;
-                println!("{}", loop_result.summary);
-            }
-        }
+        run_turns = finalize_llm_run_outcome(
+            &mut session,
+            &loop_result,
+            &turn_timings.borrow(),
+            FinalizeInputs {
+                goal: &goal,
+                memory_paths: &memory_paths,
+                skills_dir: &skills_dir,
+                learn,
+            },
+        )?;
     } else if let Some(call) = parse_seed_goal(&goal) {
         execute_call(&mut session, &cwd, &skills_dir, store.root(), call)?;
         session.append(AgentEvent::RunFinished {
@@ -1174,8 +890,6 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         info = info
             .pair("planner avg", stats.planner_avg)
             .pair("exec avg", stats.exec_avg);
-        // RF36-1: input prompt size in front of response chars — "in/out"
-        // ordering reads naturally.
         if let Some(chars) = stats.prompt_chars_total {
             info = info.pair("prompt chars", chars);
         }
@@ -1193,9 +907,8 @@ struct TimingStats {
     planner_avg: String,
     exec_avg: String,
     planner_chars_total: Option<String>,
-    /// RF36-1: sum of `prompt_chars` across all turns. Shown in the run
-    /// footer alongside response char total so users can see "I sent 320k
-    /// chars in / 18k chars out" — useful for spotting prompt bloat.
+    /// Sum of `prompt_chars` across all turns — input side counterpart
+    /// to `planner_chars_total`. Surfaces prompt-bloat.
     prompt_chars_total: Option<String>,
 }
 
@@ -1245,36 +958,14 @@ fn build_timing_stats(session: &SessionWriter) -> Result<Option<TimingStats>> {
     }))
 }
 
-// =============================================================================
-// Planner abstraction
-// -----------------------------------------------------------------------------
-// One trait + three impls replaces the three near-identical planner branches
-// that previously lived inline in run_goal. The driving loop is identical for
-// every provider — only the "send the prompt, get back a PlannedAction"
-// inner step varies, so that's all the trait covers.
-//
-// Adding a new planner backend: implement Planner, branch on PlannerProvider in
-// build_planner, done. No new code in drive_planner_loop.
-// =============================================================================
-
-// RF40-A3: Planner trait + 3 provider impls + build_planner moved to
-// commands/run_planners.rs to keep this file under 2000 lines. Tests
-// (which use MockPlanner) stay here because they test drive_planner_loop
-// integration shape, not the trait surface itself.
+// Adding a new planner backend: impl Planner, branch on PlannerProvider
+// in build_planner, done. No new code in drive_planner_loop.
 use crate::commands::run_planners::{Planner, build_planner};
 
-
-/// Run the planner loop with the given planner backend. Owns the per-turn
-/// glue (subagent signals, spinner label, prompt building, timing,
-/// failure-streak abort) so each Planner impl only has to implement the
-/// actual "send prompt → get action" step.
-///
-/// `failure_streak` + `max_consecutive_failures` implement forge's
-/// `ToolErrorTracker` pattern: when tool calls fail back-to-back too many
-/// times, abort the loop early rather than burning through `max_turns`
-/// turns. The check fires at the *top* of each turn so a fresh planner
-/// reading the same failed observation can't trigger a new one before we
-/// notice.
+/// Drives the planner loop. `failure_streak` + `max_consecutive_failures`
+/// implement forge's `ToolErrorTracker` — abort early when tool calls fail
+/// back-to-back rather than burning `max_turns`. The check fires at the
+/// TOP of each turn so a fresh planner can't trigger a new one first.
 #[allow(clippy::too_many_arguments)]
 fn drive_planner_loop<M, T>(
     planner: &mut dyn Planner,
@@ -1300,9 +991,6 @@ where
         |state| {
             active_turn.set(state.next_turn);
             if failure_streak.get() >= max_consecutive_failures {
-                // Fatal: retrying the planner won't recover from a tools-broken
-                // state; user needs to inspect the session and the failing
-                // tools first.
                 return Err(agent_runtime::RuntimeError::planner_fatal(format!(
                     "aborted: {} consecutive tool failures (limit={}). \
                      Re-run with `--max-consecutive-failures N` to raise the threshold.",
@@ -1314,21 +1002,26 @@ where
                 return Ok(action);
             }
             spinner.set_label(format!("{label} · turn {}/{}", state.next_turn, max_turns));
-            planner.on_turn_start(spinner);
+            spinner.set_subtitle(planner.turn_start_subtitle());
             let memory = build_memory();
             let planner_started = Instant::now();
-            let (action, chars) = planner.plan(goal, tool_infos, state, &memory, spinner)?;
-            // RF36-1: capture prompt size for this turn (provider-specific;
-            // 0 if the planner doesn't track it).
-            let prompt_chars = planner.last_prompt_chars();
+            let output = planner.plan(goal, tool_infos, state, &memory, &mut |event| {
+                use crate::commands::run_planners::ProgressEvent;
+                match event {
+                    ProgressEvent::StaticSubtitle(text) => spinner.set_subtitle(text),
+                    ProgressEvent::StreamingTokens(n) => {
+                        spinner.set_subtitle(Some(format_token_subtitle(n)));
+                    }
+                }
+            })?;
             record_planner_timing(
                 turn_timings,
                 state.next_turn,
                 planner_started.elapsed(),
-                chars,
-                prompt_chars,
+                output.response_chars,
+                output.prompt_chars,
             );
-            Ok(action)
+            Ok(output.action)
         },
         |call| {
             let exec_started = Instant::now();
@@ -1336,7 +1029,7 @@ where
             record_exec_timing(turn_timings, exec_started.elapsed());
             result
         },
-        // RF34-2: capture retries for later session.append (we can't hold
+        // capture retries for later session.append (we can't hold
         // &mut session here because run_tool already does). The spinner
         // gets a live subtitle update so the user sees the retry as it
         // happens; the session events are flushed after the loop returns.
@@ -1358,19 +1051,12 @@ mod tests {
     use super::*;
     use agent_core::ToolInfo;
 
-    // --- RF36-1 prompt size visibility ----------------------------------
+    // removed `planner_trait_default_last_prompt_chars_is_zero`
+    // — the `last_prompt_chars()` trait method is gone; prompt_chars
+    // is now a field on `PlanOutput` returned by `plan()`. There's no
+    // "default" anymore — every backend MUST report it.
 
-    #[test]
-    fn planner_trait_default_last_prompt_chars_is_zero() {
-        // MockPlanner doesn't override last_prompt_chars(), so the default
-        // impl should return 0 — confirming OraclePlanner (which also
-        // doesn't override) won't accidentally report stale values.
-        let mut planner = MockPlanner::new(vec![]);
-        let p: &dyn Planner = &mut planner;
-        assert_eq!(p.last_prompt_chars(), 0);
-    }
-
-    // --- RF35-2 tool memoization ----------------------------------------
+    // --- tool memoization ----------------------------------------
 
     #[test]
     fn memoize_key_orders_object_fields_canonically() {
@@ -1394,8 +1080,8 @@ mod tests {
     }
 
     #[test]
-    fn is_memoizable_only_for_read_tools() {
-        // Read-shaped → memoize.
+    fn registry_pure_read_allowlist_matches_intent() {
+        let pure = pure_read_tool_names();
         for n in [
             "read_file",
             "read_files",
@@ -1410,9 +1096,8 @@ mod tests {
             "tool_describe",
             "repoprompt_tools",
         ] {
-            assert!(is_memoizable_tool(n), "should memoize {n}");
+            assert!(pure.contains(n), "should memoize {n}; got set={pure:?}");
         }
-        // Side-effect tools → must NOT memoize.
         for n in [
             "write_file",
             "patch_file",
@@ -1430,7 +1115,7 @@ mod tests {
             "repoprompt_exec",
             "repoprompt_call",
         ] {
-            assert!(!is_memoizable_tool(n), "must not memoize {n}");
+            assert!(!pure.contains(n), "must not memoize {n}");
         }
     }
 
@@ -1440,26 +1125,38 @@ mod tests {
             ToolInfo {
                 name: "read_file".to_string(),
                 description: "read".to_string(),
+                args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "read_files".to_string(),
                 description: "batch read".to_string(),
+                args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "update_working_checkpoint".to_string(),
                 description: "anchor".to_string(),
+                args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "plan_create".to_string(),
                 description: "plan".to_string(),
+                args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "patch_file".to_string(),
                 description: "patch".to_string(),
+                args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "repoprompt_exec".to_string(),
                 description: "rp".to_string(),
+                args_schema: None,
+                is_pure_read: false,
             },
         ];
 
@@ -1479,32 +1176,26 @@ mod tests {
         );
     }
 
-    // --- RF37 skill_tools_guard intersection ---------------------------
+    // --- skill_tools_guard intersection ---------------------------
 
     #[test]
     fn skill_narrow_intersects_with_mode_filter() {
-        // RF37: a fetched skill that allowed only [read_file, run_shell]
-        // should restrict the planner catalog. Then the read-only filter
-        // (which keeps run_shell + read_file but drops write_file etc.)
-        // applies on top. So we end up with [read_file, run_shell].
         agent_tools::skill_tools_guard::reset();
         agent_tools::skill_tools_guard::set(vec![
             "read_file".to_string(),
             "run_shell".to_string(),
         ]);
         let tools = vec![
-            ToolInfo { name: "read_file".to_string(), description: "r".to_string() },
-            ToolInfo { name: "run_shell".to_string(), description: "s".to_string() },
-            ToolInfo { name: "write_file".to_string(), description: "w".to_string() },
-            ToolInfo { name: "memory_search".to_string(), description: "m".to_string() },
+            ToolInfo { name: "read_file".to_string(), description: "r".to_string(), args_schema: None, is_pure_read: false },
+            ToolInfo { name: "run_shell".to_string(), description: "s".to_string(), args_schema: None, is_pure_read: false },
+            ToolInfo { name: "write_file".to_string(), description: "w".to_string(), args_schema: None, is_pure_read: false },
+            ToolInfo { name: "memory_search".to_string(), description: "m".to_string(), args_schema: None, is_pure_read: false },
         ];
         let names = planner_tool_infos_for_mode(tools, agent_core::RunMode::ReadOnly)
             .into_iter()
             .map(|t| t.name)
             .collect::<Vec<_>>();
         agent_tools::skill_tools_guard::reset();
-        // memory_search NOT in skill narrow → dropped.
-        // write_file in neither read-only allowlist nor skill narrow → dropped.
         assert_eq!(names, vec!["read_file".to_string(), "run_shell".to_string()]);
     }
 
@@ -1512,40 +1203,24 @@ mod tests {
     fn no_skill_narrow_keeps_existing_mode_behavior() {
         agent_tools::skill_tools_guard::reset();
         let tools = vec![
-            ToolInfo { name: "read_file".to_string(), description: "r".to_string() },
-            ToolInfo { name: "memory_search".to_string(), description: "m".to_string() },
-            ToolInfo { name: "write_file".to_string(), description: "w".to_string() },
+            ToolInfo { name: "read_file".to_string(), description: "r".to_string(), args_schema: None, is_pure_read: false },
+            ToolInfo { name: "memory_search".to_string(), description: "m".to_string(), args_schema: None, is_pure_read: false },
+            ToolInfo { name: "write_file".to_string(), description: "w".to_string(), args_schema: None, is_pure_read: false },
         ];
         let names = planner_tool_infos_for_mode(tools, agent_core::RunMode::ReadOnly)
             .into_iter()
             .map(|t| t.name)
             .collect::<Vec<_>>();
-        // Read-only filter only — read_file + memory_search keep, write_file drops.
         assert_eq!(names, vec!["read_file".to_string(), "memory_search".to_string()]);
     }
 
-    // ====================================================================
-    // RF20 — integration tests for the planner loop.
-    //
-    // These tests drive `drive_planner_loop` end-to-end with a `MockPlanner`
-    // and a synthetic tool closure. They cover the loop-control behavior
-    // that's hard to verify with the per-Planner-impl unit tests in
-    // `agent-runtime` (which exercise `run_agent_loop_with_state_planner*`
-    // directly without the seed-cli glue).
-    //
-    // What they cover:
-    //   - multi-turn convergence to `Finished`
-    //   - `MaxTurnsExceeded` when planner never finishes
-    //   - ToolErrorTracker abort after N consecutive tool failures (RF13)
-    //   - `PlannerFatal` short-circuits the loop with no retry (RF14)
-    //   - `Planner` (retryable) variant DOES retry via the runtime's
-    //     transport-retry plumbing
-    // ====================================================================
+    // drive_planner_loop integration tests via MockPlanner. Covers loop
+    // control (Finished/MaxTurnsExceeded/streak abort/Fatal vs retryable
+    // Planner errors) that the per-Planner-impl unit tests in
+    // agent-runtime don't see.
 
-    /// Test stand-in for a real Planner backend. Stores a queue of
-    /// pre-baked responses; each `plan()` call pops the next one. Using an
-    /// enum instead of `Result<PlannedAction, RuntimeError>` because
-    /// `RuntimeError` doesn't implement `Clone` (anyhow::Error inside).
+    /// Queue of pre-baked responses; each `plan()` pops the next.
+    /// Enum (not `Result<_, RuntimeError>`) because RuntimeError isn't Clone.
     enum MockResponse {
         Action(agent_runtime::PlannedAction),
         TransientErr(String),
@@ -1554,7 +1229,6 @@ mod tests {
 
     struct MockPlanner {
         queue: Vec<MockResponse>,
-        /// Counts plan() invocations so tests can assert how many turns ran.
         calls: std::cell::Cell<usize>,
     }
 
@@ -1582,8 +1256,9 @@ mod tests {
             _tool_infos: &[ToolInfo],
             _state: &agent_runtime::AgentLoopState,
             _memory: &agent_runtime::PlannerMemoryContext,
-            _spinner: &agent_core::tui::Spinner,
-        ) -> Result<(agent_runtime::PlannedAction, usize), agent_runtime::RuntimeError> {
+            _on_progress: &mut dyn FnMut(crate::commands::run_planners::ProgressEvent),
+        ) -> Result<crate::commands::run_planners::PlanOutput, agent_runtime::RuntimeError> {
+            use crate::commands::run_planners::PlanOutput;
             let idx = self.calls.get();
             self.calls.set(idx + 1);
             if idx >= self.queue.len() {
@@ -1595,7 +1270,11 @@ mod tests {
                 &mut self.queue[idx],
                 MockResponse::FatalErr("(consumed)".into()),
             ) {
-                MockResponse::Action(a) => Ok((a, 0)),
+                MockResponse::Action(a) => Ok(PlanOutput {
+                    action: a,
+                    response_chars: 0,
+                    prompt_chars: 0,
+                }),
                 MockResponse::TransientErr(msg) => {
                     Err(agent_runtime::RuntimeError::Planner(msg))
                 }
@@ -1604,9 +1283,6 @@ mod tests {
         }
     }
 
-    /// Builds the bag of context refs that `drive_planner_loop` needs but
-    /// the test doesn't care about — `Cell`s, `RefCell`, spinner, etc.
-    /// Constructed fresh per test so state doesn't bleed between cases.
     struct LoopFixture {
         spinner: agent_core::tui::Spinner,
         active_turn: Cell<usize>,
@@ -1618,8 +1294,7 @@ mod tests {
     impl LoopFixture {
         fn new() -> Self {
             Self {
-                // In test runs stderr isn't a terminal, so Spinner::start
-                // returns a no-op instance — no background thread, no I/O.
+                // Spinner is a no-op when stderr isn't a terminal.
                 spinner: agent_core::tui::Spinner::start("test"),
                 active_turn: Cell::new(1),
                 turn_timings: RefCell::new(Vec::new()),
@@ -1718,17 +1393,14 @@ mod tests {
 
     #[test]
     fn loop_aborts_after_n_consecutive_tool_failures() {
-        // Five consecutive Tool calls, all returning failure → after the
-        // 5th failure the failure_streak counter trips at the top of the
-        // *next* (6th) turn and we exit with PlannerFatal. The 6th planner
-        // call never happens.
+        // The 6th planner call never happens — the streak check fires at
+        // the top of turn 6 and exits with PlannerFatal.
         let mut planner = MockPlanner::new(vec![
             MockResponse::Action(tool_call("write_file")),
             MockResponse::Action(tool_call("write_file")),
             MockResponse::Action(tool_call("write_file")),
             MockResponse::Action(tool_call("write_file")),
             MockResponse::Action(tool_call("write_file")),
-            // 6th never reached — the abort fires before this.
             MockResponse::Action(finish("should not be called")),
         ]);
         let fx = LoopFixture::new();
@@ -1745,8 +1417,6 @@ mod tests {
             &fx.retries,
             || agent_runtime::PlannerMemoryContext::new(String::new()),
             |call| {
-                // Drive the tool closure outside drive_planner_loop too —
-                // bump failure_streak here just like run_goal does.
                 let result = err_tool_result(&call.name);
                 if result.ok {
                     fx.failure_streak.set(0);
@@ -1766,6 +1436,54 @@ mod tests {
         );
         assert_eq!(planner.call_count(), 5, "6th plan() should not run");
         assert_eq!(fx.failure_streak.get(), 5);
+    }
+
+    #[test]
+    fn cache_hits_do_not_reset_failure_streak() {
+        // Regression: cache hits must NOT zero failure_streak. Otherwise
+        // a "fail, fail, fail, recheck-cached, fail" loop never trips
+        // the consecutive-failure abort. Replicates run_goal's exec_tool
+        // shape since drive_planner_loop doesn't own the cache.
+        use std::collections::HashMap;
+        let cache: RefCell<HashMap<String, ToolResult>> = RefCell::new(HashMap::new());
+        let cached_call = ToolCall::new("read_file", serde_json::json!({"path": "Cargo.toml"}));
+        let cached_result = ok_tool_result(&cached_call.name);
+        cache
+            .borrow_mut()
+            .insert("read_file:Cargo.toml".to_string(), cached_result.clone());
+
+        let failure_streak: Cell<usize> = Cell::new(0);
+
+        let exec_tool = |call: &ToolCall| -> ToolResult {
+            if call.name == "read_file"
+                && let Some(cached) = cache.borrow().get("read_file:Cargo.toml").cloned()
+            {
+                return cached;
+            }
+            let result = err_tool_result(&call.name);
+            if result.ok {
+                failure_streak.set(0);
+            } else {
+                failure_streak.set(failure_streak.get() + 1);
+            }
+            result
+        };
+
+        // 6 fresh failures + 2 cache hits → streak must reach 6.
+        let _ = exec_tool(&ToolCall::new("write_file", serde_json::json!({})));
+        let _ = exec_tool(&ToolCall::new("write_file", serde_json::json!({})));
+        let _ = exec_tool(&cached_call);
+        let _ = exec_tool(&ToolCall::new("write_file", serde_json::json!({})));
+        let _ = exec_tool(&cached_call);
+        let _ = exec_tool(&ToolCall::new("write_file", serde_json::json!({})));
+        let _ = exec_tool(&ToolCall::new("write_file", serde_json::json!({})));
+        let _ = exec_tool(&ToolCall::new("write_file", serde_json::json!({})));
+
+        assert_eq!(
+            failure_streak.get(),
+            6,
+            "cache hits should NOT reset failure_streak"
+        );
     }
 
     #[test]
@@ -1790,16 +1508,12 @@ mod tests {
         )
         .expect_err("PlannerFatal should bubble out, not retry");
         assert!(matches!(err, agent_runtime::RuntimeError::PlannerFatal(_)));
-        // Only one plan() call — no retry.
         assert_eq!(planner.call_count(), 1);
     }
 
     #[test]
     fn loop_retries_transient_planner_errors_then_succeeds() {
-        // First plan() returns transient → runtime retries. Second plan()
-        // is the retry attempt, which returns Finish. Loop completes in
-        // 1 logical turn (the retry doesn't consume a turn-number, it's
-        // an inner retry loop).
+        // Transient → runtime's inner retry. Retry doesn't consume a turn.
         let mut planner = MockPlanner::new(vec![
             MockResponse::TransientErr("network blip".into()),
             MockResponse::Action(finish("recovered")),
@@ -1822,24 +1536,17 @@ mod tests {
         .expect("loop should recover from transient error");
         assert!(matches!(result.status, agent_runtime::AgentLoopStatus::Finished));
         assert_eq!(result.summary, "recovered");
-        // Two plan() calls: the failing one + the retry that returned finish.
         assert_eq!(planner.call_count(), 2);
-        // But only one logical turn was used (retry is inside turn 1).
         assert_eq!(result.turns, 1);
     }
 
     #[test]
     fn tool_success_resets_failure_streak() {
-        // Sequence: fail, fail, success, fail, fail, fail, fail, fail.
-        // The success in turn 3 resets streak to 0, so by turn 8 we've
-        // accumulated 5 fresh failures and abort. If the streak weren't
-        // reset, we'd abort after turn 5 instead.
+        // fail*2, success, fail*5: streak resets at turn 3, aborts at turn 8.
         let mut planner = MockPlanner::new(
             (0..10).map(|_| MockResponse::Action(tool_call("x"))).collect(),
         );
         let fx = LoopFixture::new();
-        // Pre-seed the tool closure with a counter that fails 1+2 turns,
-        // succeeds turn 3, then fails 4-8.
         let turn_counter = Cell::new(0_usize);
         let err = drive_planner_loop(
             &mut planner,
@@ -1856,7 +1563,6 @@ mod tests {
             |call| {
                 turn_counter.set(turn_counter.get() + 1);
                 let n = turn_counter.get();
-                // Turn 3 succeeds; everything else fails.
                 let result = if n == 3 {
                     ok_tool_result(&call.name)
                 } else {
@@ -1872,92 +1578,13 @@ mod tests {
         )
         .expect_err("expected abort after 5 streak post-reset");
         assert!(matches!(err, agent_runtime::RuntimeError::PlannerFatal(_)));
-        // Tool ran on turns 1-8 (8 calls): 1+2 fail, 3 succeeds (streak=0),
-        // 4-8 fail (streak=5). Abort check fires at top of turn 9, which
-        // means plan() ran 8 times (one per tool call invocation).
         assert_eq!(turn_counter.get(), 8);
     }
 
-    // --- RF26-1 draft_already_conforms ----------------------------------
-
-    fn conforming_draft() -> &'static str {
-        "Bottom line: this project ships a tiny self-bootstrapping agent kernel.\n\n\
-         Evidence:\n\
-         - [via read_files] Cargo.toml:2-15 lists 12 workspace crates.\n\
-         - [via read_files] main.rs:24 defines DEFAULT_MAX_TURNS = 24.\n\n\
-         Counter-intuitive / risk:\n\
-         - agent-cli has grown thick — orchestration logic accumulates here.\n\n\
-         Action items:\n\
-         1. Extract DEFAULT_MAX_TURNS into RunPolicy.\n\
-         2. Move codex prompt routing into a tested module."
-    }
-
-    #[test]
-    fn draft_conforms_when_all_sections_and_citation_present() {
-        assert!(draft_already_conforms(conforming_draft()));
-    }
-
-    #[test]
-    fn draft_does_not_conform_when_too_short() {
-        // Same shape, but under the 200-char threshold — that filters out
-        // header-only stubs that happen to mention all four labels.
-        let short = "Bottom line: x. Evidence: y. Counter-intuitive: z. Action items: w. [via t]";
-        assert!(short.len() < 200);
-        assert!(!draft_already_conforms(short));
-    }
-
-    #[test]
-    fn draft_does_not_conform_without_via_citation() {
-        // Replace the citations with un-citation-flavored text so [via …]
-        // is absent. Synthesis should still run to enforce the rule.
-        let noisy = "Bottom line: a project description.\n\n\
-                     Evidence:\n\
-                     - One thing about the repo.\n\
-                     - Another thing about the repo.\n\n\
-                     Counter-intuitive / risk:\n\
-                     - Nothing surprising.\n\n\
-                     Action items:\n\
-                     1. Do a thing.\n\
-                     2. Do another thing.\n\
-                     3. And a third for length padding to clear the 200-char threshold.";
-        assert!(noisy.len() >= 200);
-        assert!(!draft_already_conforms(noisy));
-    }
-
-    #[test]
-    fn draft_does_not_conform_when_missing_section() {
-        let mut text = conforming_draft().to_string();
-        text = text.replace("Counter-intuitive / risk", "Random heading");
-        assert!(!draft_already_conforms(&text));
-    }
-
-    #[test]
-    fn draft_does_not_conform_with_banned_opener() {
-        // Schema explicitly forbids these openers. If the draft uses one,
-        // synthesis would rewrite — so we should run it.
-        let banned = format!("整体来看 this project is fine. {}", conforming_draft());
-        assert!(!draft_already_conforms(&banned));
-        let banned2 = format!("Overall, the design is clean. {}", conforming_draft());
-        assert!(!draft_already_conforms(&banned2));
-    }
-
-    // --- RF26-2 auto-effort heuristic ----------------------------------
-
-    // The auto-effort logic lives inline inside `run_goal` and can't be
-    // unit-tested directly without spinning up the whole runtime. We cover
-    // the underlying classifier (`is_read_only_analysis_goal`) in
-    // agent-runtime's own test suite (lib.rs:1921+), and verify the
-    // selection rule itself here with a tiny mirror function so we catch
-    // regressions to the override logic without coupling to run_goal.
-
-    /// Mirror of the RF26-2 / RF27 rule used inside `run_goal`. Kept in
-    /// sync by review (it's three lines). If this diverges, the inline
+    /// Mirror of the auto-effort rule inside `run_goal` — the inline
     /// call site is the source of truth.
     fn auto_effort_mirror(user_set: Option<String>, goal: &str) -> Option<String> {
         user_set.or_else(|| {
-            // We compose against the same resolution chain: classify(goal)
-            // then check ReadOnly. Tests below pass `Auto`-shaped inputs
-            // so this matches `--mode auto` behavior.
             if matches!(
                 agent_runtime::classify_run_mode(goal),
                 agent_core::RunMode::ReadOnly
@@ -1971,12 +1598,10 @@ mod tests {
 
     #[test]
     fn auto_effort_user_set_always_wins() {
-        // Even if goal is read-only, user-set effort is preserved.
         assert_eq!(
             auto_effort_mirror(Some("high".to_string()), "分析当前的项目"),
             Some("high".to_string())
         );
-        // And for implementation goals.
         assert_eq!(
             auto_effort_mirror(Some("minimal".to_string()), "implement feature X"),
             Some("minimal".to_string())

@@ -278,7 +278,7 @@ pub fn fetch_memory(
 }
 
 pub fn planner_memory_context(paths: &MemoryPaths) -> MemoryResult<String> {
-    // RF33-1: process-global cache keyed on (memory_dir + mtime fingerprint).
+    // process-global cache keyed on (memory_dir + mtime fingerprint).
     // A REPL chain of read-only goals reuses the cached string when none of
     // the inputs (meta_rules, l1_insight, global_facts, index, skills dir)
     // have changed. Cache miss falls through to the full rebuild below.
@@ -661,7 +661,7 @@ pub struct SessionArchiveRecord {
     pub finished_at: DateTime<Utc>,
 }
 
-/// RF29-2: FIFO cap on `session_archive.jsonl`. Each successful read-only
+/// FIFO cap on `session_archive.jsonl`. Each successful read-only
 /// run appends one record (see agent-cli/commands/run.rs build_session_archive_record),
 /// so without rotation this file grows monotonically. At ~1KB/record it
 /// takes thousands of runs before this matters, but the cost of capping
@@ -694,7 +694,7 @@ pub fn append_session_archive_record(
     use std::io::Write;
     writeln!(file, "{line}").context("write session archive line")?;
     drop(file);
-    // RF29-2: enforce FIFO cap. We do this AFTER appending so the failure
+    // enforce FIFO cap. We do this AFTER appending so the failure
     // mode (cap-enforcement IO error) doesn't lose the freshly-recorded
     // session — the worst case is we have N+M lines for one run instead
     // of the strict cap.
@@ -1060,7 +1060,7 @@ mod tests {
         std::env::temp_dir().join(format!("seed-memory-test-{nanos}"))
     }
 
-    // --- RF29-2 session archive rotation ---------------------------------
+    // --- session archive rotation ---------------------------------
 
     fn write_lines(path: &Path, lines: &[&str]) {
         let body = lines
@@ -1120,7 +1120,7 @@ mod tests {
         enforce_session_archive_cap(&root.join("nope.jsonl"), 10).unwrap();
     }
 
-    // --- RF33-1 planner memory cache ------------------------------------
+    // --- planner memory cache ------------------------------------
 
     #[test]
     fn planner_memory_context_caches_within_invocation_window() {

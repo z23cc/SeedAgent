@@ -94,7 +94,7 @@ pub fn write_subagent_signals(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SpawnSubagentArgs {
     pub task: String,
     #[serde(default)]
@@ -121,9 +121,9 @@ impl Tool for SpawnSubagentTool {
         "spawn_subagent"
     }
 
-    fn description(&self) -> &'static str {
-        "Delegate an isolated sub-task to a child `seed` process. By default the child runs in its OWN cwd (subagent/<uuid>/) with its own memory/skills/sessions so writes never race with the parent's L4 archive. Pass inherit_memory=true ONLY when the sub-task explicitly needs to read or extend the parent's memory/skill tree. Args: task (string), context_files (optional list of absolute paths to read first), max_turns (default 8), timeout_secs (default 600), provider, model, inherit_memory (default false). Returns the child's final answer plus session_path and subagent_root."
-    }
+    crate::tool_description!("spawn_subagent");
+
+    crate::impl_args_schema!(SpawnSubagentArgs);
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
             let args: SpawnSubagentArgs = crate::parse_tool_args(call)?;
@@ -321,7 +321,7 @@ pub(crate) fn spawn_one_subagent(
     })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SpawnSubagentMapArgs {
     pub tasks: Vec<SpawnSubagentArgs>,
     #[serde(default)]
@@ -335,9 +335,9 @@ impl Tool for SpawnSubagentMapTool {
         "spawn_subagent_map"
     }
 
-    fn description(&self) -> &'static str {
-        "Fan out N independent sub-tasks to parallel child seed processes (each isolated by default). Use when several tasks operate on disjoint inputs and produce independent outputs. Args: tasks (array of spawn_subagent argument objects), max_parallel (default 4, capped at 8). Returns an array of per-task outcomes with status/answer/session_path/elapsed_secs. Sequential `spawn_subagent` is simpler when tasks share state or depend on each other."
-    }
+    crate::tool_description!("spawn_subagent_map");
+
+    crate::impl_args_schema!(SpawnSubagentMapArgs);
 
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
             let args: SpawnSubagentMapArgs = crate::parse_tool_args(call)?;
@@ -412,7 +412,7 @@ impl Tool for SpawnSubagentMapTool {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SubagentNudgeArgs {
     #[serde(alias = "watch_dir", alias = "dir", alias = "subagent_root")]
     pub target: PathBuf,
@@ -431,9 +431,9 @@ impl Tool for SubagentNudgeTool {
         "subagent_nudge"
     }
 
-    fn description(&self) -> &'static str {
-        "Send a non-blocking signal to a running subagent so the parent can steer it without killing the run. Args: target (subagent_root path returned by spawn_subagent), key_info (text appended to the child's working memory at its next turn), intervene (one-shot system message prepended to the child's next prompt), stop (bool — child finishes at end of its current turn). At least one of key_info/intervene/stop must be set."
-    }
+    crate::tool_description!("subagent_nudge");
+
+    crate::impl_args_schema!(SubagentNudgeArgs);
 
     fn execute(&self, _ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError> {
             let args: SubagentNudgeArgs = crate::parse_tool_args(call)?;

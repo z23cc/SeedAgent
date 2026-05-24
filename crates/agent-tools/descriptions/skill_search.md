@@ -1,0 +1,1 @@
+Search local skill metadata by name, description, and tags.

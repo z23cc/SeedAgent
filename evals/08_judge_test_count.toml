@@ -1,0 +1,23 @@
+# Workflow task: requires planner to choose between asking shell vs
+# reading code. Tests "did it use run_shell with cargo test --list"
+# vs naive "count #[test] across all files".
+
+name = "judge_test_count"
+goal = "How many `#[test]` functions does this workspace have? Give the exact number plus the command you used to find it."
+mode = "read"
+max_turns = 4
+
+[grade]
+kind = "judge"
+rubric = '''
+PASS criteria:
+- Provides a specific number (the actual count is ~370, accept anything 200-500 since the count fluctuates per RF).
+- Names the command/method used (e.g. `cargo test --list`, `rg "#\[test\]"`, or similar).
+- The named command is plausibly correct (would actually count tests).
+
+FAIL if:
+- No number given.
+- Number is wildly off (e.g. <10 or >5000).
+- Says "I cannot determine" — the answer is obtainable in 1 shell call.
+- Names a command that wouldn't actually count tests (e.g. "wc -l").
+'''

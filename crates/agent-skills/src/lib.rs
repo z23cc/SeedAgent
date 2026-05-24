@@ -46,7 +46,7 @@ pub struct SkillInfo {
     pub blast_radius: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repoprompt: Option<RepoPromptBinding>,
-    /// RF37: per-skill tool catalog narrowing, borrowed from jcode skill
+    /// per-skill tool catalog narrowing, borrowed from jcode skill
     /// frontmatter's `allowed-tools:` field. When non-empty, fetching this
     /// skill activates a process-level allowlist that the planner-loop
     /// intersects with its existing tool catalog. Empty = no restriction
@@ -75,9 +75,9 @@ pub struct RepoPromptBinding {
     pub oracle_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_name: Option<String>,
-    /// RF33-2 opt-in: when true, skill_fetch makes the binding STICKY by
+    /// opt-in: when true, skill_fetch makes the binding STICKY by
     /// also queuing a workspace.cwd change (caught by run_goal between
-    /// turns). Default false preserves the transient behavior (RF24-4) —
+    /// turns). Default false preserves the transient behavior —
     /// the binding affects only the very next rp call, then cwd snaps
     /// back to user's. Set this in skill frontmatter only when the skill
     /// is genuinely a "work in /other-repo for this whole task" recipe.
@@ -363,14 +363,9 @@ pub fn reflect_markdown(records: &[SessionRecord]) -> String {
     )
 }
 
-pub fn create_skill(
-    skills_dir: impl AsRef<Path>,
-    name: &str,
-    records: &[SessionRecord],
-) -> SkillResult<PathBuf> {
-    create_skill_with_binding(skills_dir, name, records, None)
-}
-
+// `create_skill` (no-binding variant) deleted — 0 external
+// callers, internal callers migrated. Use `create_skill_with_binding`
+// with `None` when no binding is needed.
 pub fn create_skill_with_binding(
     skills_dir: impl AsRef<Path>,
     name: &str,
@@ -428,14 +423,8 @@ fn render_binding_frontmatter(name: &str, binding: Option<&RepoPromptBinding>) -
     out
 }
 
-pub fn consolidate_skill(
-    skills_dir: impl AsRef<Path>,
-    name_hint: &str,
-    records: &[SessionRecord],
-) -> SkillResult<SkillConsolidation> {
-    consolidate_skill_with_binding(skills_dir, name_hint, records, None)
-}
-
+// `consolidate_skill` (no-binding variant) deleted —
+// 0 external callers. Use `consolidate_skill_with_binding(.., None)`.
 pub fn consolidate_skill_with_binding(
     skills_dir: impl AsRef<Path>,
     name_hint: &str,
@@ -735,7 +724,7 @@ fn skill_info_from_body(skills_dir: &Path, path: PathBuf, body: &str) -> SkillIn
     let blast_radius =
         front_matter.and_then(|front_matter| front_matter_value(front_matter, "blast_radius"));
     let repoprompt = front_matter.and_then(parse_repoprompt_binding);
-    // RF37: accept either jcode's `allowed-tools:` (kebab) or
+    // accept either jcode's `allowed-tools:` (kebab) or
     // `allowed_tools:` (snake) for compatibility — both round-trip
     // through serde via the alias.
     let allowed_tools = front_matter
@@ -799,8 +788,8 @@ fn parse_repoprompt_binding(front_matter: &str) -> Option<RepoPromptBinding> {
     let context_id = front_matter_value(front_matter, "repoprompt_context_id");
     let oracle_mode = front_matter_value(front_matter, "repoprompt_oracle_mode");
     let workspace_name = front_matter_value(front_matter, "repoprompt_workspace_name");
-    // RF33-2: parse opt-in `repoprompt_sticky_cwd: true|false`. Missing
-    // or non-bool defaults to false → transient (RF24-4) behavior.
+    // parse opt-in `repoprompt_sticky_cwd: true|false`. Missing
+    // or non-bool defaults to false → transient behavior.
     let sticky_cwd = front_matter_value(front_matter, "repoprompt_sticky_cwd")
         .as_deref()
         .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
@@ -1354,7 +1343,7 @@ mod tests {
         .unwrap();
 
         let records = learning_records("Run a shell workflow check", "run_shell");
-        let result = consolidate_skill(&root, "new-shell-workflow", &records).unwrap();
+        let result = consolidate_skill_with_binding(&root, "new-shell-workflow", &records, None).unwrap();
         let body = fs::read_to_string(root.join("shell-workflow").join("SKILL.md")).unwrap();
 
         assert_eq!(result.decision, SkillConsolidationDecision::Updated);
@@ -1373,7 +1362,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let records = learning_records("Analyze a memory index", "memory_search");
-        let result = consolidate_skill(&root, "memory-index-analysis", &records).unwrap();
+        let result = consolidate_skill_with_binding(&root, "memory-index-analysis", &records, None).unwrap();
 
         assert_eq!(result.decision, SkillConsolidationDecision::Created);
         assert!(result.path.is_file());

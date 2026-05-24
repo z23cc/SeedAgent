@@ -486,7 +486,7 @@ impl ProviderClient {
         }
     }
 
-    /// RF32: streaming variant of `chat`. Posts with `stream: true`, parses
+    /// streaming variant of `chat`. Posts with `stream: true`, parses
     /// the SSE event stream incrementally, calls `on_delta` for each text
     /// chunk, and returns the accumulated `ChatResponse` at end.
     ///
@@ -942,7 +942,7 @@ mod tests {
         assert_eq!(rendered, "https://example.test/v1/responses");
     }
 
-    // --- RF32 SSE event parser ------------------------------------------
+    // --- SSE event parser ------------------------------------------
 
     #[test]
     fn decode_sse_extracts_text_delta() {

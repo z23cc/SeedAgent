@@ -1,0 +1,1 @@
+Record a RepoPrompt/context/verification artifact path in the plan orchestration ledger. Args JSON: {"id":"plan-...","kind":"repoprompt_export","path":"/abs/file.md","note":"optional"}. Alias plan_id is accepted.

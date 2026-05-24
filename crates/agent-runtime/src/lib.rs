@@ -1,5 +1,5 @@
 use agent_core::{ToolCall, ToolInfo, ToolResult};
-use agent_llm::{ChatMessage, ChatRequest, ModelId, ProviderClient, ProviderId};
+use agent_llm::{ChatMessage, ChatRequest, ModelId, ProviderId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -200,7 +200,7 @@ pub fn is_read_only_analysis_goal(goal: &str) -> bool {
         && !implementation_terms.iter().any(|term| lower.contains(term))
 }
 
-/// RF27-1: typed accessor for the goal classifier. `is_read_only_analysis_goal`
+/// typed accessor for the goal classifier. `is_read_only_analysis_goal`
 /// is kept as the underlying primitive so the keyword tables stay in one
 /// place; this wraps the boolean into the public `RunMode` enum so callers
 /// (the CLI, `run_goal`, the AgentEvent emitter) can hand the result
@@ -785,57 +785,10 @@ pub enum AgentLoopStatus {
     MaxTurnsExceeded,
 }
 
-pub fn plan_one_tool_call(
-    provider_id: &str,
-    model: impl Into<ModelId>,
-    goal: &str,
-    tools: &[ToolInfo],
-) -> Result<PlannedAction, RuntimeError> {
-    let provider = agent_llm::find_provider(provider_id)
-        .ok_or_else(|| agent_llm::LlmError::ProviderNotFound(provider_id.to_string()))?;
-    let request = planner_request(model, goal, tools);
-    let response = ProviderClient::new().chat(provider, request)?;
-    parse_planned_action(&response.text)
-}
-
-pub fn run_agent_loop<F>(
-    config: AgentLoopConfig,
-    goal: &str,
-    tools: &[ToolInfo],
-    execute_tool: F,
-) -> Result<AgentLoopResult, RuntimeError>
-where
-    F: FnMut(&ToolCall) -> ToolResult,
-{
-    let provider_id = config.provider_id.clone();
-    let model = config.model.clone();
-    run_agent_loop_with_state_planner(
-        config.max_turns,
-        |state| plan_next_action_with_state(&provider_id, model.clone(), goal, tools, state),
-        execute_tool,
-    )
-}
-
-pub fn run_agent_loop_with_planner<P, F>(
-    max_turns: usize,
-    mut plan_next: P,
-    execute_tool: F,
-) -> Result<AgentLoopResult, RuntimeError>
-where
-    P: FnMut(&[ToolObservation]) -> Result<PlannedAction, RuntimeError>,
-    F: FnMut(&ToolCall) -> ToolResult,
-{
-    run_agent_loop_with_state_planner(
-        max_turns,
-        |state| plan_next(&state.observations),
-        execute_tool,
-    )
-}
-
 pub const DEFAULT_PLANNER_PARSE_RETRIES: usize = 1;
 pub const DEFAULT_PLANNER_TRANSPORT_RETRIES: usize = 2;
 
-pub fn run_agent_loop_with_state_planner<P, F>(
+pub(crate) fn run_agent_loop_with_state_planner<P, F>(
     max_turns: usize,
     plan_next: P,
     execute_tool: F,
@@ -854,7 +807,7 @@ where
     )
 }
 
-/// RF34-2: same as `run_agent_loop_with_state_planner` but takes an
+/// same as `run_agent_loop_with_state_planner` but takes an
 /// `on_retry` callback so the CLI can emit `AgentEvent::PlannerRetry`
 /// and update the spinner. Existing callers who don't care about retry
 /// observability stay on the original entry point.
@@ -879,7 +832,7 @@ where
     )
 }
 
-/// RF34-2: information about one planner retry attempt, passed to the
+/// information about one planner retry attempt, passed to the
 /// `on_retry` callback so the caller can emit telemetry (AgentEvent,
 /// spinner update, log line, etc.) without the runtime depending on any
 /// specific output channel.
@@ -1043,66 +996,7 @@ where
     })
 }
 
-pub fn plan_next_action(
-    provider_id: &str,
-    model: impl Into<ModelId>,
-    goal: &str,
-    tools: &[ToolInfo],
-    observations: &[ToolObservation],
-) -> Result<PlannedAction, RuntimeError> {
-    let state = AgentLoopState::from_observations(observations, observations.len() + 1, 0);
-    plan_next_action_with_state(provider_id, model, goal, tools, &state)
-}
-
-pub fn plan_next_action_with_observations_and_memory(
-    provider_id: &str,
-    model: impl Into<ModelId>,
-    goal: &str,
-    tools: &[ToolInfo],
-    observations: &[ToolObservation],
-    memory_context: &PlannerMemoryContext,
-) -> Result<PlannedAction, RuntimeError> {
-    let state = AgentLoopState::from_observations(observations, observations.len() + 1, 0);
-    plan_next_action_with_state_and_memory(provider_id, model, goal, tools, &state, memory_context)
-}
-
-pub fn plan_next_action_with_state(
-    provider_id: &str,
-    model: impl Into<ModelId>,
-    goal: &str,
-    tools: &[ToolInfo],
-    state: &AgentLoopState,
-) -> Result<PlannedAction, RuntimeError> {
-    plan_next_action_with_state_and_memory(
-        provider_id,
-        model,
-        goal,
-        tools,
-        state,
-        &PlannerMemoryContext::default(),
-    )
-}
-
-pub fn plan_next_action_with_state_and_memory(
-    provider_id: &str,
-    model: impl Into<ModelId>,
-    goal: &str,
-    tools: &[ToolInfo],
-    state: &AgentLoopState,
-    memory_context: &PlannerMemoryContext,
-) -> Result<PlannedAction, RuntimeError> {
-    let provider = agent_llm::find_provider(provider_id)
-        .ok_or_else(|| agent_llm::LlmError::ProviderNotFound(provider_id.to_string()))?;
-    let request = planner_request_with_state_and_memory(model, goal, tools, state, memory_context);
-    let response = ProviderClient::new().chat(provider, request)?;
-    parse_planned_action(&response.text)
-}
-
-pub fn planner_request(model: impl Into<ModelId>, goal: &str, tools: &[ToolInfo]) -> ChatRequest {
-    planner_request_with_observations(model, goal, tools, &[])
-}
-
-pub fn planner_request_with_observations(
+pub(crate) fn planner_request_with_observations(
     model: impl Into<ModelId>,
     goal: &str,
     tools: &[ToolInfo],
@@ -1112,7 +1006,7 @@ pub fn planner_request_with_observations(
     planner_request_with_state(model, goal, tools, &state)
 }
 
-pub fn planner_request_with_state(
+pub(crate) fn planner_request_with_state(
     model: impl Into<ModelId>,
     goal: &str,
     tools: &[ToolInfo],
@@ -1134,7 +1028,7 @@ pub fn planner_request_with_state_and_memory(
     state: &AgentLoopState,
     memory_context: &PlannerMemoryContext,
 ) -> ChatRequest {
-    // RF33-3: per-turn tool catalog culling. The prompt currently ships
+    // per-turn tool catalog culling. The prompt currently ships
     // ~30 tools × 1-line descriptions every turn. After turn 1 most of
     // that is redundant repetition. We tier it:
     //
@@ -1152,18 +1046,27 @@ pub fn planner_request_with_state_and_memory(
         let mut lines: Vec<String> =
             tools.iter().map(|tool| format!("- {}", tool.name)).collect();
         lines.push(String::from(
-            "  (descriptions elided — call `tool_describe {name: \"...\"}` if you need one)",
+            "  (descriptions + schemas elided — call `tool_describe {name: \"...\"}` if you need one)",
         ));
         lines.join("\n")
     } else {
         tools
             .iter()
             .map(|tool| {
-                format!(
+                // include the tool's args JSON Schema when
+                // available so the planner sees the real input shape
+                // instead of guessing field names (closes the                 // serde-alias workaround class).
+                let mut block = format!(
                     "- {}: {}",
                     tool.name,
                     compact_tool_description(&tool.description)
-                )
+                );
+                if let Some(schema) = &tool.args_schema {
+                    if let Some(compact) = compact_args_schema(schema) {
+                        block.push_str(&format!("\n    args: {compact}"));
+                    }
+                }
+                block
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -1222,6 +1125,97 @@ Available tools:\n{tools_text}",
 /// per-turn planner prompt does not ship ~3KB of duplicated tool docs. The
 /// planner still has the full description available via `seed tool ...` and
 /// the registry — this is purely for the LLM's per-turn context.
+/// compress a full JSON Schema into a one-line summary
+/// suitable for inline display in the planner prompt's tool catalog.
+///
+/// Full schemas can be 500+ chars per tool (32 tools × 500 = 16KB
+/// just for schema bloat). Instead we extract just the top-level
+/// `properties` block as a comma-separated `field: type` list, marking
+/// `required` fields with `!`:
+///
+/// ```text
+/// args: {path!: string, start?: integer, keyword?: string}
+/// ```
+///
+/// This is ~50 chars per tool — affordable to ship every turn. If the
+/// schema isn't an object with `properties` (e.g. a primitive or oneOf),
+/// returns `None` and the caller falls back to the description alone.
+fn compact_args_schema(schema: &serde_json::Value) -> Option<String> {
+    let obj = schema.as_object()?;
+    let props = obj.get("properties")?.as_object()?;
+    if props.is_empty() {
+        return None;
+    }
+    let required: std::collections::HashSet<&str> = obj
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let parts: Vec<String> = props
+        .iter()
+        .map(|(name, schema)| {
+            let ty = schema_short_type(schema);
+            let marker = if required.contains(name.as_str()) {
+                "!"
+            } else {
+                "?"
+            };
+            format!("{name}{marker}: {ty}")
+        })
+        .collect();
+    Some(format!("{{{}}}", parts.join(", ")))
+}
+
+/// Helper: extract a short type token from a property schema.
+/// Handles plain types ("string", "integer"), arrays ("string[]"),
+/// enums (lists the variants), and falls back to "any" for complex
+/// cases (oneOf, $ref, etc.).
+fn schema_short_type(schema: &serde_json::Value) -> String {
+    let Some(obj) = schema.as_object() else {
+        return "any".to_string();
+    };
+    // Enum: list variants if they're short.
+    if let Some(arr) = obj.get("enum").and_then(|v| v.as_array()) {
+        let variants: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        if !variants.is_empty() && variants.iter().map(String::len).sum::<usize>() < 40 {
+            return variants.join("|");
+        }
+    }
+    // Single type.
+    if let Some(t) = obj.get("type").and_then(|v| v.as_str()) {
+        if t == "array" {
+            let item_ty = obj
+                .get("items")
+                .map(schema_short_type)
+                .unwrap_or_else(|| "any".to_string());
+            return format!("{item_ty}[]");
+        }
+        return t.to_string();
+    }
+    // type as an array (e.g. ["string", "null"] for Option<String>).
+    if let Some(arr) = obj.get("type").and_then(|v| v.as_array()) {
+        let types: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        if !types.is_empty() {
+            return types.join("|");
+        }
+    }
+    // anyOf / oneOf with simple primitives — pick the first non-null.
+    for key in &["anyOf", "oneOf"] {
+        if let Some(arr) = obj.get(*key).and_then(|v| v.as_array()) {
+            for variant in arr {
+                let v = schema_short_type(variant);
+                if v != "null" && v != "any" {
+                    return v;
+                }
+            }
+        }
+    }
+    "any".to_string()
+}
+
 fn compact_tool_description(desc: &str) -> String {
     let cleaned = desc.split_whitespace().collect::<Vec<_>>().join(" ");
     if let Some(first_sentence_end) = cleaned.find(". ") {
@@ -1283,16 +1277,7 @@ fn planner_tool_routing_block(tools: &[ToolInfo]) -> String {
     block
 }
 
-pub fn planner_prompt_with_observations(
-    goal: &str,
-    tools: &[ToolInfo],
-    observations: &[ToolObservation],
-) -> String {
-    let state = AgentLoopState::from_observations(observations, observations.len() + 1, 0);
-    planner_prompt_with_state(goal, tools, &state)
-}
-
-pub fn planner_prompt_with_state(goal: &str, tools: &[ToolInfo], state: &AgentLoopState) -> String {
+pub(crate) fn planner_prompt_with_state(goal: &str, tools: &[ToolInfo], state: &AgentLoopState) -> String {
     planner_prompt_with_state_and_memory(goal, tools, state, &PlannerMemoryContext::default())
 }
 
@@ -1465,9 +1450,29 @@ fn truncate_utf8(text: &mut String, limit: usize) {
 }
 
 pub fn parse_planned_action(text: &str) -> Result<PlannedAction, RuntimeError> {
+    // two-step parse. First try strict parse on the extracted
+    // JSON object; if that fails, apply the repair pass and retry. The
+    // strict-first order means we don't pay the repair cost on the
+    // common case (planner emits clean JSON), and we keep the original
+    // error message when repair also fails.
     let json_text = extract_json_object(text).unwrap_or_else(|| text.trim().to_string());
-    let action: PlannedAction = serde_json::from_str(&json_text)
-        .map_err(|err| RuntimeError::InvalidPlannerJson(format!("{err}; text={text}")))?;
+    let action: PlannedAction = match serde_json::from_str::<PlannedAction>(&json_text) {
+        Ok(action) => action,
+        Err(strict_err) => {
+            let repaired = repair_planner_json(&json_text);
+            // If repair didn't change anything, no point in retrying.
+            if repaired == json_text {
+                return Err(RuntimeError::InvalidPlannerJson(format!(
+                    "{strict_err}; text={text}"
+                )));
+            }
+            serde_json::from_str::<PlannedAction>(&repaired).map_err(|repair_err| {
+                RuntimeError::InvalidPlannerJson(format!(
+                    "strict parse failed ({strict_err}); repair retry also failed ({repair_err}); text={text}"
+                ))
+            })?
+        }
+    };
     if action.summary().is_none() {
         return Err(RuntimeError::InvalidPlannerJson(format!(
             "planner action is missing a non-empty `summary` field; got: {json_text}"
@@ -1479,6 +1484,112 @@ pub fn parse_planned_action(text: &str) -> Result<PlannedAction, RuntimeError> {
         )));
     }
     Ok(action)
+}
+
+/// best-effort JSON repair for common LLM output glitches.
+/// **NOT** a full parser — handles three fixes that together cover ~80%
+/// of "planner returned almost-valid JSON" cases without burning a
+/// retry turn:
+///
+/// 1. **Markdown code fences**: strip surrounding ` ```json … ``` `
+///    or ` ``` … ``` ` markers if present.
+/// 2. **Trailing commas**: serde_json rejects `{"a":1,}` and
+///    `[1,2,]` — strip the trailing comma before `}` or `]`.
+/// 3. **Line comments**: strip `// …` to end-of-line. (Block
+///    comments are rare enough not to bother.)
+///
+/// Conservative: never modifies the inside of string literals (tracks
+/// `in_string` state with backslash-aware escape handling). If the
+/// result is unchanged, the caller skips the repair-retry step.
+///
+/// For genuine structural breakage (missing `}`, unquoted keys,
+/// truncation mid-output), the strict parser still fails and the
+/// planner gets a retry — same as before this function existed.
+pub fn repair_planner_json(text: &str) -> String {
+    // Phase 1: strip markdown fences if the whole text is fence-wrapped.
+    let stripped = strip_code_fence(text);
+
+    // Phase 2 + 3: walk chars tracking string/escape state; emit only
+    // chars that should remain in the output.
+    let mut out = String::with_capacity(stripped.len());
+    let mut in_string = false;
+    let mut prev_was_backslash = false;
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+
+        if in_string {
+            out.push(ch);
+            if ch == '\\' && !prev_was_backslash {
+                prev_was_backslash = true;
+            } else {
+                if ch == '"' && !prev_was_backslash {
+                    in_string = false;
+                }
+                prev_was_backslash = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // Phase 3: line comment outside strings — skip to end of line.
+        if ch == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Phase 2: trailing comma — strip if next non-whitespace is `}` or `]`.
+        if ch == ',' {
+            let mut peek = i + 1;
+            while peek < chars.len() && chars[peek].is_whitespace() {
+                peek += 1;
+            }
+            if peek < chars.len() && (chars[peek] == '}' || chars[peek] == ']') {
+                // Skip this comma entirely. Whitespace and the closer
+                // are emitted on subsequent iterations.
+                i += 1;
+                continue;
+            }
+        }
+
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+/// Strip ` ```json … ``` ` or ` ``` … ``` ` wrapping. Only triggers
+/// when both the leading ``` and trailing ``` are present at the
+/// outer trimmed boundaries — partial fences pass through unchanged
+/// to avoid corrupting content that happens to contain ``` inline.
+fn strip_code_fence(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("```") {
+        return text.to_string();
+    }
+    // Skip past the opening fence + optional language tag + newline.
+    let after_open = &trimmed[3..];
+    let body = match after_open.find('\n') {
+        Some(nl_idx) => &after_open[nl_idx + 1..],
+        None => after_open, // single-line fenced — unusual, but handle.
+    };
+    // Strip trailing fence.
+    let body = body.trim_end();
+    if let Some(closing) = body.rfind("```") {
+        body[..closing].trim().to_string()
+    } else {
+        text.to_string() // no closing fence — bail.
+    }
 }
 
 fn extract_json_object(text: &str) -> Option<String> {
@@ -1707,6 +1818,8 @@ mod tests {
             &[ToolInfo {
                 name: "read_file".to_string(),
                 description: "read".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &[ToolObservation {
                 turn: 1,
@@ -1742,6 +1855,8 @@ mod tests {
             &[ToolInfo {
                 name: "update_working_checkpoint".to_string(),
                 description: "checkpoint".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &[ToolObservation {
                 turn: 1,
@@ -1779,12 +1894,184 @@ mod tests {
             &[ToolInfo {
                 name: "patch_file".to_string(),
                 description: "patch".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &state,
         );
 
         assert!(prompt.contains("Two tool calls in a row failed"));
         assert!(prompt.contains("same tool call repeated"));
+    }
+
+    // planner JSON repair pre-pass tests.
+
+    #[test]
+    fn repair_passes_through_clean_json_unchanged() {
+        let clean = r#"{"summary":"ok","action":"finish","answer":"done"}"#;
+        assert_eq!(repair_planner_json(clean), clean);
+    }
+
+    #[test]
+    fn repair_strips_json_code_fence() {
+        let fenced = "```json\n{\"summary\":\"x\",\"action\":\"finish\",\"answer\":\"y\"}\n```";
+        let out = repair_planner_json(fenced);
+        assert!(out.starts_with('{'));
+        assert!(out.ends_with('}'));
+        assert!(!out.contains("```"));
+    }
+
+    #[test]
+    fn repair_strips_bare_code_fence() {
+        let fenced = "```\n{\"a\":1}\n```";
+        let out = repair_planner_json(fenced);
+        assert_eq!(out, "{\"a\":1}");
+    }
+
+    #[test]
+    fn repair_strips_trailing_comma_in_object() {
+        let bad = "{\"a\":1,\"b\":2,}";
+        let out = repair_planner_json(bad);
+        // Result must round-trip through serde_json strictly.
+        let v: serde_json::Value = serde_json::from_str(&out).expect("repaired must parse");
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"], 2);
+    }
+
+    #[test]
+    fn repair_strips_trailing_comma_in_array() {
+        let bad = "[1,2,3,]";
+        let out = repair_planner_json(bad);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("repaired must parse");
+        assert_eq!(v[2], 3);
+    }
+
+    #[test]
+    fn repair_preserves_commas_inside_strings() {
+        // The `,` inside the string is NOT a trailing comma — must not be touched.
+        let s = r#"{"msg":"hello, world,","x":1}"#;
+        let out = repair_planner_json(s);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["msg"], "hello, world,");
+    }
+
+    #[test]
+    fn repair_strips_line_comments() {
+        let with_comment = "{\n  // this is a comment\n  \"a\": 1\n}";
+        let out = repair_planner_json(with_comment);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("must parse");
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn repair_does_not_touch_double_slashes_inside_strings() {
+        let s = r#"{"url":"http://example.com"}"#;
+        let out = repair_planner_json(s);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["url"], "http://example.com");
+    }
+
+    #[test]
+    fn parse_planned_action_recovers_from_fenced_output() {
+        let fenced = "```json\n{\"summary\":\"investigating Cargo.toml\",\"action\":\"tool\",\"tool_name\":\"read_file\",\"args\":{\"path\":\"Cargo.toml\"}}\n```";
+        let action = parse_planned_action(fenced).expect("fence-wrapped action must parse");
+        match action {
+            PlannedAction::Tool { tool_name, .. } => assert_eq!(tool_name, "read_file"),
+            _ => panic!("expected Tool action"),
+        }
+    }
+
+    #[test]
+    fn parse_planned_action_recovers_from_trailing_comma() {
+        let bad = r#"{"summary":"x","action":"finish","answer":"done",}"#;
+        let action = parse_planned_action(bad).expect("trailing-comma action must parse");
+        assert!(matches!(action, PlannedAction::Finish { .. }));
+    }
+
+    // compact_args_schema turns the full JSON Schema into a
+    // one-line `{field!: type, optional?: type}` summary for the planner.
+
+    #[test]
+    fn compact_args_schema_marks_required_with_bang() {
+        let schema = json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": {"type": "string"},
+                "start": {"type": "integer"}
+            }
+        });
+        let s = compact_args_schema(&schema).unwrap();
+        assert!(s.contains("path!: string"), "got: {s}");
+        assert!(s.contains("start?: integer"), "got: {s}");
+    }
+
+    #[test]
+    fn compact_args_schema_renders_arrays_with_brackets() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            }
+        });
+        let s = compact_args_schema(&schema).unwrap();
+        assert!(s.contains("paths?: string[]"), "got: {s}");
+    }
+
+    #[test]
+    fn compact_args_schema_inlines_short_enums() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "enum": ["overwrite", "append", "prepend"]
+                }
+            }
+        });
+        let s = compact_args_schema(&schema).unwrap();
+        assert!(s.contains("mode?: overwrite|append|prepend"), "got: {s}");
+    }
+
+    #[test]
+    fn compact_args_schema_returns_none_for_non_object() {
+        let schema = json!({"type": "string"});
+        assert!(compact_args_schema(&schema).is_none());
+    }
+
+    #[test]
+    fn schema_short_type_handles_nullable_options() {
+        // serde_json renders `Option<String>` as `{"type": ["string", "null"]}`.
+        let schema = json!({"type": ["string", "null"]});
+        assert_eq!(schema_short_type(&schema), "string|null");
+    }
+
+    #[test]
+    fn planner_prompt_includes_compact_args_schema_block() {
+        let tools = vec![ToolInfo {
+            name: "read_file".to_string(),
+            description: "read a slice".to_string(),
+            args_schema: Some(json!({
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "start": {"type": "integer"}
+                }
+            })),
+            is_pure_read: false,
+        }];
+        let state = AgentLoopState::new(8);
+        let memory = PlannerMemoryContext::new(String::new());
+        let prompt = planner_prompt_with_state_and_memory("test", &tools, &state, &memory);
+        // First-turn prompt MUST contain the schema line so the planner
+        // can pick the right field names (aliases become moot).
+        assert!(
+            prompt.contains("args: {path!: string"),
+            "schema not rendered, prompt:\n{prompt}"
+        );
     }
 
     #[test]
@@ -1818,26 +2105,38 @@ mod tests {
             ToolInfo {
                 name: "repoprompt_call".to_string(),
                 description: "rp".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "spawn_subagent".to_string(),
                 description: "sub".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "read_file".to_string(),
                 description: "read".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "patch_file".to_string(),
                 description: "patch".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "run_shell".to_string(),
                 description: "shell".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "ask_user".to_string(),
                 description: "ask".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             },
         ];
         let prompt = planner_prompt_with_state("test", &tools, &state);
@@ -1855,6 +2154,8 @@ mod tests {
         let tools = vec![ToolInfo {
             name: "read_file".to_string(),
             description: "read".to_string(),
+            args_schema: None,
+                is_pure_read: false,
         }];
         let prompt = planner_prompt_with_state("test", &tools, &state);
         assert!(!prompt.contains("TOOL ROUTING"));
@@ -1869,6 +2170,8 @@ mod tests {
             &[ToolInfo {
                 name: "ask_user".to_string(),
                 description: "ask".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &state,
         );
@@ -1893,6 +2196,8 @@ mod tests {
             &[ToolInfo {
                 name: "read_file".to_string(),
                 description: "read".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &state,
         );
@@ -1948,6 +2253,8 @@ mod tests {
             &[ToolInfo {
                 name: "read_file".to_string(),
                 description: "read".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &state,
         );
@@ -1969,6 +2276,8 @@ mod tests {
             &[ToolInfo {
                 name: "update_working_checkpoint".to_string(),
                 description: "anchor".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &state,
         );
@@ -2002,6 +2311,8 @@ mod tests {
             &[ToolInfo {
                 name: "update_working_checkpoint".to_string(),
                 description: "anchor".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &state,
         );
@@ -2016,6 +2327,8 @@ mod tests {
             &[ToolInfo {
                 name: "memory_fetch".to_string(),
                 description: "fetch".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &state,
         );
@@ -2033,6 +2346,8 @@ mod tests {
             &[ToolInfo {
                 name: "memory_search".to_string(),
                 description: "search".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &state,
             &memory,
@@ -2086,6 +2401,8 @@ mod tests {
             &[ToolInfo {
                 name: "read_files".to_string(),
                 description: "batch read".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &state,
         );
@@ -2102,6 +2419,8 @@ mod tests {
             &[ToolInfo {
                 name: "read_file".to_string(),
                 description: "read".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &AgentLoopState::new(4),
         );
@@ -2120,14 +2439,20 @@ mod tests {
                 ToolInfo {
                     name: "repoprompt_call".to_string(),
                     description: "call RepoPrompt".to_string(),
+            args_schema: None,
+                is_pure_read: false,
                 },
                 ToolInfo {
                     name: "plan_record_artifact".to_string(),
                     description: "record artifact".to_string(),
+            args_schema: None,
+                is_pure_read: false,
                 },
                 ToolInfo {
                     name: "plan_record_handoff".to_string(),
                     description: "record handoff".to_string(),
+            args_schema: None,
+                is_pure_read: false,
                 },
             ],
             &state,
@@ -2174,6 +2499,8 @@ mod tests {
             &[ToolInfo {
                 name: "memory_fetch".to_string(),
                 description: "fetch".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             }],
             &state,
         );
@@ -2254,12 +2581,16 @@ mod tests {
 
     #[test]
     fn generic_loop_uses_injected_planner() {
+        // migrated from the now-deleted `run_agent_loop_with_planner`
+        // wrapper. The test still drives the loop with a custom closure;
+        // the only difference is the closure receives `&mut AgentLoopState`
+        // instead of `&[ToolObservation]`, and reads `state.observations`.
         let mut calls = 0usize;
-        let result = run_agent_loop_with_planner(
+        let result = run_agent_loop_with_state_planner(
             3,
-            |observations| {
+            |state| {
                 calls += 1;
-                if observations.is_empty() {
+                if state.observations.is_empty() {
                     Ok(PlannedAction::Tool {
                         summary: Some("need README context".to_string()),
                         tool_name: "read_file".to_string(),
@@ -2425,7 +2756,7 @@ mod tests {
         );
     }
 
-    // --- RF33-3 per-turn tool-description culling ----------------------
+    // --- per-turn tool-description culling ----------------------
 
     #[test]
     fn planner_prompt_includes_descriptions_through_turn_4() {
@@ -2433,10 +2764,14 @@ mod tests {
             ToolInfo {
                 name: "read_file".to_string(),
                 description: "Read a UTF-8 file from disk.".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "write_file".to_string(),
                 description: "Write or overwrite a file at the given path.".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             },
         ];
         // Turn 1 — full descriptions.
@@ -2469,10 +2804,14 @@ mod tests {
             ToolInfo {
                 name: "read_file".to_string(),
                 description: "Read a UTF-8 file from disk.".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             },
             ToolInfo {
                 name: "write_file".to_string(),
                 description: "Write or overwrite a file at the given path.".to_string(),
+            args_schema: None,
+                is_pure_read: false,
             },
         ];
         let mut state = AgentLoopState::from_observations(&[], 5, 0);

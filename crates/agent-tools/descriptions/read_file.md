@@ -1,0 +1,1 @@
+Read a bounded slice of a UTF-8 file, optionally around a keyword; args: path, optional start, count, keyword, show_line_numbers.

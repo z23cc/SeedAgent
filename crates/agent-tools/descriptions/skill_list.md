@@ -1,0 +1,1 @@
+List lightweight skill metadata without loading full skill bodies.

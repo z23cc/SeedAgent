@@ -1,0 +1,1 @@
+Call any wrapped RepoPrompt MCP tool by name with JSON args; workspace tools default to the current cwd when no routing is supplied.

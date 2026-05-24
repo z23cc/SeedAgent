@@ -1,0 +1,1 @@
+Start a GenericAgent-style long-term memory distillation pass after verified reusable evidence; args: reason, optional evidence.

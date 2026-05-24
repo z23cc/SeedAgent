@@ -1,0 +1,1 @@
+Read the current or selected plan state, checkbox items, and next unchecked item. Args JSON: {"id":"plan-..."}; alias plan_id is accepted; empty args read the active plan.

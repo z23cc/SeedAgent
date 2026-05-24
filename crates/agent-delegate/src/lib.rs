@@ -58,10 +58,10 @@ pub struct CodexAppServerConfig {
     pub approval_mode: ApprovalMode,
     pub mcp_policy: McpPolicy,
     pub plugins_enabled: bool,
-    /// RF33-4: when true, launch via `codex app-server proxy` (which
+    /// when true, launch via `codex app-server proxy` (which
     /// connects to the running `codex app-server daemon`) instead of
     /// spawning a fresh `codex app-server --listen stdio://`. Saves
-    /// startup across distinct `seed` invocations (RF25-1 already covers
+    /// startup across distinct `seed` invocations (already covers
     /// the within-REPL case). User must have started the daemon
     /// separately via `seed codex-daemon start` (or `codex app-server
     /// daemon start`).
@@ -98,7 +98,7 @@ impl Default for CodexAppServerConfig {
 }
 
 impl CodexAppServerConfig {
-    /// RF33-4: when daemon mode is enabled, the argv changes from
+    /// when daemon mode is enabled, the argv changes from
     /// `["codex", "app-server", "--listen", "stdio://"]` to
     /// `["codex", "app-server", "proxy"]`. The proxy subcommand connects
     /// stdin/stdout to a unix socket served by `codex app-server daemon`,
@@ -254,7 +254,7 @@ pub struct CodexRunResult {
     pub turn_id: String,
     pub text: String,
     pub events_seen: usize,
-    /// RF35-1: token usage for this turn, when Codex sent a
+    /// token usage for this turn, when Codex sent a
     /// `thread/tokenUsageUpdated` notification before `turn/completed`.
     /// `None` when Codex didn't emit one (older daemon, errored turn, …).
     pub tokens: Option<TokenUsage>,
@@ -390,7 +390,7 @@ pub struct CodexLaunchFingerprint {
     pub command: String,
     pub args: Vec<String>,
     pub experimental_api: bool,
-    /// RF33-4: daemon vs stdio mode is a launch-time decision (different
+    /// daemon vs stdio mode is a launch-time decision (different
     /// argv → different subprocess shape) so it splits the fingerprint.
     /// Flipping `--use-daemon` mid-REPL drops the cached client.
     pub use_daemon: bool,
@@ -571,7 +571,7 @@ impl CodexAppServerClient {
         let deadline = Instant::now() + Duration::from_secs(self.cfg.turn_timeout_secs);
         let mut text = String::new();
         let mut events_seen = 0usize;
-        // RF35-1: capture the most recent token-usage notification for
+        // capture the most recent token-usage notification for
         // this turn. Codex emits `thread/tokenUsageUpdated` one or more
         // times before `turn/completed`; the last one before completion
         // is the authoritative per-turn breakdown.
@@ -767,7 +767,7 @@ pub fn approval_response(method: &str, mode: ApprovalMode) -> Value {
     json!({ "response": "decline" })
 }
 
-/// RF35-1: extract a [`TokenUsage`] from a `thread/tokenUsageUpdated`
+/// extract a [`TokenUsage`] from a `thread/tokenUsageUpdated`
 /// notification's params. Per the schema:
 ///   `params.tokenUsage.last.{inputTokens, outputTokens, …}`
 ///
@@ -926,7 +926,7 @@ mod tests {
         assert!(message_mentions_turn(&params, "turn_1"));
     }
 
-    // --- RF35-1 token usage parsing -------------------------------------
+    // --- token usage parsing -------------------------------------
 
     #[test]
     fn parse_token_usage_extracts_full_breakdown() {
@@ -1066,7 +1066,7 @@ mod tests {
         );
     }
 
-    // --- RF33-4 daemon mode --------------------------------------------
+    // --- daemon mode --------------------------------------------
 
     #[test]
     fn daemon_mode_swaps_argv_to_proxy() {
@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn stdio_mode_still_adds_plugins_and_mcp_flags() {
-        // Default (use_daemon=false) must preserve pre-RF33-4 behavior.
+        // Default (use_daemon=false) must keep adding plugins + mcp flags.
         // Pass a discovered MCP server that's NOT in the Allow list so
         // mcp_servers_override has something to disable (returns Some).
         let cfg = CodexAppServerConfig::default();

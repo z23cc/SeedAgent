@@ -1,0 +1,13 @@
+# Multi-step: enumerate crates → count lines → identify max.
+# Tests: does the planner use read_files batch + walker?
+# Or N sequential reads (wasteful)?
+
+name = "largest_crate_loc"
+goal = "Which crate's `src/lib.rs` has the most lines in this workspace? Reply with the crate name (e.g. `agent-cli`)."
+mode = "read"
+max_turns = 6
+
+[grade]
+kind = "regex"
+# agent-runtime currently has 2813-line lib.rs — largest by far.
+pattern = '(?i)agent-runtime'

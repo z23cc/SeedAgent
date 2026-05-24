@@ -1,227 +1,241 @@
 # SeedAgent
 
-SeedAgent is a minimal Rust seed for a self-bootstrapping agent. The CLI is `seed`, and the
-internal core agent is `Seed`.
+A minimal Rust kernel for self-bootstrapping LLM agents. The binary
+is `seed`. The planner picks one typed tool per turn, records every
+side-effect into a JSONL session, and updates a structured memory
+tree on disk.
 
-The first version intentionally keeps the kernel small:
+The kernel deliberately stays small — capabilities ship as crates,
+not as kernel changes. Today's tool surface is ~32 typed tools
+(read/write/patch files, shell, plan state, skill discovery,
+RepoPrompt bridge, subagent spawning, memory protocol) across 12
+workspace crates.
 
-- typed tool calls
-- exact-match file patching
-- bounded file reads
-- shell execution with timeout
-- JSONL session traces
-- per-turn working summaries inspired by GenericAgent checkpoints
-- GenericAgent-style memory tools: `update_working_checkpoint`, `start_long_term_update`,
-  and `complete_long_term_update`
-- L0/L1/L2/L3/L4 memory skeleton with a pointer-only L1 insight file plus a JSON index
-- GenericAgent-style plan mode with durable `plan.md`, `state.json`, and verification gate
-- reflection into `SKILL.md` drafts
-- lightweight memory and skill search/fetch tools
-- ForgeCode-style LLM provider routing
-- first real LLM call path through OpenAI Responses
-- multi-turn LLM planner loop for choosing local tools
-- Codex app-server as the preferred execution backend
-- RepoPrompt skill routing for Codex delegate tasks, with searchable execution metadata
-
-The workspace is split so future features can grow without reshaping the core:
-
-```text
-crates/
-  agent-core      # tool protocol, events, registry
-  agent-llm       # provider ids, model ids, routes, request transforms
-  agent-memory    # L0-L4 memory layout, L1 insight/index, memory fetch/search
-  agent-plan      # durable plan.md/state.json state machine and verification context
-  agent-repoprompt # RepoPrompt CLI/MCP backend wrapper
-  agent-delegate  # external agent backends such as Codex app-server
-  agent-tools     # shell/read/write/patch/checkpoint tools
-  agent-session   # JSONL sessions and replay
-  agent-skills    # session reflection and skill draft creation
-  agent-cli       # clap command surface
-  agent-tui       # reserved for ratatui UI
-skills/           # generated skill drafts
-memory/           # meta rules, L1 insight/index, global facts, session archive
-sessions/         # JSONL execution traces
-```
-
-Try it after installing the local CLI:
+## Install
 
 ```bash
+# Build + install the `seed` binary
 cargo install --path crates/agent-cli --force
+
+# Verify
 seed doctor
-seed run "shell: pwd"
-seed reflect
-seed skill create --name first-shell
-seed skill list
-seed tool memory-search shell
-seed tool memory-fetch meta-rules
-seed tool skill-search shell
-seed tool update-working-checkpoint "Repo root verified at $PWD"
-seed tool start-long-term-update "verified reusable shell workflow" --evidence "run_shell exited 0"
-seed tool complete-long-term-update skip --reason "not durable" --evidence "one-off"
-seed run "Find a shell-related skill, fetch it, then summarize it." --llm --max-turns 4
-seed run "Find a shell-related skill, fetch it, then summarize it." --llm --learn --max-turns 4
-seed providers --provider opencode --model gpt-5.1-codex
-seed llm ask "Say pong." --model gpt-5.1 --max-output-tokens 64
-seed codex "Summarize this repo." --approval deny
-seed codex "Summarize without any MCP." --mcp none
-seed run "Summarize this repo." --codex
-seed skill search repoprompt
-seed rp status
-seed rp tools
-seed rp windows
-seed rp bind --create-if-missing
-seed rp call file_search --args '{"pattern":"TODO","max_results":5}'
-seed tool repoprompt-tools
-seed tool repoprompt-call bind_context --args '{"op":"list"}'
-seed plan create --title "Demo" --task "Implement demo" --step "Inspect context" --step "Run tests"
+```
+
+Toolchain is pinned in `rust-toolchain.toml` (currently 1.95). First
+`cargo` invocation auto-installs it.
+
+## Quick start
+
+```bash
+# One-shot LLM run
+seed run --llm --provider codex --mode read "What does this project do?"
+
+# Interactive REPL (Ctrl-D to exit)
+seed chat
+
+# Run an eval suite against a backend (regex + LLM-as-judge grading)
+seed eval --provider codex
+
+# Micro-benchmarks for perf claims (RF42 / RF45 / RF46)
+cargo bench -p agent-bench
+```
+
+## Planner backends
+
+`--provider <id>` picks the LLM that drives the planner loop. Four
+families, 9 ids:
+
+| `--provider` | Routes via | Best for | Needs |
+|---|---|---|---|
+| `codex` (default) | Local `codex app-server` over stdio JSON-RPC | Most tasks; fast; uses Codex login | Codex CLI installed |
+| `repoprompt_oracle` (or `repoprompt`) | RepoPrompt `ask_oracle` (one-shot Q&A) | Quick reasoning with RepoPrompt's curated context | RepoPrompt running |
+| `repoprompt_agent` (or `rp_agent` / `rp-agent`) | RepoPrompt `agent_run` (full Agent Mode) | Multi-turn tasks needing rich workspace context | RepoPrompt running |
+| `openai` / `anthropic` / `google` / `openai_compatible` / `openai_responses_compatible` / `opencode` | HTTP, with SSE streaming | Direct API access; CI without local backends | Matching `*_API_KEY` env var |
+
+Pick a role/model via `--model`:
+- For `codex`: any Codex model id (`gpt-5.1` etc.)
+- For `repoprompt_oracle`: oracle mode (`chat | plan | edit | review`)
+- For `repoprompt_agent`: role label (`explore | engineer | pair | design`)
+- For HTTP providers: provider-specific model id
+
+`--mode read|write|auto` toggles the read-only tool catalog. `auto`
+classifies by goal keywords (default).
+
+## What it does each turn
+
+```
+goal → resolve mode (read/write/auto)
+     → build planner prompt (system + memory + tool catalog + observations)
+     → planner.plan() → PlannedAction { tool | finish }
+     → if Tool: execute via registry, record observation, loop
+     → if Finish: write Reflection + RunFinished events
+```
+
+Every observable side-effect lands in `sessions/<uuid>.jsonl` as an
+`AgentEvent`. Use `seed reflect` to summarize and `seed replay` to
+walk through a recorded session.
+
+## Memory model (L0–L4)
+
+`memory/` and `skills/` form a layered store the planner can search
+and pull from. Writes are guarded — generated indexes (L1) are
+read-only from the tool layer; the long-term update protocol forces
+the planner to declare intent (`start_long_term_update`) and audit
+the write (`complete_long_term_update`).
+
+| Layer | What | Location |
+|---|---|---|
+| L0 | Meta-rules + memory SOP | `memory/meta_rules.md`, `memory/memory_management_sop.md` |
+| L1 | Generated pointer index | `memory/l1_insight.md`, `memory/index.json` |
+| L2 | Stable global facts | `memory/global_facts.md` |
+| L3 | Skills (reusable workflows) | `skills/<slug>/SKILL.md` |
+| L4 | Session archive | `memory/session_archive.jsonl` + `sessions/*.jsonl` |
+
+The planner sees L0 + L1 every turn (compact). L2/L3 are loaded on
+demand via `memory_search` → `memory_fetch`.
+
+## Plan protocol
+
+For non-trivial implementation goals, the planner can create a
+durable plan under `plans/<id>/`:
+
+```bash
+# CLI mirror of the planner's plan_create tool
+seed plan create --task "..." --steps "step 1" --steps "step 2"
 seed plan list
-seed plan next
-seed plan complete --item 1 --note "context inspected"
-seed plan record-artifact --kind context-export --path prompt-exports/context.md --note "RepoPrompt selected context"
-seed plan record-handoff --backend repoprompt --role engineer --run-id agent-run-123 --artifact-path prompt-exports/context.md --status completed --summary "implemented the selected step"
-seed plan verify --dry-run
-seed tool plan-create --title "Tool Demo" --task "Planner-visible plan" --step "Do one thing"
-seed tool plan-list
-seed tool plan-record-artifact --kind verification-report --path reports/verify.md --note "independent verifier output"
+seed plan status <id>
+seed plan next <id>
 ```
 
-`run --llm` defaults to the local Codex app-server planner, so it uses your existing Codex login
-instead of `OPENAI_API_KEY`. Pass `--provider openai` or another provider only when you explicitly
-want the HTTP provider path. `llm ask` is still a raw provider smoke command and reads
-`OPENAI_API_KEY` for the built-in OpenAI provider. Compatible endpoints can use `OPENAI_BASE_URL`
-with the `openai_responses_compatible` provider.
+A `[VERIFY]` checkbox is always added — `plan_verify` runs an
+independent verifier (currently RepoPrompt `agent_run`) before the
+plan can be marked complete. Items with `[D]` are delegated;
+items with `[P]` can run in parallel.
 
-Set `--provider repoprompt_oracle` to route each planner turn through RepoPrompt's `ask_oracle`
-instead of Codex directly. The oracle inherits whatever workspace and selection RepoPrompt has
-curated, so prompts come pre-grounded and answers stay aware of the selection. Pass
-`--model chat|plan|edit|review` to pick the oracle mode (default `chat`). The run will refuse to
-start if the RepoPrompt CLI cannot be located; fall back to `--provider codex` for offline work.
+## Skill system
 
-A RepoPrompt builder plan export (`builder ... --response-type plan --export`) imports straight
-into a durable seed plan, including auto-applied `[D]`/`[P]` step markers and an entry in the
-plan's RepoPrompt artifact ledger:
+Skills are reusable workflow recipes that ship with the project.
+The planner can `skill_search` → `skill_fetch` to load one at any
+time. `seed run --learn` consolidates a successful run into a new
+skill (or updates a similar existing one).
 
 ```bash
-repoprompt_cli -e 'builder "create an implementation plan for: ..." --response-type plan --export'
-# -> writes plan-export.md
-
-seed plan import --path plan-export.md
-# or, from the planner: plan_create_from_repoprompt({"export_path": "plan-export.md"})
+seed skill list
+seed skill search "memory"
+seed skill fetch repoprompt-deep-plan
 ```
 
-When you don't already have an export, `seed plan build` does the whole loop in one shot —
-RepoPrompt's discovery agent explores the codebase, drafts the plan, exports it, and seed
-imports the result:
+Skills with `repoprompt_*` frontmatter auto-bind the next RepoPrompt
+call to the skill's workspace dirs.
+
+## Eval suite
+
+`evals/*.toml` defines goals + grading rules. Two grade kinds:
+
+- `kind = "regex"` — answer must match the pattern
+- `kind = "judge"` — separate backend judges PASS/FAIL against a rubric
 
 ```bash
-seed plan build \
-    --task "split the auth middleware into JWT + session layers" \
-    --context "session storage must satisfy the new compliance spec in docs/auth-spec.md" \
-    --working-dir /Users/me/repo
-# planner equivalent: plan_create_via_repoprompt({"task":"...","context":"..."})
+# Run all evals against codex
+seed eval --provider codex
+
+# Run in-process (reuses CodexSession across evals; faster)
+seed eval --provider codex --in-process
+
+# Validate that `--learn` actually produces useful skills
+seed eval-learn evals/01_count_crates.toml --provider codex
 ```
 
-After a plan exists (built any way), `seed plan refine` asks RepoPrompt's oracle to review it
-and appends concrete improvements as numbered `[FIX]` items before the `[VERIFY]` gate. The
-reviewer chat_id is preserved so subsequent `--chat-id` invocations continue the same review
-session instead of starting fresh.
+The eval-learn subcommand runs the same task 3× (baseline, with
+--learn, post-learn) and reports whether the learned skill reduced
+turn count or upgraded the grade.
 
-```bash
-seed plan refine                            # refine latest active plan
-seed plan refine <plan-id> --focus "look for race conditions in step 4-6"
-# planner equivalent: plan_refine_via_repoprompt({"focus":"..."})
-```
+## Benchmarks
 
-Skills can declare a RepoPrompt binding in their frontmatter:
+`cargo bench -p agent-bench` runs criterion micro-benchmarks for
+the perf claims accumulated through the project's history:
+ToolRegistry caching (RF42-A3), schemars schema generation
+(RF45-Phase1), JSON repair (RF46-A), memoize key (RF35-2),
+AgentLoopState construction. Baseline numbers live in `CLAUDE.md`'s
+RF49-B section.
 
-```yaml
----
-name: My Skill
-repoprompt_working_dirs:
-  - /abs/path/to/repo
-repoprompt_oracle_mode: plan
----
-```
+## Codex integration knobs
 
-When `skill_fetch` returns a skill with this block, seed transparently calls
-`bind_context op=bind working_dirs=...` so the right workspace is active before the planner uses
-the skill. `seed skill create` and `run --learn` query `bind_context op=status` and embed the
-current binding into any new skill they emit, closing the loop between RepoPrompt sessions and
-the durable skill tree.
+- `--codex` — fast-path: hand the whole goal to `codex app-server`
+  in one turn (skip the planner loop entirely)
+- `--use-daemon` — connect via `codex app-server proxy` (running
+  daemon) instead of spawning a fresh app-server per goal
+- `--approval deny|accept-once|accept-for-session` — what to do
+  when Codex requests tool approval
+- `--mcp none|all` + `--mcp-allow <name>` — which MCP servers
+  Codex discovers (default: only RepoPrompt allowed)
 
-Every planner turn asks for a short `summary`, stores it in the JSONL session, and feeds a
-GenericAgent-style `### [WORKING MEMORY]` anchor into the next planner prompt. The anchor includes
-recent turn history, `update_working_checkpoint` key facts, related skills, and loop guard hints
-when the agent is repeating a failed action or approaching the turn limit. Passing `run --learn`
-after a successful LLM run consolidates that trace into the skill tree: it updates a similar
-existing `SKILL.md` under `## Learned Updates`, or creates a new skill only when no sufficiently
-similar skill exists. The self-bootstrapping loop is: run, summarize, consolidate, reuse.
+The Codex client is REPL-lifetime-cached (`CodexSession`) — hot-swap
+cwd/model/effort between turns without restart, only respawn when
+the `CodexLaunchFingerprint` (plugins / MCP policy / launch args)
+actually changes.
 
-The memory tools mirror GenericAgent's split between short-term and durable memory. Use
-`update_working_checkpoint` for verified context needed during the current task. Use
-`start_long_term_update` to begin a distillation pass that reads `memory/memory_management_sop.md`
-and only writes durable facts or reusable SOPs when there is successful evidence. Once
-`start_long_term_update` succeeds, the next planner turn enters phase 2 settlement and must choose
-exactly one branch: update L2 `global_facts.md`, update an existing L3 skill, or skip with a reason.
-After the branch writes or skips, the planner calls `complete_long_term_update` so the session has
-an auditable settlement event. Memory and skill writes automatically rebuild the L1 insight and
-machine index. Tool writes to `memory/` and `skills/` are guarded: generated L1/index files cannot
-be edited directly, existing durable memory cannot be overwritten wholesale, and secret-like or
-unverified text is rejected before it lands.
+## REPL slash commands
 
-The durable memory skeleton is intentionally simple:
+`seed chat` enters an interactive REPL. Slash commands:
 
-- L0: `memory/meta_rules.md` and `memory/memory_management_sop.md`
-- L1: `memory/l1_insight.md` for pointer-only navigation, plus `memory/index.json` for machine search
-- L2: `memory/global_facts.md`
-- L3: `skills/<slug>/SKILL.md`
-- L4: `sessions/*.jsonl` plus `memory/session_archive.jsonl`
+| Group | Commands |
+|---|---|
+| View | `/help` `/doctor` `/skills` `/tools` `/memory` `/plan` `/plans` `/dump` `/providers` |
+| Configure | `/cd` `/mode` `/provider` `/model` `/effort` |
+| Operate | `/new` `/retry` `/compact` `/sync` |
+| Exit | `/exit` (or `/quit` / `:q`) |
 
-`run --llm` injects L0, `memory/l1_insight.md`, and a compact machine index by default. Deeper
-bodies stay out of the prompt until the planner calls `memory_search` and then `memory_fetch`.
+`!<cmd>` runs a shell command and prints the output without
+involving the planner.
 
-Plan mode mirrors GenericAgent's external plan-state pattern. `plan_create` writes
-`plans/<id>/plan.md`, `state.json`, and a mandatory `[VERIFY]` checkbox. The planner can then call
-`plan_next`, do exactly the next unchecked item, and call `plan_complete`. Once all non-verify items
-are complete, `plan_verify` writes `verify_context.json` and can launch an independent RepoPrompt
-`agent_run` verifier with the `pair` Codex role by default. `VERDICT: PASS` marks the plan
-verified; `VERDICT: FAIL` appends a `[FIX]` item and keeps the plan from finishing.
+## Architecture (one paragraph)
 
-Each plan also carries an orchestration ledger for RepoPrompt-led execution. `plan_record_artifact`
-records selected context exports, RepoPrompt exports, verification contexts, and verifier reports.
-`plan_record_handoff` records who executed a step, which backend or role ran it, any run/thread id,
-the artifact used, and the outcome summary. This keeps Seed as the durable state machine while
-RepoPrompt does the context building, handoff, review, and verification work.
-Planner prompts and `plan_next` now treat this as protocol, not optional bookkeeping: RepoPrompt
-exports should be followed by `plan_record_artifact`, and RepoPrompt `agent_run` or Codex delegated
-work should be followed by `plan_record_handoff`. `plan_verify` records its RepoPrompt verifier
-handoff automatically.
+12 crates in `crates/`. `agent-core` defines the shared
+`Tool`/`ToolRegistry`/`ToolCall`/`AgentEvent` types + the TUI / session
+sub-modules. `agent-runtime` owns the planner loop (`AgentLoopState`,
+`PlannedAction`, retries). `agent-tools` registers the 32 typed tools
+(split into per-family modules: `files.rs`, `plan.rs`,
+`memory_protocol.rs`, etc.). `agent-cli` is the `seed` binary
+(subcommand routing + REPL + `run_goal`). `agent-llm` is the HTTP
+provider registry; `agent-delegate` wraps `codex app-server`;
+`agent-repoprompt` wraps the RepoPrompt CLI. `agent-memory` /
+`agent-plan` / `agent-skills` own the L0-L4 / plan / skill state
+machines respectively. `agent-bench` is the criterion harness.
 
-`codex` and `run --codex` use the local `codex app-server` transport and your existing Codex
-login/config. Passing `--model` is optional; when omitted, Codex chooses from local config. By
-default the delegate starts Codex with plugins disabled and only `RepoPrompt` allowed. Use
-`--mcp none` to disable every configured MCP server, `--mcp all` to keep Codex's full MCP surface,
-or repeat `--mcp-allow <name>` to keep a custom allowlist such as `RepoPrompt` plus `semgrep`.
-With plugins disabled, MCP discovery reads `~/.codex/config.toml` directly and only falls back to
-`codex mcp list` if local config parsing fails.
+For the full architectural decision log, see `CLAUDE.md` (it's the
+agent-readable design doc — RF24 through RF52, ~1k lines).
 
-Before `codex` and `run --codex` send a prompt to Codex, the CLI now routes broad repository tasks
-to a local RepoPrompt SOP skill and injects that skill body into the delegated prompt. Planning or
-implementation prompts route to `skills/repoprompt-deep-plan/SKILL.md`; review prompts route to
-`skills/repoprompt-review/SKILL.md`; investigation prompts route to
-`skills/repoprompt-investigate/SKILL.md`. This makes RepoPrompt usage explicit instead of relying
-on Codex to infer the right skill from MCP availability alone. Skill discovery also indexes
-frontmatter fields such as `task_type`, `capabilities`, `required_tools`, `preferred_backend`,
-`autonomous_safe`, and `blast_radius`, so planners can choose skills by execution fit rather than
-name alone.
+## Status
 
-RepoPrompt is also available as a first-class SeedAgent backend. The `agent-repoprompt` crate wraps
-the RepoPrompt CLI and knows the full 18-tool MCP surface: exploration, context selection, oracle
-conversations, editing, git, workspace routing, settings, and agent control. It uses
-`REPOPROMPT_CLI` when set, otherwise `$HOME/RepoPrompt/repoprompt_cli` when present, otherwise
-`repoprompt_cli` from `PATH`. The local planner can call `repoprompt_tools` to inspect the surface,
-`repoprompt_exec` for RepoPrompt shorthand commands, and `repoprompt_call` for any specific
-RepoPrompt MCP tool with JSON args. Workspace-scoped RepoPrompt calls default to the current cwd
-when no window, context id, or working directory is supplied; discovery calls such as window or
-workspace listing stay unbound. The CLI mirrors this through `seed rp ...`, and `seed rp bind`
-defaults to binding the current directory when no `--working-dir` is given.
+- 369 unit + integration tests; basic GitHub Actions CI gating
+  build + test
+- 4 planner backend families, 9 provider ids
+- 8 evals across 4 categories (regex + judge grading)
+- 10 micro-benchmarks
+- Schema-driven tool args (planner sees real input shapes, not
+  guesses)
+- Markdown-file tool descriptions (`crates/agent-tools/descriptions/`)
+
+What's intentionally **not** here:
+- `ToolCatalog` enum dispatch (forge's pattern) — defer until a
+  native function-calling protocol consumer arrives (see
+  CLAUDE.md RF50-C)
+- LLM-as-judge across all evals — only opt-in per eval; regex
+  grading covers the simple cases
+- Production observability (metrics export, structured logging
+  beyond JSONL sessions)
+
+## Contributing
+
+Standard cargo. Add a new tool: write a struct + `impl Tool`,
+declare its args struct with `#[derive(schemars::JsonSchema)]`,
+add `crate::impl_args_schema!(MyArgs)` + `crate::impl_pure_read!()`
+(if read-only) to the impl, write the description to
+`crates/agent-tools/descriptions/<name>.md`, register in
+`seed_registry()`. Run `cargo test --workspace` before opening a PR;
+clippy + rustfmt are advisory in CI.
+
+## License
+
+MIT.

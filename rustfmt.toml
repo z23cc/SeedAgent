@@ -1,0 +1,12 @@
+# RF46-B: rustfmt style mirroring forgecode's settings.
+#
+# unstable_features = true is required for the imports/group settings.
+# It means rustfmt may format edition-2024-only constructs differently
+# across point releases — acceptable for an internal project; would
+# need pinning for a library crate with external consumers.
+unstable_features = true
+struct_lit_width = 60
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"
+wrap_comments = true
+comment_width = 80

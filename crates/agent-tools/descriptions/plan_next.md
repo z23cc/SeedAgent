@@ -1,0 +1,1 @@
+Return the next unchecked plan item; use this before continuing a plan-mode task. Args JSON: {"id":"plan-..."}; alias plan_id is accepted; empty args use the active plan.

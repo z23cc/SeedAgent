@@ -1,6 +1,6 @@
 //! `seed codex` + `seed delegate codex`: thin wrapper around the local
 //! `codex app-server`. Also exposes `codex_config` / `codex_prompt_with_routed_skill`
-//! to `commands::run` for the in-loop synthesis path.
+//! to `commands::run` for the `--codex` fast path.
 
 use std::env;
 use std::fs;
@@ -137,9 +137,9 @@ pub(crate) fn codex_config(
     )
 }
 
-/// RF33-4: extended config builder that takes `use_daemon`. The older
+/// extended config builder that takes `use_daemon`. The older
 /// `codex_config` keeps the no-daemon default for callers that don't care
-/// (synthesis pass, `seed codex` one-shot).
+/// (`seed codex` one-shot).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn codex_config_full(
     model: Option<String>,
@@ -165,7 +165,7 @@ pub(crate) fn codex_config_full(
     })
 }
 
-/// RF33-4: `seed codex-daemon start|stop|status`. Thin wrapper that
+/// `seed codex-daemon start|stop|status`. Thin wrapper that
 /// shells out to `codex app-server daemon ...` and forwards stdout/stderr
 /// so users see codex's own success/failure messages without seed
 /// editorializing. We don't try to parse the output — codex is the source

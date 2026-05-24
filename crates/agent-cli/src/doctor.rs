@@ -33,11 +33,11 @@ pub(crate) fn doctor(skills_dir: &Path, store: &SessionStore) -> Result<()> {
             .join(", ")
     );
     println!("- delegates: codex-app-server, repoprompt-oracle");
-    // RF25-3: cwd sync health check. Always run; for one-shot `seed doctor`
+    // cwd sync health check. Always run; for one-shot `seed doctor`
     // (no REPL session), we just print env::current_dir() + any cached RP
     // bound state. For REPL `/doctor` callers see `cwd_health_check` below.
     cwd_health_check(&env::current_dir()?, None)?;
-    // RF28-1: run-mode health check. Same shape — for one-shot doctor there's
+    // run-mode health check. Same shape — for one-shot doctor there's
     // no REPL session so we pass None for the REPL-pinned mode and report
     // only the process-global guard's current value (defaults to
     // Implementation if no run has fired yet in this process).
@@ -45,7 +45,7 @@ pub(crate) fn doctor(skills_dir: &Path, store: &SessionStore) -> Result<()> {
     Ok(())
 }
 
-/// RF28-1: surface the active `RunMode` so users can confirm what toolset
+/// surface the active `RunMode` so users can confirm what toolset
 /// the next run will have access to. Two pieces of state:
 ///   - `run_mode_guard::current()`: the *process-global* guard set by the
 ///     most recent `run_goal`. For one-shot `seed doctor` this is the
@@ -124,7 +124,7 @@ pub(crate) fn cwd_health_check(
         None => println!("    rp bind cache: (empty — next rp call will bind fresh)"),
     }
 
-    // Pending skill override (RF24-4).
+    // Pending skill override.
     match agent_tools::repoprompt_sync::peek_pending_override() {
         Some(over) => println!(
             "    rp pending override: {:?} (consumed by next rp call, transient)",
@@ -148,7 +148,7 @@ mod tests {
     // instead we verify it runs without panicking under every shape of input
     // (codex session live/dead, RP cache hit/miss, override present/absent).
     // The shape of the printed lines is exercised by the smoke test that
-    // calls `seed doctor` end-to-end in RF25-4.
+    // calls `seed doctor` end-to-end in .
 
     static RP_SYNC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn rp_sync_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -200,7 +200,7 @@ mod tests {
         cwd_health_check(&PathBuf::from("/tmp/seed-doctor-e"), None).unwrap();
     }
 
-    // --- RF28-1 run_mode_health_check ------------------------------------
+    // --- run_mode_health_check ------------------------------------
 
     static MODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn mode_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -252,6 +252,9 @@ pub(crate) fn show_providers(
     println!("- codex local-app-server (default planner; uses local Codex login, no API key)");
     println!(
         "- repoprompt_oracle (opt-in: --provider repoprompt_oracle; planner goes through RepoPrompt ask_oracle so prompts inherit RepoPrompt's curated context; --model selects oracle mode: chat|plan|edit|review)"
+    );
+    println!(
+        "- repoprompt_agent (opt-in: --provider repoprompt_agent; planner goes through RepoPrompt agent_run — full Agent Mode with session continuity across turns; --model selects role: explore|engineer|pair|design, default pair)"
     );
     for provider in &providers {
         let models = provider

@@ -1,0 +1,1 @@
+Execute a RepoPrompt CLI command chain such as windows, tree, search, select, context, builder, plan, or review. Args JSON: {"command":"tree --mode folders"}; alias cmd is accepted. Workspace commands default to the current cwd when no routing is supplied.

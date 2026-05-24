@@ -13,6 +13,12 @@ agent-plan.workspace = true
 agent-repoprompt.workspace = true
 agent-skills.workspace = true
 anyhow.workspace = true
+# RF50-A: gitignore-aware workspace walker. Used by the new
+# `walk_workspace` helper + by `read_files` when given a directory.
+ignore.workspace = true
+# RF45-Phase1: every *Args struct derives JsonSchema so the planner
+# prompt can show real input shapes instead of guessing field names.
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 wait-timeout.workspace = true

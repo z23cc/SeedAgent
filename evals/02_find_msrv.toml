@@ -1,0 +1,11 @@
+# Eval: a workspace-config question that requires reading Cargo.toml.
+# Tests: does the planner go to the canonical source instead of guessing?
+
+name = "find_msrv"
+goal = "What is the MSRV (rust-version) declared in this workspace's Cargo.toml?"
+mode = "read"
+max_turns = 5
+
+[grade]
+kind = "regex"
+pattern = '1\.95'

@@ -3,6 +3,8 @@
 
 pub(crate) mod codex;
 pub(crate) mod codex_session;
+// eval-suite runner.
+pub(crate) mod eval;
 pub(crate) mod exec;
 pub(crate) mod interactive;
 pub(crate) mod llm;

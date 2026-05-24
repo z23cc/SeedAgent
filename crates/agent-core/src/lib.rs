@@ -3,42 +3,27 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-// RF41-B1: absorbed agent-tui and agent-session as submodules to drop
-// the workspace from 14 to 12 crates. Old `use agent_core::tui::X` becomes
-// `use agent_core::tui::X`; same for agent_session → agent_core::session.
 pub mod session;
 pub mod tui;
 
-/// Whether a run is allowed to mutate the project.
-///
-/// Set by `run_goal` early (after consulting the explicit `--mode` flag and
-/// then `agent_runtime::classify_run_mode`) and pushed into the
-/// `agent_tools::run_mode_guard` process-singleton so individual tools
-/// (notably `ShellTool`, RF27-2) can refuse write-shaped operations when
-/// they shouldn't be running.
+/// Whether a run is allowed to mutate the project. Set by `run_goal` and
+/// pushed into `agent_tools::run_mode_guard` so individual tools (notably
+/// `ShellTool`) can refuse write-shaped operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
-    /// Tool catalog is pared down to discovery-only tools; `run_shell`
-    /// rejects commands that look like writes. Set automatically when the
-    /// goal text matches the analyze/summarize/explain shape.
     ReadOnly,
-    /// Full tool catalog. The default for any goal that doesn't classify
-    /// as read-only, and the catch-all for `--mode write` overrides.
     #[default]
     Implementation,
 }
 
-/// Records how the active `RunMode` was chosen, so session JSONLs and the
-/// trace header can distinguish "auto-classified from goal keywords" from
-/// "user pinned it explicitly". Pure provenance — does not affect behavior.
+/// Provenance for the active `RunMode` — appears in session JSONLs and the
+/// trace header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ModeSource {
-    /// Came from `agent_runtime::classify_run_mode(goal)`.
     #[default]
     Auto,
-    /// User-set via `--mode read|write` on the CLI, or `/mode` in the REPL.
     Explicit,
 }
 
@@ -118,25 +103,14 @@ pub struct ToolContext {
     pub skills_dir: PathBuf,
     pub memory_dir: PathBuf,
     pub sessions_dir: PathBuf,
-    /// Current planner turn (1-indexed) when invoked from the runtime loop.
-    /// Used by tools to scale default output limits so working memory does not
-    /// blow up on long runs. `0` means "not in a loop" — tools use their
-    /// natural defaults.
+    /// 1-indexed planner turn from the runtime loop; `0` means "not in
+    /// a loop". Tools use it to scale output limits as runs grow longer.
     pub current_turn: usize,
 }
 
 impl ToolContext {
-    pub fn new(cwd: impl Into<PathBuf>, skills_dir: impl Into<PathBuf>) -> Self {
-        let cwd = cwd.into();
-        Self {
-            memory_dir: cwd.join("memory"),
-            sessions_dir: cwd.join("sessions"),
-            cwd,
-            skills_dir: skills_dir.into(),
-            current_turn: 0,
-        }
-    }
-
+    /// Test/one-off convenience: derives skills/memory/sessions dirs as
+    /// `cwd.join(...)`. Production uses [`Self::with_paths`] instead.
     pub fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
         let cwd = cwd.into();
         Self {
@@ -148,6 +122,8 @@ impl ToolContext {
         }
     }
 
+    /// Per-task cwd may be a subdir (after `/cd`) but the host's
+    /// memory/skills/sessions storage stays at the workspace root.
     pub fn with_paths(
         cwd: impl Into<PathBuf>,
         skills_dir: impl Into<PathBuf>,
@@ -168,9 +144,8 @@ impl ToolContext {
         self
     }
 
-    /// Returns a soft default cap scaled by current turn pressure.
-    /// `base` is the natural default for the tool (count, bytes, etc.).
-    /// `floor` caps how small it can shrink.
+    /// Returns a default scaled by turn pressure. `base` is the natural
+    /// default; `floor` is the smallest it can shrink to.
     pub fn scaled_default(&self, base: usize, floor: usize) -> usize {
         if self.current_turn < 5 {
             return base;
@@ -186,13 +161,10 @@ pub enum AgentEvent {
     RunStarted {
         goal: String,
         cwd: PathBuf,
-        /// RF27-1: the run mode this goal is operating under. `#[serde(default)]`
-        /// so older session JSONLs (no `mode` field) deserialize cleanly as
-        /// `Implementation` (the historical behavior — there was no read-only
-        /// gating before).
+        /// `serde(default)` so older session JSONLs (no `mode` field)
+        /// deserialize as `Implementation`.
         #[serde(default)]
         mode: RunMode,
-        /// Whether `mode` was auto-classified or explicitly pinned.
         #[serde(default)]
         mode_source: ModeSource,
     },
@@ -228,12 +200,9 @@ pub enum AgentEvent {
         turn: usize,
         planner_ms: u64,
         exec_ms: u64,
-        /// Output char count from the planner's response (approximation for
-        /// output tokens when the provider doesn't report `tokens` directly).
+        /// Approximation for output tokens when the provider doesn't
+        /// report `tokens` directly.
         planner_chars: usize,
-        /// RF36-1: input char count of the assembled planner prompt for this
-        /// turn (system + user + memory + tool catalog). `serde(default)` so
-        /// older session JSONLs read back as `0`.
         #[serde(default)]
         prompt_chars: usize,
     },
@@ -241,23 +210,15 @@ pub enum AgentEvent {
         status: String,
         summary: String,
     },
-    /// RF34-2: emitted when the planner's parse/transport retry path fires.
-    /// Lets sessions show how often (and why) the runtime had to back off,
-    /// without making the planner itself responsible for that observability.
     PlannerRetry {
         turn: usize,
-        /// Attempt index, 1-based. `attempt=1` means "first retry"
-        /// (the original call already failed).
+        /// 1-based; `attempt=1` is the first retry after the original failed.
         attempt: usize,
-        /// Total attempts the runtime is willing to make for this kind.
         of: usize,
-        /// Backoff in ms applied before this retry (0 for parse-retries
-        /// which retry immediately without sleeping).
+        /// 0 for parse-retries (no sleep).
         backoff_ms: u64,
-        /// `"parse"` for `InvalidPlannerJson` retries, `"transport"` for
-        /// `Planner(_)` retries (network/stdio blip).
+        /// `"parse"` for InvalidPlannerJson, `"transport"` for `Planner(_)`.
         kind: String,
-        /// Short error string for trace context.
         reason: String,
     },
 }
@@ -279,12 +240,56 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn execute(&self, ctx: &ToolContext, call: &ToolCall) -> Result<ToolResult, ToolError>;
+
+    /// Schema rendered next to the tool description in the planner
+    /// prompt so the LLM picks correct field names. Convention: derive
+    /// `JsonSchema` on the args struct + use the `impl_args_schema!` macro.
+    fn args_schema(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// True iff the tool is purely a read (same inputs ⇒ same output
+    /// within a run). Used by the planner loop's per-run memoization
+    /// layer. Convention: read tools use the `impl_pure_read!` macro.
+    fn is_pure_read(&self) -> bool {
+        false
+    }
+}
+
+/// Compact `JsonSchema` → `Value` for `ToolInfo.args_schema`. Strips
+/// `$schema` and `title` (Rust-type-name pollution) so the schema
+/// reads cleanly in the planner prompt.
+pub fn tool_args_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+    let mut generator = schemars::generate::SchemaSettings::default().into_generator();
+    let schema = generator.root_schema_for::<T>();
+    let mut value = serde_json::to_value(schema).unwrap_or(serde_json::Value::Null);
+    strip_schema_noise(&mut value);
+    value
+}
+
+/// `JsonSchema` emits `title` as the Rust type name — internal noise.
+fn strip_schema_noise(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = value {
+        map.remove("$schema");
+        map.remove("title");
+        for child in map.values_mut() {
+            strip_schema_noise(child);
+        }
+    } else if let serde_json::Value::Array(arr) = value {
+        for child in arr.iter_mut() {
+            strip_schema_noise(child);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInfo {
     pub name: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub is_pure_read: bool,
 }
 
 #[derive(Default)]
@@ -314,6 +319,8 @@ impl ToolRegistry {
             .map(|tool| ToolInfo {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
+                args_schema: tool.args_schema(),
+                is_pure_read: tool.is_pure_read(),
             })
             .collect()
     }
@@ -325,6 +332,16 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::UnknownTool(call.name.clone()))?;
         tool.execute(ctx, call)
     }
+}
+
+fn uuid_like() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{nanos:x}")
 }
 
 #[cfg(test)]
@@ -350,7 +367,6 @@ mod tests {
     #[test]
     fn scaled_default_respects_floor_only_when_below_base() {
         let ctx = ToolContext::with_cwd(".").with_turn(100);
-        // floor=4_000, base=16_000 → divisor=21 → 16000/21 = 761; max(floor.min(base)=4000) = 4000
         assert_eq!(ctx.scaled_default(16_000, 4_000), 4_000);
     }
 
@@ -360,14 +376,4 @@ mod tests {
         assert_eq!(ctx.current_turn, 0);
         assert_eq!(ctx.scaled_default(200, 60), 200);
     }
-}
-
-fn uuid_like() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!("{nanos:x}")
 }

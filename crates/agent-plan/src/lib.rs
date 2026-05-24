@@ -83,7 +83,7 @@ pub struct PlanState {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanBackend {
     Local,
@@ -93,7 +93,7 @@ pub enum PlanBackend {
     Mixed,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanArtifactKind {
     RepoPromptExport,
@@ -1549,8 +1549,8 @@ session-token storage change.
         std::env::temp_dir().join(format!("seed-plan-test-{}", Uuid::new_v4()))
     }
 
-    // Targeted gap tests added in RF18. The existing 14 tests cover happy
-    // paths well; these fill in the typed-error branches from RF10, the
+    // Targeted gap tests added in . The existing 14 tests cover happy
+    // paths well; these fill in the typed-error branches from , the
     // record_artifact_once dedup invariant, and a couple of edge cases.
 
     #[test]

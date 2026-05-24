@@ -1,0 +1,14 @@
+# RF46-B: clippy thresholds. Kept light — the project hasn't been
+# clippy-cleaned end-to-end yet, so aggressive lints would flood the
+# output. Two non-default settings:
+#
+# - `cognitive-complexity-threshold = 30` (vs default 25): the runtime
+#   loop and `run_goal` legitimately have higher branching than typical
+#   library code. Lowering to 25 would flag healthy code with no
+#   actionable fix.
+# - `too-many-arguments-threshold = 10` (vs default 7): `build_planner`
+#   and `codex_config_full` genuinely need 9-10 distinct knobs per
+#   provider. Either accept the count or build a struct per backend —
+#   for now, accept.
+cognitive-complexity-threshold = 30
+too-many-arguments-threshold = 10

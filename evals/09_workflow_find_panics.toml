@@ -1,0 +1,23 @@
+# Workflow eval — designed for --learn validation.
+# This is a recurring shape ("find all X across the codebase") that
+# benefits from a learned recipe: "use rg, restrict to crates/, count".
+
+name = "workflow_find_panics"
+goal = "How many `.unwrap()` calls are in the agent-cli crate's src/ directory? Reply with just the number and the command you used."
+mode = "read"
+max_turns = 5
+
+[grade]
+kind = "judge"
+rubric = '''
+PASS criteria:
+- Provides a specific integer (the count varies; accept 1-500).
+- Names the command used (rg, grep, etc.).
+- The command would actually count `.unwrap()` in agent-cli/src/ (not the whole workspace).
+
+FAIL if:
+- No number given.
+- Number from wrong scope (e.g. counts ALL workspace files).
+- Names a command that wouldn't count this (e.g. `wc -l`).
+- Says "cannot determine" — answerable in 1 shell call.
+'''

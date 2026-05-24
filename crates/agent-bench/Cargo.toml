@@ -1,0 +1,35 @@
+[package]
+name = "agent-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# RF49-B: micro-benchmark harness. Lets us put real numbers behind perf
+# claims accumulated across RF33/35/42/45/46. Without numbers, every
+# "optimization" is faith-based — and the next refactor that
+# accidentally undoes one of them goes unnoticed.
+#
+# `publish = false` keeps this out of any future `cargo publish`. The
+# crate exists purely to ship `criterion` benchmarks to `cargo bench`.
+publish = false
+
+[dependencies]
+agent-core.workspace = true
+agent-memory.workspace = true
+agent-runtime.workspace = true
+agent-tools.workspace = true
+# schemars: bench file has a local `#[derive(JsonSchema)]` to measure
+# the schema-generation cost on a representative Args shape.
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.10"
+
+[[bench]]
+name = "perf_claims"
+harness = false

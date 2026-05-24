@@ -1,0 +1,79 @@
+# RF46-C: minimal CI. Runs build + test + clippy on every push/PR.
+# Stops PRs that break the workspace from merging — the actual gap
+# this closes (no automated gate existed before).
+#
+# Deliberately NOT mirroring forge's elaborate gh-workflow setup: forge
+# builds for 5 target triples + cross-compiles + publishes releases.
+# We have one binary (`seed`) and one target (developer's machine).
+# When a real release pipeline becomes a need, this file grows.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  build-test:
+    name: build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml at the repo root pins channel = "1.95",
+      # so we don't need to set toolchain version here — the
+      # rust-toolchain setup happens automatically when cargo is invoked.
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: cargo build (workspace)
+        run: cargo build --workspace --locked
+      - name: cargo test (workspace)
+        run: cargo test --workspace --locked
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+      # Don't fail on warnings yet — the codebase has style warnings
+      # accumulated through 45 RFs. Treat clippy as advisory until a
+      # dedicated cleanup pass runs. When that's done, swap `--`
+      # for `-- -D warnings` to make warnings block merges.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked --
+
+  rustfmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # Same advisory posture as clippy — `cargo fmt --check` would
+      # likely fail on the current codebase. Once a `cargo fmt --all`
+      # cleanup ships, switch to `--check`.
+      - name: cargo fmt check (advisory)
+        run: cargo fmt --all -- --check || echo "::warning::rustfmt diffs detected — run 'cargo fmt --all' locally"

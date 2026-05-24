@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/agent-bench",
   "crates/agent-cli",
   "crates/agent-core",
   "crates/agent-delegate",
@@ -34,11 +35,23 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 derive_setters = "0.1"
+# RF50-A: gitignore-aware walker. `ignore` is the same crate that
+# powers ripgrep and fd — handles `.gitignore`, global gitignore,
+# `.ignore`, parent-dir lookup, hidden-file rules. Used by agent-tools.
+ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 reedline = "0.47"
+# RF45-Phase1: schema-driven tool dispatch — derives JSON Schema from
+# Args structs so the planner sees real input shapes instead of guessing
+# field names (closes RF38-2's serde-alias workaround class).
+schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 toml = "0.8"
+# RF50-B: regex matching for eval-grading. Already transitively
+# present via criterion (dev-dep), but listed at workspace level so
+# the eval module can use it as a first-class prod dep.
+regex = "1.10"
 uuid = { version = "1.8", features = ["v4", "serde"] }
 wait-timeout = "0.2"

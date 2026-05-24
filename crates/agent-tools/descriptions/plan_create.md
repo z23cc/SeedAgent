@@ -1,0 +1,1 @@
+Create a durable GenericAgent-style plan under plans/<id>/ with plan.md, state.json, and a required verification gate. Args JSON: {"title":"short title","task":"full task","steps":["step 1"]}. Accepted aliases: goal->task, items->steps. Do not pass plan_id or verification_gate.

@@ -1,0 +1,1 @@
+Record a RepoPrompt/Codex/local execution handoff, run id, artifact, status, and summary in the plan ledger. Args JSON: {"id":"plan-...","backend":"repoprompt|codex|local","summary":"what happened","status":"done"}. Alias plan_id is accepted.

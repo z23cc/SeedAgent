@@ -1,0 +1,14 @@
+# Eval: a basic read-only repository-structure question.
+# Tests: can the planner do simple file enumeration + counting?
+# Expected backends to pass: all (Codex, RP Agent, Oracle, HTTP).
+
+name = "count_crates"
+goal = "How many Rust crates are in the crates/ directory? Reply with just the number."
+mode = "read"
+max_turns = 5
+
+# Grading: case-insensitive regex on the final answer.
+# We expect "11" (10 prod crates + agent-bench). Allow surrounding text.
+[grade]
+kind = "regex"
+pattern = '\b11\b'

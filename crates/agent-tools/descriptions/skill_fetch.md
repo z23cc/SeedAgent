@@ -1,0 +1,1 @@
+Fetch the full SKILL.md body for one exact skill name or slug.

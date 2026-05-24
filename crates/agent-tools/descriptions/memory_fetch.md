@@ -1,0 +1,1 @@
+Fetch one memory document by L1 index id or exact path; use after memory_search.

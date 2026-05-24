@@ -9,6 +9,10 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+# RF45-Phase1: agent-tools' PlanRecordArtifactArgs embeds
+# `agent_plan::PlanArtifactKind` directly, so the type needs to derive
+# JsonSchema so the tool's args_schema can include its variants.
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

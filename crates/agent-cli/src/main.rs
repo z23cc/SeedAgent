@@ -41,7 +41,7 @@ pub(crate) struct Cli {
 
 /// Subcommands for `seed codex-daemon`. Thin wrappers around
 /// `codex app-server daemon ...` so users don't have to remember the
-/// full codex CLI path. RF33-4.
+/// full codex CLI path. .
 #[derive(Debug, Subcommand)]
 pub(crate) enum CodexDaemonAction {
     /// Start the daemon (no-op if already running).
@@ -100,6 +100,54 @@ pub(crate) enum Command {
         use_daemon: bool,
     },
     Doctor,
+    /// run the eval suite in `evals/` against a chosen
+    /// backend. Each `.toml` defines a goal + regex grade; the
+    /// command shells out to `seed run` for each, aggregates pass/
+    /// fail, and exits non-zero if any failed.
+    Eval {
+        /// Backend to test. Same id form as `--provider` on `seed run`.
+        #[arg(long, default_value = "repoprompt_agent")]
+        provider: String,
+        /// Directory containing `*.toml` eval specs.
+        #[arg(long, default_value = "evals")]
+        evals_dir: PathBuf,
+        /// run each eval in-process (reuse CodexSession +
+        /// thread-local caches across evals) instead of shelling out
+        /// to a fresh `seed run` per eval. Faster but evals share
+        /// more state — if one eval poisons a thread-local you'll see
+        /// it. Default off (shell-out for isolation).
+        #[arg(long = "in-process")]
+        in_process: bool,
+        /// backend that runs `kind = "judge"` evals. Defaults
+        /// to `repoprompt_oracle` because oracle is cheap, has chat
+        /// continuity for the rubric, and is independent of the
+        /// `--provider` under test (so a backend doesn't grade its
+        /// own answer). For CI-headless runs without RepoPrompt,
+        /// pass e.g. `--judge-provider openai`.
+        #[arg(long = "judge-provider", default_value = "repoprompt_oracle")]
+        judge_provider: String,
+    },
+    /// validate that `seed run --learn` actually produces
+    /// useful skills. Runs one eval THREE times:
+    ///   1. baseline (no learn) → answer A1, turns T1
+    ///   2. with --learn        → answer A2, turns T2, creates SKILL.md
+    ///   3. post-learn          → answer A3, turns T3 (skill now in catalog)
+    /// then compares T1 vs T3 and the judge scores. If T3 isn't lower
+    /// than T1 AND the judge scores didn't go up, --learn isn't earning
+    /// its keep on this kind of task.
+    ///
+    /// Important: creates a real SKILL.md on disk under `skills/<slug>/`.
+    /// Doesn't auto-clean up — the trace tells you the slug to `rm -rf`.
+    EvalLearn {
+        /// The eval `.toml` file to test.
+        eval: PathBuf,
+        /// Backend to run the goal against (same as `seed eval`).
+        #[arg(long, default_value = "codex")]
+        provider: String,
+        /// Judge for the comparison (same as `seed eval`).
+        #[arg(long = "judge-provider", default_value = "repoprompt_oracle")]
+        judge_provider: String,
+    },
     Run {
         goal: String,
         #[arg(long)]
@@ -215,7 +263,7 @@ pub(crate) enum Command {
         )]
         show_hidden: bool,
     },
-    /// RF33-4: thin wrapper over `codex app-server daemon …` so users can
+    /// thin wrapper over `codex app-server daemon …` so users can
     /// start/stop/status the codex daemon from `seed` directly. Pair with
     /// `--use-daemon` on `seed run` / `chat` to actually consume it.
     #[command(name = "codex-daemon", alias = "codex_daemon")]
@@ -318,6 +366,41 @@ fn main() -> Result<()> {
             },
         ),
         Command::Doctor => doctor::doctor(&cli.skills_dir, &store),
+        // run the eval suite. Exit code propagates so CI
+        // can pick up regressions.
+        Command::EvalLearn {
+            eval,
+            provider,
+            judge_provider,
+        } => {
+            let exit_code = commands::eval::run_eval_learn(
+                &eval,
+                &provider,
+                &store,
+                &cli.skills_dir,
+                &judge_provider,
+            )?;
+            std::process::exit(exit_code);
+        }
+        Command::Eval {
+            provider,
+            evals_dir,
+            in_process,
+            judge_provider,
+        } => {
+            let exit_code = if in_process {
+                commands::eval::run_eval_in_process(
+                    &provider,
+                    evals_dir,
+                    &store,
+                    &cli.skills_dir,
+                    &judge_provider,
+                )?
+            } else {
+                commands::eval::run_eval(&provider, evals_dir, &judge_provider)?
+            };
+            std::process::exit(exit_code);
+        }
         Command::Run {
             goal,
             cwd,
