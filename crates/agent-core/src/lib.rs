@@ -3,6 +3,39 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Whether a run is allowed to mutate the project.
+///
+/// Set by `run_goal` early (after consulting the explicit `--mode` flag and
+/// then `agent_runtime::classify_run_mode`) and pushed into the
+/// `agent_tools::run_mode_guard` process-singleton so individual tools
+/// (notably `ShellTool`, RF27-2) can refuse write-shaped operations when
+/// they shouldn't be running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    /// Tool catalog is pared down to discovery-only tools; `run_shell`
+    /// rejects commands that look like writes. Set automatically when the
+    /// goal text matches the analyze/summarize/explain shape.
+    ReadOnly,
+    /// Full tool catalog. The default for any goal that doesn't classify
+    /// as read-only, and the catch-all for `--mode write` overrides.
+    #[default]
+    Implementation,
+}
+
+/// Records how the active `RunMode` was chosen, so session JSONLs and the
+/// trace header can distinguish "auto-classified from goal keywords" from
+/// "user pinned it explicitly". Pure provenance — does not affect behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModeSource {
+    /// Came from `agent_runtime::classify_run_mode(goal)`.
+    #[default]
+    Auto,
+    /// User-set via `--mode read|write` on the CLI, or `/mode` in the REPL.
+    Explicit,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -147,6 +180,15 @@ pub enum AgentEvent {
     RunStarted {
         goal: String,
         cwd: PathBuf,
+        /// RF27-1: the run mode this goal is operating under. `#[serde(default)]`
+        /// so older session JSONLs (no `mode` field) deserialize cleanly as
+        /// `Implementation` (the historical behavior — there was no read-only
+        /// gating before).
+        #[serde(default)]
+        mode: RunMode,
+        /// Whether `mode` was auto-classified or explicitly pinned.
+        #[serde(default)]
+        mode_source: ModeSource,
     },
     ToolStarted {
         call: ToolCall,

@@ -35,6 +35,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a fresh session for the next prompt"),
     ("/retry", "re-run the previous goal in a new session"),
     ("/cd", "change REPL workspace cwd (Codex + RepoPrompt follow)"),
+    ("/mode", "view or pin run mode (auto|read|write)"),
     ("/exit", "leave interactive mode"),
 ];
 

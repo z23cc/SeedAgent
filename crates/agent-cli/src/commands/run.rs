@@ -400,6 +400,27 @@ pub(crate) struct ProviderSpec {
     pub(crate) plugins: bool,
 }
 
+/// User-visible mode override exposed via `--mode` and `/mode`.
+///
+/// `Auto` is the default and matches pre-RF27 behavior: the goal text gets
+/// classified via `agent_runtime::classify_run_mode`. `Read` and `Write`
+/// pin the mode regardless of goal text, which is useful when the
+/// keyword heuristic guesses wrong (e.g. "implement an analysis of foo"
+/// → currently classifies read-only because "analysis" is matched first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+#[clap(rename_all = "lowercase")]
+pub(crate) enum ModeArg {
+    /// Auto-classify via keyword heuristic (default, historical behavior).
+    #[default]
+    Auto,
+    /// Pin to read-only: write tools blocked, run_shell writes refused,
+    /// synthesis pass eligible.
+    Read,
+    /// Pin to implementation: full tool catalog, no run_shell gating, no
+    /// synthesis pass (treated as non-read-only).
+    Write,
+}
+
 #[derive(derive_setters::Setters)]
 #[setters(into, strip_option)]
 pub(crate) struct RunGoalArgs<'a> {
@@ -412,6 +433,9 @@ pub(crate) struct RunGoalArgs<'a> {
     pub(crate) skills_dir: PathBuf,
     pub(crate) policy: RunPolicy,
     pub(crate) provider: ProviderSpec,
+    /// RF27-3: explicit mode override. `Auto` uses the keyword classifier;
+    /// `Read`/`Write` pin the mode regardless of goal text.
+    pub(crate) mode: ModeArg,
     /// Optional REPL-lifetime Codex client cache. When `Some`, every Codex
     /// spawn site inside this `run_goal` will reuse the cached client (with
     /// per-turn cfg hot-swapped) instead of spawning a fresh `codex
@@ -420,8 +444,11 @@ pub(crate) struct RunGoalArgs<'a> {
     pub(crate) codex_session: Option<&'a mut crate::commands::codex_session::CodexSession>,
 }
 
-fn planner_tool_infos_for_goal(tools: Vec<ToolInfo>, goal: &str) -> Vec<ToolInfo> {
-    if !agent_runtime::is_read_only_analysis_goal(goal) {
+fn planner_tool_infos_for_mode(
+    tools: Vec<ToolInfo>,
+    mode: agent_core::RunMode,
+) -> Vec<ToolInfo> {
+    if !matches!(mode, agent_core::RunMode::ReadOnly) {
         return tools;
     }
 
@@ -563,6 +590,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 mcp_allow,
                 plugins,
             },
+        mode: mode_arg,
         codex_session,
     } = args;
     // Bridge: when we have no REPL-owned session we build a throwaway one
@@ -572,14 +600,55 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
     let mut local_codex_session = crate::commands::codex_session::CodexSession::default();
     let codex_session: &mut crate::commands::codex_session::CodexSession =
         codex_session.unwrap_or(&mut local_codex_session);
+    // RF27: resolve effective mode + provenance.
+    //
+    //   --mode auto  (default) → classify by goal keywords; source = Auto
+    //   --mode read           → ReadOnly,         source = Explicit
+    //   --mode write          → Implementation,   source = Explicit
+    //
+    // Set the process-global guard right after so ShellTool (and any
+    // future tool that wants to check) sees the right value for the
+    // entirety of the run. The previous run's value persists otherwise
+    // — fine for one-shot processes, dangerous for the REPL.
+    let (run_mode, mode_source) = match mode_arg {
+        ModeArg::Read => (agent_core::RunMode::ReadOnly, agent_core::ModeSource::Explicit),
+        ModeArg::Write => (
+            agent_core::RunMode::Implementation,
+            agent_core::ModeSource::Explicit,
+        ),
+        ModeArg::Auto => (
+            agent_runtime::classify_run_mode(&goal),
+            agent_core::ModeSource::Auto,
+        ),
+    };
+    agent_tools::run_mode_guard::set(run_mode);
+    // Surface the decision so the user can tell from the trace which
+    // toolset the planner has access to. Dimmed so it doesn't compete with
+    // the goal text — but always present.
+    eprintln!(
+        "{}",
+        agent_tui::dim_text(&format!(
+            "mode: {} ({})",
+            match run_mode {
+                agent_core::RunMode::ReadOnly => "read-only",
+                agent_core::RunMode::Implementation => "implementation",
+            },
+            match mode_source {
+                agent_core::ModeSource::Auto => "auto-classified from goal",
+                agent_core::ModeSource::Explicit => "explicit via --mode",
+            },
+        ))
+    );
     let cwd = cwd.unwrap_or(env::current_dir()?);
-    // RF26-2: for read-only analysis goals, default codex `reasoning_effort`
+    // RF26-2 / RF27: for read-only runs, default codex `reasoning_effort`
     // to "low" when the user didn't explicitly set one. Codex's default is
     // "medium" which is overkill for "summarize / explain / explore" tasks
     // — `low` typically cuts per-turn planner time roughly in half on those
-    // shapes. User-set --effort (or /effort in REPL) always wins.
+    // shapes. User-set --effort (or /effort in REPL) always wins. We key
+    // off the resolved `run_mode` (not the raw classifier) so `--mode read`
+    // on an implementation-shaped goal still gets the cheap effort.
     let effort = effort.or_else(|| {
-        if agent_runtime::is_read_only_analysis_goal(&goal) {
+        if matches!(run_mode, agent_core::RunMode::ReadOnly) {
             Some("low".to_string())
         } else {
             None
@@ -610,6 +679,8 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
     session.append(AgentEvent::RunStarted {
         goal: goal.clone(),
         cwd: cwd.clone(),
+        mode: run_mode,
+        mode_source,
     })?;
     let run_started = Instant::now();
     let mut run_turns: usize = 0;
@@ -663,7 +734,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         }
     } else if use_llm {
         let registry = agent_tools::seed_registry();
-        let tool_infos = planner_tool_infos_for_goal(registry.infos(), &goal);
+        let tool_infos = planner_tool_infos_for_mode(registry.infos(), run_mode);
         let allowed_tool_names = tool_infos
             .iter()
             .map(|tool| tool.name.clone())
@@ -763,7 +834,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         let synthesis_eligible = matches!(
             loop_result.status,
             agent_runtime::AgentLoopStatus::Finished
-        ) && agent_runtime::is_read_only_analysis_goal(&goal)
+        ) && matches!(run_mode, agent_core::RunMode::ReadOnly)
             && !loop_result.summary.trim().is_empty();
         if synthesis_eligible && draft_already_conforms(&loop_result.summary) {
             // Skip path. Leave loop_result.summary as the draft; log so the
@@ -1365,7 +1436,7 @@ mod tests {
             },
         ];
 
-        let names = planner_tool_infos_for_goal(tools, "分析当前的项目")
+        let names = planner_tool_infos_for_mode(tools, agent_core::RunMode::ReadOnly)
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
@@ -1799,12 +1870,18 @@ mod tests {
     // selection rule itself here with a tiny mirror function so we catch
     // regressions to the override logic without coupling to run_goal.
 
-    /// Mirror of the RF26-2 rule used inside `run_goal`. Kept in sync by
-    /// review (it's three lines). If this diverges, the inline call site
-    /// is the source of truth.
+    /// Mirror of the RF26-2 / RF27 rule used inside `run_goal`. Kept in
+    /// sync by review (it's three lines). If this diverges, the inline
+    /// call site is the source of truth.
     fn auto_effort_mirror(user_set: Option<String>, goal: &str) -> Option<String> {
         user_set.or_else(|| {
-            if agent_runtime::is_read_only_analysis_goal(goal) {
+            // We compose against the same resolution chain: classify(goal)
+            // then check ReadOnly. Tests below pass `Auto`-shaped inputs
+            // so this matches `--mode auto` behavior.
+            if matches!(
+                agent_runtime::classify_run_mode(goal),
+                agent_core::RunMode::ReadOnly
+            ) {
                 Some("low".to_string())
             } else {
                 None

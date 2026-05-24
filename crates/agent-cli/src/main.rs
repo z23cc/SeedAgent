@@ -73,6 +73,13 @@ pub(crate) enum Command {
         codex: bool,
         #[arg(long, help = "Record goals locally without invoking an LLM")]
         record_only: bool,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = commands::run::ModeArg::Auto,
+            help = "Read-only/write mode: auto (classify), read (force read-only), write (force implementation)"
+        )]
+        mode: commands::run::ModeArg,
     },
     Doctor,
     Run {
@@ -107,6 +114,13 @@ pub(crate) enum Command {
         mcp_allow: Vec<String>,
         #[arg(long, help = "Enable Codex plugins while starting app-server")]
         plugins: bool,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = commands::run::ModeArg::Auto,
+            help = "Read-only/write mode: auto (classify), read (force read-only), write (force implementation)"
+        )]
+        mode: commands::run::ModeArg,
     },
     Tool {
         #[command(subcommand)]
@@ -249,6 +263,7 @@ fn main() -> Result<()> {
             plugins,
             codex,
             record_only,
+            mode,
         } => run_interactive(
             &cli,
             &store,
@@ -266,6 +281,7 @@ fn main() -> Result<()> {
                 plugins,
                 codex,
                 record_only,
+                mode,
             },
         ),
         Command::Doctor => doctor::doctor(&cli.skills_dir, &store),
@@ -284,6 +300,7 @@ fn main() -> Result<()> {
             mcp,
             mcp_allow,
             plugins,
+            mode,
         } => run_goal(RunGoalArgs {
             store: &store,
             goal,
@@ -306,6 +323,7 @@ fn main() -> Result<()> {
                 mcp_allow,
                 plugins,
             },
+            mode,
             // One-shot `seed run` — no REPL session to inherit, fall back
             // to the local throwaway session built inside run_goal.
             codex_session: None,

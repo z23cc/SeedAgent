@@ -1,4 +1,4 @@
-use agent_core::{Tool, ToolCall, ToolContext, ToolError, ToolRegistry, ToolResult};
+use agent_core::{RunMode, Tool, ToolCall, ToolContext, ToolError, ToolRegistry, ToolResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -18,6 +18,51 @@ pub use subagent::{
     SpawnSubagentTool, SubagentNudgeTool, SubagentSignals, consume_subagent_signals,
     write_subagent_signals,
 };
+
+/// Process-wide active `RunMode`. Set at the top of `run_goal` after the
+/// classifier (or `--mode` override) resolves, consumed inside individual
+/// tools that need to enforce read-only semantics (RF27-2: ShellTool
+/// refuses write-shaped commands when the guard is `ReadOnly`).
+///
+/// Same pattern as `repoprompt_sync` below — `ToolContext` is built fresh
+/// per call so there's no natural place to hang per-run state; a static
+/// Mutex is simple and lets us keep the `Tool` trait signature unchanged.
+/// `run_mode_guard::reset()` defaults to `Implementation` because that's
+/// the historical pre-RF27 behavior — any path that forgets to set the
+/// guard keeps working as it did before.
+pub mod run_mode_guard {
+    use super::RunMode;
+    use std::sync::{Mutex, OnceLock};
+
+    static STATE: OnceLock<Mutex<RunMode>> = OnceLock::new();
+
+    fn state() -> &'static Mutex<RunMode> {
+        STATE.get_or_init(|| Mutex::new(RunMode::Implementation))
+    }
+
+    /// Set the active mode. Called by `run_goal` once at the top of each run.
+    pub fn set(mode: RunMode) {
+        if let Ok(mut g) = state().lock() {
+            *g = mode;
+        }
+    }
+
+    /// Read the active mode. Defaults to `Implementation` if the guard has
+    /// never been set or the lock is poisoned — fail-open so we don't
+    /// silently block writes when something upstream went wrong.
+    pub fn current() -> RunMode {
+        state()
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(RunMode::Implementation)
+    }
+
+    /// Reset to the default. Tests use this between cases; runtime code
+    /// calls `set(...)` directly with the resolved mode.
+    pub fn reset() {
+        set(RunMode::Implementation);
+    }
+}
 
 /// Process-wide RepoPrompt sync state. Tiny — only used to carry "one-shot
 /// working_dirs override" suggestions from `skill_fetch` to the next
@@ -1693,6 +1738,149 @@ struct ShellArgs {
     timeout_secs: Option<u64>,
 }
 
+/// Classification of a shell command's intent for the read-only guard.
+///
+/// Conservative: anything we don't explicitly recognize as Read or Write
+/// is `Ambiguous` and gets through. The goal is to catch the obvious
+/// `echo > foo` / `rm -rf` shapes that would silently violate the
+/// read-only contract, not to be a full bash linter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellIntent {
+    /// Clearly write-shaped (output redirect, mutating subcommand). Blocked
+    /// in `RunMode::ReadOnly`.
+    Write,
+    /// Clearly read-shaped (ls, cat, git status, …). Always allowed.
+    Read,
+    /// Neither pattern matched. Allowed everywhere — pure pass-through.
+    Ambiguous,
+}
+
+/// RF27-2: classify a shell command string to decide whether ShellTool
+/// should run it under `RunMode::ReadOnly`.
+///
+/// Looked-for write signals (any one is enough → `Write`):
+///   - Output redirect operators: `>`, `>>`, `|tee`, `&>`
+///   - Destructive cmds at start of any chain segment: `rm`, `mv`,
+///     `mkdir`, `rmdir`, `cp`, `dd`, `tee`, `install`, `ln`
+///   - In-place editors: `sed -i`, `awk -i`, `perl -i`
+///   - VCS mutating subcommands: `git commit`, `git push`, `git checkout`,
+///     `git reset --hard`, `git rebase`, `git merge`, `git tag`, `git add`,
+///     `git rm`, `git mv`, `git stash`
+///   - Package managers: `cargo install/build/run/test/publish`,
+///     `npm install`, `pip install`, `brew install`
+///
+/// Read signals (any → `Read`, but write signals take precedence):
+///   - `ls`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `tree`
+///   - `grep`, `rg`, `ag`, `find`, `fd`
+///   - `git status`, `git log`, `git diff`, `git show`, `git blame`
+///   - `pwd`, `whoami`, `which`, `type`, `echo` (without redirect)
+pub fn shell_command_intent(cmd: &str) -> ShellIntent {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return ShellIntent::Ambiguous;
+    }
+
+    // Redirect operators are unambiguous writes (echo "x" > foo, cmd | tee).
+    // Match against a stripped version that removes contiguous spaces around
+    // redirect chars so `echo x>foo` and `echo x > foo` both hit.
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains(" > ")
+        || lower.contains(" >> ")
+        || lower.contains(" >>")
+        || lower.contains(">> ")
+        || lower.contains(" &> ")
+        || lower.contains(" &>>")
+        || lower.contains("| tee")
+        || lower.contains("|tee")
+    {
+        return ShellIntent::Write;
+    }
+
+    // Inspect each chained segment (split on `&&`, `||`, `;`, `|`). For
+    // each segment we look at the first token.
+    let segments = lower
+        .split(|c: char| c == ';' || c == '|' || c == '&')
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let write_first_tokens = [
+        "rm", "mv", "mkdir", "rmdir", "cp", "dd", "tee", "install", "ln", "touch",
+        "chmod", "chown",
+    ];
+    let read_first_tokens = [
+        "ls", "cat", "head", "tail", "wc", "file", "stat", "tree", "grep", "rg",
+        "ag", "find", "fd", "pwd", "whoami", "which", "type", "echo", "printf",
+        "env", "date", "uname", "hostname", "id",
+    ];
+
+    let mut any_write = false;
+    let mut any_read = false;
+    for seg in segments {
+        let mut toks = seg.split_whitespace();
+        let Some(first) = toks.next() else { continue };
+
+        // In-place editors via flag inspection.
+        if matches!(first, "sed" | "awk" | "perl") {
+            for tok in toks.clone() {
+                if tok == "-i" || tok.starts_with("-i") {
+                    return ShellIntent::Write;
+                }
+            }
+        }
+
+        if write_first_tokens.contains(&first) {
+            any_write = true;
+            continue;
+        }
+
+        if first == "git" {
+            if let Some(sub) = toks.next() {
+                let mutating = [
+                    "commit", "push", "checkout", "reset", "rebase", "merge",
+                    "tag", "add", "rm", "mv", "stash", "cherry-pick", "revert",
+                    "clean", "branch", "pull", "fetch", "init", "clone",
+                ];
+                let reading = ["status", "log", "diff", "show", "blame", "ls-files", "config"];
+                if mutating.contains(&sub) {
+                    any_write = true;
+                } else if reading.contains(&sub) {
+                    any_read = true;
+                }
+            }
+            continue;
+        }
+
+        if matches!(first, "cargo" | "npm" | "pip" | "pip3" | "yarn" | "pnpm" | "brew")
+        {
+            if let Some(sub) = toks.next() {
+                let mutating = [
+                    "install", "uninstall", "remove", "publish", "build", "run",
+                    "test", "bench", "update", "upgrade",
+                ];
+                let reading = ["check", "tree", "list", "info", "search", "outdated"];
+                if mutating.contains(&sub) {
+                    any_write = true;
+                } else if reading.contains(&sub) {
+                    any_read = true;
+                }
+            }
+            continue;
+        }
+
+        if read_first_tokens.contains(&first) {
+            any_read = true;
+        }
+    }
+
+    if any_write {
+        ShellIntent::Write
+    } else if any_read {
+        ShellIntent::Read
+    } else {
+        ShellIntent::Ambiguous
+    }
+}
+
 pub struct ShellTool;
 
 impl Tool for ShellTool {
@@ -1711,6 +1899,22 @@ impl Tool for ShellTool {
                 source,
             }
         })?;
+        // RF27-2: in read-only mode, refuse write-shaped commands. The
+        // `is_read_only_planner_tool` allowlist already lets `run_shell`
+        // through unconditionally (so `ls`/`git status` work in read-only
+        // runs); this is the inner check that closes the `echo > foo`
+        // loophole. Ambiguous commands fall through to keep the false
+        // positive rate down.
+        if matches!(run_mode_guard::current(), RunMode::ReadOnly)
+            && matches!(shell_command_intent(&args.command), ShellIntent::Write)
+        {
+            return Err(ToolError::Failed(format!(
+                "run_shell refused in read-only mode: command appears to write \
+                 ({:?}). Re-run with --mode write (or `/mode write` in the REPL) \
+                 if you really mean to mutate the project.",
+                args.command,
+            )));
+        }
         let cwd = args
             .cwd
             .as_deref()
@@ -3453,5 +3657,186 @@ mod tests {
         repoprompt_sync::reset();
         assert!(repoprompt_sync::peek_bound_window().is_none());
         assert!(repoprompt_sync::peek_pending_override().is_none());
+    }
+
+    // --- RF27 run_mode_guard + shell_command_intent ----------------------
+
+    static RUN_MODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn run_mode_setup() -> std::sync::MutexGuard<'static, ()> {
+        let g = RUN_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        run_mode_guard::reset();
+        g
+    }
+
+    #[test]
+    fn run_mode_guard_defaults_to_implementation() {
+        let _g = run_mode_setup();
+        // reset() in setup pins to Implementation explicitly.
+        assert_eq!(run_mode_guard::current(), RunMode::Implementation);
+    }
+
+    #[test]
+    fn run_mode_guard_set_round_trips() {
+        let _g = run_mode_setup();
+        run_mode_guard::set(RunMode::ReadOnly);
+        assert_eq!(run_mode_guard::current(), RunMode::ReadOnly);
+        run_mode_guard::set(RunMode::Implementation);
+        assert_eq!(run_mode_guard::current(), RunMode::Implementation);
+    }
+
+    #[test]
+    fn shell_intent_classifies_obvious_reads() {
+        for cmd in [
+            "ls",
+            "ls -la",
+            "cat README.md",
+            "head -20 file.txt",
+            "wc -l Cargo.toml",
+            "grep TODO src/",
+            "rg --files",
+            "find . -name '*.rs'",
+            "git status",
+            "git log --oneline -5",
+            "git diff",
+            "pwd",
+            "echo hello",
+            "cargo check",
+            "cargo tree",
+        ] {
+            assert_eq!(
+                shell_command_intent(cmd),
+                ShellIntent::Read,
+                "expected Read for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_intent_classifies_obvious_writes() {
+        for cmd in [
+            "echo x > foo.txt",
+            "echo x >> log.txt",
+            "ls > listing.out",
+            "ls | tee tee-out.txt",
+            "cat foo | tee bar",
+            "rm -rf target",
+            "mv a b",
+            "mkdir new-dir",
+            "cp -r src dst",
+            "touch new-file",
+            "chmod +x script.sh",
+            "chown user file",
+            "sed -i 's/a/b/' file",
+            "perl -i -pe 's/x/y/' f",
+            "git commit -m 'x'",
+            "git push origin main",
+            "git checkout main",
+            "git reset --hard HEAD~1",
+            "git add .",
+            "cargo install --path .",
+            "cargo build",
+            "cargo test",
+            "npm install foo",
+            "pip install pkg",
+        ] {
+            assert_eq!(
+                shell_command_intent(cmd),
+                ShellIntent::Write,
+                "expected Write for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_intent_treats_unknown_commands_as_ambiguous() {
+        for cmd in [
+            "make something",     // could read or write
+            "python script.py",   // could read or write
+            "node app.js",        // could read or write
+            "some-custom-tool",   // we don't know
+            "",                   // empty
+        ] {
+            assert_eq!(
+                shell_command_intent(cmd),
+                ShellIntent::Ambiguous,
+                "expected Ambiguous for: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_intent_write_in_chain_dominates_reads() {
+        // `git status && rm -rf target` is a Write — chained writes block.
+        assert_eq!(
+            shell_command_intent("git status && rm -rf target"),
+            ShellIntent::Write
+        );
+        assert_eq!(
+            shell_command_intent("ls; mv old new"),
+            ShellIntent::Write
+        );
+    }
+
+    #[test]
+    fn shell_tool_refuses_writes_in_read_only_mode() {
+        let _g = run_mode_setup();
+        run_mode_guard::set(RunMode::ReadOnly);
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = temp_ctx(&root);
+        let call = ToolCall::new(
+            "run_shell",
+            json!({ "command": "echo x > foo.txt" }),
+        );
+        let err = ShellTool.execute(&ctx, &call).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read-only mode") && msg.contains("write"),
+            "unexpected error: {msg}"
+        );
+        // The file MUST NOT have been created.
+        assert!(
+            !root.join("foo.txt").exists(),
+            "read-only block leaked: foo.txt was written"
+        );
+        run_mode_guard::reset();
+    }
+
+    #[test]
+    fn shell_tool_allows_reads_in_read_only_mode() {
+        let _g = run_mode_setup();
+        run_mode_guard::set(RunMode::ReadOnly);
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = temp_ctx(&root);
+        // `true` always exits 0 on POSIX, costs nothing.
+        let call = ToolCall::new("run_shell", json!({ "command": "true" }));
+        let result = ShellTool.execute(&ctx, &call);
+        assert!(result.is_ok(), "read-only should allow `true`: {result:?}");
+        // Same for `ls` (we registered it as a Read).
+        let call = ToolCall::new("run_shell", json!({ "command": "ls" }));
+        let result = ShellTool.execute(&ctx, &call);
+        assert!(result.is_ok(), "read-only should allow `ls`: {result:?}");
+        run_mode_guard::reset();
+    }
+
+    #[test]
+    fn shell_tool_allows_writes_in_implementation_mode() {
+        let _g = run_mode_setup();
+        run_mode_guard::set(RunMode::Implementation);
+        let root = temp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = temp_ctx(&root);
+        let call = ToolCall::new(
+            "run_shell",
+            json!({ "command": "echo hi > test-file.txt" }),
+        );
+        let result = ShellTool.execute(&ctx, &call);
+        assert!(result.is_ok(), "implementation must allow writes: {result:?}");
+        // Confirm the side effect actually happened (sanity).
+        assert!(root.join("test-file.txt").exists());
+        run_mode_guard::reset();
     }
 }

@@ -235,7 +235,7 @@ pub fn reflect_markdown(records: &[SessionRecord]) -> String {
 
     for record in records {
         match &record.event {
-            AgentEvent::RunStarted { goal: g, cwd: c } => {
+            AgentEvent::RunStarted { goal: g, cwd: c, .. } => {
                 goal = g.clone();
                 cwd = Some(c.display().to_string());
             }
@@ -1347,6 +1347,8 @@ mod tests {
             record(AgentEvent::RunStarted {
                 goal: goal.to_string(),
                 cwd: std::env::current_dir().unwrap(),
+                mode: Default::default(),
+                mode_source: Default::default(),
             }),
             record(AgentEvent::ToolStarted { call: call.clone() }),
             record(AgentEvent::ToolFinished {

@@ -33,6 +33,7 @@ pub(crate) fn default_interactive_command() -> Command {
         plugins: false,
         codex: false,
         record_only: false,
+        mode: crate::commands::run::ModeArg::Auto,
     }
 }
 
@@ -50,6 +51,9 @@ pub(crate) struct InteractiveArgs {
     pub(crate) plugins: bool,
     pub(crate) codex: bool,
     pub(crate) record_only: bool,
+    /// RF27-3: REPL-session mode override. `Auto` = auto-classify per-goal
+    /// (default); `Read`/`Write` pin until `/mode` is changed.
+    pub(crate) mode: crate::commands::run::ModeArg,
 }
 
 /// Per-REPL session state that we keep outside `InteractiveArgs` because it's
@@ -212,6 +216,7 @@ pub(crate) fn run_interactive(
                         mcp_allow: args.mcp_allow.clone(),
                         plugins: args.plugins,
                     },
+                    mode: args.mode,
                     codex_session: Some(&mut codex_session),
                 }) {
                     agent_tui::print_error(err);
@@ -309,6 +314,10 @@ fn handle_interactive_command(
         }
         "/cd" => {
             handle_cd_command(workspace, rest);
+            Ok(false)
+        }
+        "/mode" => {
+            handle_mode_command(args, rest);
             Ok(false)
         }
         cmd if cmd.starts_with('/') => {
@@ -641,6 +650,60 @@ fn handle_compact_command(cli: &Cli, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+// --- /mode -------------------------------------------------------------------
+
+/// `/mode [auto|read|write]` — view or set the REPL-session run mode.
+///
+/// `auto` (default): each goal is classified by `agent_runtime::classify_run_mode`.
+/// `read`: pin to ReadOnly — write tools blocked, `run_shell` rejects
+///   write-shaped commands, synthesis pass still eligible.
+/// `write`: pin to Implementation — full toolset, no read-only gating, no
+///   synthesis pass.
+///
+/// The chosen mode is stored on `args.mode` and applied to every subsequent
+/// `run_goal` invocation from this REPL (including `/retry`). It does NOT
+/// retroactively affect a currently-running goal — switching while the
+/// planner is busy is impossible because the REPL is blocked.
+fn handle_mode_command(args: &mut InteractiveArgs, rest: &str) {
+    use crate::commands::run::ModeArg;
+    if rest.is_empty() {
+        let current = match args.mode {
+            ModeArg::Auto => "auto (classify per goal)",
+            ModeArg::Read => "read (pinned read-only)",
+            ModeArg::Write => "write (pinned implementation)",
+        };
+        println!("mode: {current}");
+        println!("  /mode auto     classify each goal by keyword");
+        println!("  /mode read     pin read-only (block writes)");
+        println!("  /mode write    pin implementation (full tools)");
+        return;
+    }
+    let normalized = rest.to_ascii_lowercase();
+    let (next, label) = match normalized.as_str() {
+        "auto" | "default" | "-" => (ModeArg::Auto, "auto"),
+        "read" | "readonly" | "read-only" | "ro" | "r" => (ModeArg::Read, "read"),
+        "write" | "implementation" | "impl" | "rw" | "w" => (ModeArg::Write, "write"),
+        _ => {
+            agent_tui::print_error(format!(
+                "unknown mode: {rest} (try auto|read|write)"
+            ));
+            return;
+        }
+    };
+    if args.mode == next {
+        println!("mode: already {label}");
+    } else {
+        let prev = match args.mode {
+            ModeArg::Auto => "auto",
+            ModeArg::Read => "read",
+            ModeArg::Write => "write",
+        };
+        args.mode = next;
+        println!("mode: {prev} → {label}");
+        println!("  applies to subsequent goals in this REPL session");
+    }
+}
+
 // --- /cd ---------------------------------------------------------------------
 
 /// `/cd [<path>]` — change the REPL workspace cwd.
@@ -731,6 +794,7 @@ fn handle_retry_command(
             mcp_allow: args.mcp_allow.clone(),
             plugins: args.plugins,
         },
+        mode: args.mode,
         // Reuse the REPL-lifetime Codex client (RF25-1) — same fingerprint
         // means same subprocess, no respawn cost on retry.
         codex_session: Some(codex_session),
@@ -801,6 +865,7 @@ mod tests {
             plugins: false,
             codex: false,
             record_only: false,
+            mode: crate::commands::run::ModeArg::Auto,
         }
     }
 
@@ -1145,6 +1210,52 @@ mod tests {
             agent_tools::repoprompt_sync::peek_bound_window().is_some(),
             "no-op /cd must preserve the RP bound-window cache"
         );
+    }
+
+    // --- RF27-3 /mode ----------------------------------------------------
+
+    #[test]
+    fn mode_command_empty_arg_does_not_mutate() {
+        let mut a = args();
+        a.mode = crate::commands::run::ModeArg::Read;
+        handle_mode_command(&mut a, "");
+        // Empty just prints; state unchanged.
+        assert_eq!(a.mode, crate::commands::run::ModeArg::Read);
+    }
+
+    #[test]
+    fn mode_command_sets_each_variant() {
+        let mut a = args();
+        handle_mode_command(&mut a, "read");
+        assert_eq!(a.mode, crate::commands::run::ModeArg::Read);
+        handle_mode_command(&mut a, "write");
+        assert_eq!(a.mode, crate::commands::run::ModeArg::Write);
+        handle_mode_command(&mut a, "auto");
+        assert_eq!(a.mode, crate::commands::run::ModeArg::Auto);
+    }
+
+    #[test]
+    fn mode_command_accepts_aliases() {
+        let mut a = args();
+        handle_mode_command(&mut a, "readonly");
+        assert_eq!(a.mode, crate::commands::run::ModeArg::Read);
+        handle_mode_command(&mut a, "RO");
+        assert_eq!(a.mode, crate::commands::run::ModeArg::Read);
+        handle_mode_command(&mut a, "rw");
+        assert_eq!(a.mode, crate::commands::run::ModeArg::Write);
+        handle_mode_command(&mut a, "implementation");
+        assert_eq!(a.mode, crate::commands::run::ModeArg::Write);
+        handle_mode_command(&mut a, "default");
+        assert_eq!(a.mode, crate::commands::run::ModeArg::Auto);
+    }
+
+    #[test]
+    fn mode_command_rejects_unknown_values() {
+        let mut a = args();
+        a.mode = crate::commands::run::ModeArg::Read;
+        handle_mode_command(&mut a, "yolo");
+        // Bad input → state unchanged, error printed.
+        assert_eq!(a.mode, crate::commands::run::ModeArg::Read);
     }
 
     #[test]

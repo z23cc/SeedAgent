@@ -263,6 +263,12 @@ pub(crate) fn run_tool(
     session.append(AgentEvent::RunStarted {
         goal: format!("tool:{}", call.name),
         cwd: cwd.clone(),
+        // One-shot `seed tool` invocations don't go through goal
+        // classification — they're explicit user-named tool calls. Use
+        // Implementation (full access) + Explicit so the source field tells
+        // the truth even though there's no CLI surface for it here.
+        mode: agent_core::RunMode::Implementation,
+        mode_source: agent_core::ModeSource::Explicit,
     })?;
     let result = execute_call(&mut session, &cwd, &skills_dir, store.root(), call)?;
     session.append(AgentEvent::RunFinished {

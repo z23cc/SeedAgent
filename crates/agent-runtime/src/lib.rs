@@ -200,6 +200,19 @@ pub fn is_read_only_analysis_goal(goal: &str) -> bool {
         && !implementation_terms.iter().any(|term| lower.contains(term))
 }
 
+/// RF27-1: typed accessor for the goal classifier. `is_read_only_analysis_goal`
+/// is kept as the underlying primitive so the keyword tables stay in one
+/// place; this wraps the boolean into the public `RunMode` enum so callers
+/// (the CLI, `run_goal`, the AgentEvent emitter) can hand the result
+/// around without reasoning about polarity each time.
+pub fn classify_run_mode(goal: &str) -> agent_core::RunMode {
+    if is_read_only_analysis_goal(goal) {
+        agent_core::RunMode::ReadOnly
+    } else {
+        agent_core::RunMode::Implementation
+    }
+}
+
 /// `is_deep_analysis_goal` distinguishes "summarize this repo" (light, 2-3
 /// reads suffice) from "deeply analyze this project" (the user expects
 /// substantive findings beyond README paraphrase). Deep goals get a larger
