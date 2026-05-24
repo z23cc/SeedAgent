@@ -464,7 +464,7 @@ fn maybe_emit_phase_divider(err: &mut impl Write, name: &str) {
         if prev.is_some() {
             let _ = writeln!(err);
         }
-        let _ = writeln!(err, "{}", agent_tui::phase_divider(phase.label(), 70));
+        let _ = writeln!(err, "{}", agent_core::tui::phase_divider(phase.label(), 70));
         LAST_PHASE.with(|cell| cell.set(Some(phase)));
     }
 }
@@ -474,10 +474,10 @@ fn maybe_emit_phase_divider(err: &mut impl Write, name: &str) {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn emit_tool_line(
-    spinner: Option<&agent_tui::Spinner>,
+    spinner: Option<&agent_core::tui::Spinner>,
     name: &str,
     args: &str,
-    status: agent_tui::Status,
+    status: agent_core::tui::Status,
     elapsed: Option<Duration>,
     note: &str,
 ) {
@@ -492,23 +492,23 @@ pub(crate) fn emit_tool_line(
     let _ = write!(err, "\r\x1b[2K");
     maybe_emit_phase_divider(&mut err, name);
 
-    let marker = agent_tui::status_marker(status);
-    let styled_name = agent_tui::tool_name(name);
+    let marker = agent_core::tui::status_marker(status);
+    let styled_name = agent_core::tui::tool_name(name);
     let elapsed_chunk = match elapsed {
         Some(d) if d >= SLOW_OP_THRESHOLD => format!(
             " {}",
-            agent_tui::slow_elapsed(&agent_tui::format_elapsed(d))
+            agent_core::tui::slow_elapsed(&agent_core::tui::format_elapsed(d))
         ),
         Some(d) => format!(
             " {}",
-            agent_tui::fast_elapsed(&agent_tui::format_elapsed(d))
+            agent_core::tui::fast_elapsed(&agent_core::tui::format_elapsed(d))
         ),
         None => String::new(),
     };
     let note_chunk = if note.is_empty() {
         String::new()
     } else {
-        format!(" {}", agent_tui::dim_text(note))
+        format!(" {}", agent_core::tui::dim_text(note))
     };
     let body = if args.is_empty() {
         format!("{marker} {styled_name}{elapsed_chunk}{note_chunk}")

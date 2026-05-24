@@ -1,5 +1,5 @@
 use agent_core::AgentEvent;
-use agent_session::SessionRecord;
+use agent_core::session::SessionRecord;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};

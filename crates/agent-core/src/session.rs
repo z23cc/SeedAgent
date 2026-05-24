@@ -1,4 +1,4 @@
-use agent_core::AgentEvent;
+use crate::AgentEvent;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

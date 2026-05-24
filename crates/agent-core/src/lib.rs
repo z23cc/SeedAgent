@@ -3,6 +3,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+// RF41-B1: absorbed agent-tui and agent-session as submodules to drop
+// the workspace from 14 to 12 crates. Old `use agent_core::tui::X` becomes
+// `use agent_core::tui::X`; same for agent_session → agent_core::session.
+pub mod session;
+pub mod tui;
+
 /// Whether a run is allowed to mutate the project.
 ///
 /// Set by `run_goal` early (after consulting the explicit `--mode` flag and

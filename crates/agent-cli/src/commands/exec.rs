@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use agent_core::{AgentEvent, ToolCall, ToolContext, ToolResult};
-use agent_session::SessionWriter;
+use agent_core::session::SessionWriter;
 use anyhow::Result;
 
 pub(crate) fn execute_call(

@@ -29,7 +29,7 @@ pub(crate) trait Planner {
     /// static subtitle (oracle: "RepoPrompt oracle thinking…"). Default clears
     /// the subtitle so Codex's streaming-token subtitle isn't stuck from the
     /// previous turn.
-    fn on_turn_start(&self, spinner: &agent_tui::Spinner) {
+    fn on_turn_start(&self, spinner: &agent_core::tui::Spinner) {
         spinner.set_subtitle(None);
     }
 
@@ -42,7 +42,7 @@ pub(crate) trait Planner {
         tool_infos: &[ToolInfo],
         state: &agent_runtime::AgentLoopState,
         memory: &agent_runtime::PlannerMemoryContext,
-        spinner: &agent_tui::Spinner,
+        spinner: &agent_core::tui::Spinner,
     ) -> Result<(agent_runtime::PlannedAction, usize), agent_runtime::RuntimeError>;
 
     /// RF36-1: input char count of the most-recently-built planner prompt.
@@ -66,7 +66,7 @@ impl Planner for OraclePlanner {
         "oracle"
     }
 
-    fn on_turn_start(&self, spinner: &agent_tui::Spinner) {
+    fn on_turn_start(&self, spinner: &agent_core::tui::Spinner) {
         spinner.set_subtitle(Some("RepoPrompt oracle thinking…".to_string()));
     }
 
@@ -76,7 +76,7 @@ impl Planner for OraclePlanner {
         tool_infos: &[ToolInfo],
         state: &agent_runtime::AgentLoopState,
         memory: &agent_runtime::PlannerMemoryContext,
-        _spinner: &agent_tui::Spinner,
+        _spinner: &agent_core::tui::Spinner,
     ) -> Result<(agent_runtime::PlannedAction, usize), agent_runtime::RuntimeError> {
         let prompt =
             agent_runtime::planner_prompt_with_state_and_memory(goal, tool_infos, state, memory);
@@ -136,7 +136,7 @@ impl<'a> Planner for CodexPlanner<'a> {
         tool_infos: &[ToolInfo],
         state: &agent_runtime::AgentLoopState,
         memory: &agent_runtime::PlannerMemoryContext,
-        spinner: &agent_tui::Spinner,
+        spinner: &agent_core::tui::Spinner,
     ) -> Result<(agent_runtime::PlannedAction, usize), agent_runtime::RuntimeError> {
         let prompt =
             agent_runtime::planner_prompt_with_state_and_memory(goal, tool_infos, state, memory);
@@ -183,7 +183,7 @@ impl Planner for HttpPlanner {
         tool_infos: &[ToolInfo],
         state: &agent_runtime::AgentLoopState,
         memory: &agent_runtime::PlannerMemoryContext,
-        spinner: &agent_tui::Spinner,
+        spinner: &agent_core::tui::Spinner,
     ) -> Result<(agent_runtime::PlannedAction, usize), agent_runtime::RuntimeError> {
         // RF32: stream HTTP responses so the user sees live token counts in
         // the spinner subtitle, matching the Codex path. The blocking

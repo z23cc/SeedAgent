@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use agent_core::{AgentEvent, ToolCall, ToolInfo, ToolResult};
-use agent_session::{SessionStore, SessionWriter};
+use agent_core::session::{SessionStore, SessionWriter};
 use anyhow::Result;
 
 use crate::display::{
@@ -539,7 +539,7 @@ fn is_memoizable_tool(name: &str) -> bool {
 }
 
 fn run_planner_tool(
-    spinner: Option<&agent_tui::Spinner>,
+    spinner: Option<&agent_core::tui::Spinner>,
     allowed_tool_names: &BTreeSet<String>,
     session: &mut SessionWriter,
     cwd: &Path,
@@ -555,7 +555,7 @@ fn run_planner_tool(
             spinner,
             &compose_tool_label(&call.name, inner.as_deref()),
             &args_text,
-            agent_tui::Status::Blocked,
+            agent_core::tui::Status::Blocked,
             None,
             "read-only mode",
         );
@@ -582,9 +582,9 @@ fn run_planner_tool(
     match outcome {
         Ok(result) => {
             let status = if result.ok {
-                agent_tui::Status::Ok
+                agent_core::tui::Status::Ok
             } else {
-                agent_tui::Status::Failed
+                agent_core::tui::Status::Failed
             };
             let note = if result.ok {
                 String::new()
@@ -607,7 +607,7 @@ fn run_planner_tool(
                 spinner,
                 &compose_tool_label(&call.name, inner_tool.as_deref()),
                 &args_text,
-                agent_tui::Status::Failed,
+                agent_core::tui::Status::Failed,
                 Some(elapsed),
                 &note,
             );
@@ -678,7 +678,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
     // the goal text — but always present.
     eprintln!(
         "{}",
-        agent_tui::dim_text(&format!(
+        agent_core::tui::dim_text(&format!(
             "mode: {} ({})",
             match run_mode {
                 agent_core::RunMode::ReadOnly => "read-only",
@@ -741,7 +741,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
     let mut run_turns: usize = 0;
 
     if use_codex {
-        let spinner = agent_tui::Spinner::start("codex · running prompt");
+        let spinner = agent_core::tui::Spinner::start("codex · running prompt");
         let cfg = crate::commands::codex::codex_config_full(
             model,
             Some(cwd.clone()),
@@ -778,7 +778,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 if let Some(t) = result.tokens.as_ref() {
                     eprintln!(
                         "{}",
-                        agent_tui::dim_text(&format!(
+                        agent_core::tui::dim_text(&format!(
                             "(tokens: {} in / {} cached / {} out / {} reasoning · {} total)",
                             t.input_tokens,
                             t.cached_input_tokens,
@@ -818,7 +818,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             .iter()
             .map(|tool| tool.name.clone())
             .collect::<BTreeSet<_>>();
-        let spinner = agent_tui::Spinner::start(format!("planning · turn 1/{max_turns}"));
+        let spinner = agent_core::tui::Spinner::start(format!("planning · turn 1/{max_turns}"));
         let turn_timings: RefCell<Vec<TurnTiming>> = RefCell::new(Vec::new());
         let active_turn: Cell<usize> = Cell::new(1);
         // Track consecutive tool failures. Reset on any successful tool call;
@@ -891,7 +891,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                             Some(&spinner),
                             &compose_tool_label(&call.name, inner_tool.as_deref()),
                             &args_text,
-                            agent_tui::Status::Ok,
+                            agent_core::tui::Status::Ok,
                             None,
                             "cached",
                         );
@@ -971,12 +971,12 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
             // user sees from the trace whether synthesis fired.
             eprintln!(
                 "{}",
-                agent_tui::dim_text(
+                agent_core::tui::dim_text(
                     "(synthesis pass skipped: draft already conforms to schema)"
                 )
             );
         } else if synthesis_eligible {
-            let synthesis_spinner = agent_tui::Spinner::start("synthesizing answer · turn final");
+            let synthesis_spinner = agent_core::tui::Spinner::start("synthesizing answer · turn final");
             let synthesis_prompt = build_synthesis_prompt(
                 &goal,
                 &loop_result.summary,
@@ -1051,7 +1051,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 Ok(rewritten) => {
                     eprintln!(
                         "{}",
-                        agent_tui::dim_text(
+                        agent_core::tui::dim_text(
                             "(synthesis pass applied: draft rewritten to schema)"
                         )
                     );
@@ -1060,7 +1060,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
                 Err(err) => {
                     eprintln!(
                         "{}",
-                        agent_tui::dim_text(&format!(
+                        agent_core::tui::dim_text(&format!(
                             "(synthesis pass skipped: {err}; using draft answer)"
                         ))
                     );
@@ -1165,7 +1165,7 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
         })?;
     }
 
-    let mut info = agent_tui::Info::new();
+    let mut info = agent_core::tui::Info::new();
     if run_turns > 0 {
         info = info.pair("turns", run_turns.to_string());
     }
@@ -1200,7 +1200,7 @@ struct TimingStats {
 }
 
 fn build_timing_stats(session: &SessionWriter) -> Result<Option<TimingStats>> {
-    let records = agent_session::read_records(session.path())?;
+    let records = agent_core::session::read_records(session.path())?;
     let mut planner_ms_total: u64 = 0;
     let mut exec_ms_total: u64 = 0;
     let mut planner_chars_total: usize = 0;
@@ -1281,7 +1281,7 @@ fn drive_planner_loop<M, T>(
     max_turns: usize,
     goal: &str,
     tool_infos: &[ToolInfo],
-    spinner: &agent_tui::Spinner,
+    spinner: &agent_core::tui::Spinner,
     active_turn: &Cell<usize>,
     turn_timings: &RefCell<Vec<TurnTiming>>,
     failure_streak: &Cell<usize>,
@@ -1582,7 +1582,7 @@ mod tests {
             _tool_infos: &[ToolInfo],
             _state: &agent_runtime::AgentLoopState,
             _memory: &agent_runtime::PlannerMemoryContext,
-            _spinner: &agent_tui::Spinner,
+            _spinner: &agent_core::tui::Spinner,
         ) -> Result<(agent_runtime::PlannedAction, usize), agent_runtime::RuntimeError> {
             let idx = self.calls.get();
             self.calls.set(idx + 1);
@@ -1608,7 +1608,7 @@ mod tests {
     /// the test doesn't care about — `Cell`s, `RefCell`, spinner, etc.
     /// Constructed fresh per test so state doesn't bleed between cases.
     struct LoopFixture {
-        spinner: agent_tui::Spinner,
+        spinner: agent_core::tui::Spinner,
         active_turn: Cell<usize>,
         turn_timings: RefCell<Vec<TurnTiming>>,
         failure_streak: Cell<usize>,
@@ -1620,7 +1620,7 @@ mod tests {
             Self {
                 // In test runs stderr isn't a terminal, so Spinner::start
                 // returns a no-op instance — no background thread, no I/O.
-                spinner: agent_tui::Spinner::start("test"),
+                spinner: agent_core::tui::Spinner::start("test"),
                 active_turn: Cell::new(1),
                 turn_timings: RefCell::new(Vec::new()),
                 failure_streak: Cell::new(0),

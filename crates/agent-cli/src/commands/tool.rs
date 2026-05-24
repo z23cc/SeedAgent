@@ -6,7 +6,7 @@ use std::env;
 use std::path::PathBuf;
 
 use agent_core::{AgentEvent, ToolCall};
-use agent_session::SessionStore;
+use agent_core::session::SessionStore;
 use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
 use serde_json::json;

@@ -1,6 +1,6 @@
 //! `seed replay`: dump a session's JSONL events with timestamps.
 
-use agent_session::SessionStore;
+use agent_core::session::SessionStore;
 use anyhow::Result;
 
 pub(crate) fn replay(store: &SessionStore, session: Option<&str>) -> Result<()> {

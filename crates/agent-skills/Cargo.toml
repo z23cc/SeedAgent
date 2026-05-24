@@ -10,7 +10,6 @@ rust-version.workspace = true
 agent-core.workspace = true
 agent-memory.workspace = true
 agent-repoprompt.workspace = true
-agent-session.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true

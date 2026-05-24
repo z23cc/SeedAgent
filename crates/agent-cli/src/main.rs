@@ -1,6 +1,6 @@
 use agent_core::ToolCall;
 use agent_delegate::ApprovalMode;
-use agent_session::SessionStore;
+use agent_core::session::SessionStore;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
@@ -501,7 +501,7 @@ fn consolidate_run_skill(
     goal: &str,
     session_path: &Path,
 ) -> Result<agent_skills::SkillConsolidation> {
-    let records = agent_session::read_records(session_path)?;
+    let records = agent_core::session::read_records(session_path)?;
     let name = unique_skill_name(skills_dir, goal);
     let binding = agent_skills::query_current_repoprompt_binding();
     Ok(agent_skills::consolidate_skill_with_binding(

@@ -1,5 +1,5 @@
 //! `seed chat` (and `seed` with no args): reedline REPL that loops
-//! `agent_tui::Repl::read` → planner / codex / record-only depending on flags.
+//! `agent_core::tui::Repl::read` → planner / codex / record-only depending on flags.
 //!
 //! Slash commands short-circuit before the planner. We keep the full handler
 //! set here (rather than splitting per-command) because each handler is small
@@ -11,7 +11,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
-use agent_session::SessionStore;
+use agent_core::session::SessionStore;
 use anyhow::{Context, Result};
 
 use crate::commands::run::{PlannerProvider, ProviderSpec, RunGoalArgs, RunPolicy, run_goal};
@@ -144,7 +144,7 @@ pub(crate) fn run_interactive(
     let mut workspace = SeedWorkspace::new(initial_cwd);
     std::fs::create_dir_all(&cli.sessions_dir)?;
     let history_path = cli.sessions_dir.join(".seed_history");
-    let mut repl = agent_tui::Repl::new(history_path);
+    let mut repl = agent_core::tui::Repl::new(history_path);
     let mode = if args.record_only {
         "record"
     } else if args.codex {
@@ -159,9 +159,9 @@ pub(crate) fn run_interactive(
     // both drop it, which kills the subprocess via Drop.
     let mut codex_session = crate::commands::codex_session::CodexSession::default();
 
-    agent_tui::print_banner();
+    agent_core::tui::print_banner();
     loop {
-        let prompt = agent_tui::PromptState::new(
+        let prompt = agent_core::tui::PromptState::new(
             workspace.cwd.clone(),
             mode,
             args.provider.clone(),
@@ -169,13 +169,13 @@ pub(crate) fn run_interactive(
         );
 
         match repl.read(&prompt)? {
-            agent_tui::ReplInput::Line(input) => {
+            agent_core::tui::ReplInput::Line(input) => {
                 // Shell escape: `!cmd` runs `cmd` in cwd via the user's shell
                 // and prints its output. Must precede the slash dispatcher so
                 // `!` is not mistaken for an unknown command.
-                if let Some(rest) = input.strip_prefix(agent_tui::SHELL_ESCAPE_PREFIX) {
+                if let Some(rest) = input.strip_prefix(agent_core::tui::SHELL_ESCAPE_PREFIX) {
                     if let Err(err) = run_shell_escape(&workspace.cwd, rest.trim()) {
-                        agent_tui::print_error(err);
+                        agent_core::tui::print_error(err);
                     }
                     continue;
                 }
@@ -223,7 +223,7 @@ pub(crate) fn run_interactive(
                     use_daemon: args.use_daemon,
                     codex_session: Some(&mut codex_session),
                 }) {
-                    agent_tui::print_error(err);
+                    agent_core::tui::print_error(err);
                 }
                 // RF33-2: poll for skill-requested sticky cwd change. If
                 // a skill_fetch during the run set `sticky_cwd: true`,
@@ -233,8 +233,8 @@ pub(crate) fn run_interactive(
                 // result is known.
                 poll_sticky_cwd_into_workspace(&mut workspace, &mut codex_session);
             }
-            agent_tui::ReplInput::Empty | agent_tui::ReplInput::Continue => {}
-            agent_tui::ReplInput::Exit => break,
+            agent_core::tui::ReplInput::Empty | agent_core::tui::ReplInput::Continue => {}
+            agent_core::tui::ReplInput::Exit => break,
         }
     }
 
@@ -261,7 +261,7 @@ fn handle_interactive_command(
     match head {
         "/exit" | "/quit" | ":q" => Ok(true),
         "/help" | "?" => {
-            agent_tui::print_help();
+            agent_core::tui::print_help();
             Ok(false)
         }
         "/doctor" => {
@@ -345,7 +345,7 @@ fn handle_interactive_command(
             Ok(false)
         }
         cmd if cmd.starts_with('/') => {
-            agent_tui::print_error(format!("unknown command: {cmd}"));
+            agent_core::tui::print_error(format!("unknown command: {cmd}"));
             Ok(false)
         }
         _ => Ok(false),
@@ -436,7 +436,7 @@ fn handle_model_command(args: &mut InteractiveArgs, rest: &str) -> Result<()> {
         // Only meaningful for codex right now — the cache is codex-specific.
         // For other providers, point the user at `/providers` instead.
         if args.provider != "codex" {
-            agent_tui::print_error(format!(
+            agent_core::tui::print_error(format!(
                 "/model list only works for the codex provider (current: {}). Try /providers.",
                 args.provider
             ));
@@ -563,7 +563,7 @@ fn handle_effort_command(args: &mut InteractiveArgs, rest: &str) {
         normalized.as_str(),
         "low" | "medium" | "high" | "minimal"
     ) {
-        agent_tui::print_error(format!(
+        agent_core::tui::print_error(format!(
             "unknown effort level: {rest} (try low|medium|high|minimal|none)"
         ));
         return;
@@ -712,7 +712,7 @@ fn handle_dump_command(store: &SessionStore) {
             println!("  seed replay        # step-through");
         }
         Err(err) => {
-            agent_tui::print_error(err);
+            agent_core::tui::print_error(err);
         }
     }
 }
@@ -775,7 +775,7 @@ fn handle_mode_command(args: &mut InteractiveArgs, rest: &str) {
         "read" | "readonly" | "read-only" | "ro" | "r" => (ModeArg::Read, "read"),
         "write" | "implementation" | "impl" | "rw" | "w" => (ModeArg::Write, "write"),
         _ => {
-            agent_tui::print_error(format!(
+            agent_core::tui::print_error(format!(
                 "unknown mode: {rest} (try auto|read|write)"
             ));
             return;
@@ -827,7 +827,7 @@ fn poll_sticky_cwd_into_workspace(
     }
     eprintln!(
         "{}",
-        agent_tui::dim_text(&format!(
+        agent_core::tui::dim_text(&format!(
             "(skill applied sticky cwd: {} → {})",
             prev.display(),
             target.display(),
@@ -937,7 +937,7 @@ fn handle_cd_command(workspace: &mut SeedWorkspace, rest: &str) {
             println!("cwd: {} → {}", old.display(), new_cwd.display());
             println!("  next codex turn + repoprompt call will sync to the new cwd");
         }
-        Err(err) => agent_tui::print_error(err),
+        Err(err) => agent_core::tui::print_error(err),
     }
 }
 
@@ -972,7 +972,7 @@ fn handle_retry_command(
     codex_session: &mut crate::commands::codex_session::CodexSession,
 ) -> Result<()> {
     let Some(goal) = state.last_goal.clone() else {
-        agent_tui::print_error("nothing to retry — submit a goal first");
+        agent_core::tui::print_error("nothing to retry — submit a goal first");
         return Ok(());
     };
     println!("retrying: {goal}");
@@ -1008,7 +1008,7 @@ fn handle_retry_command(
     // iterating on this goal, so /retry should keep working.
     state.last_goal = Some(goal);
     if let Err(err) = result {
-        agent_tui::print_error(err);
+        agent_core::tui::print_error(err);
     }
     Ok(())
 }

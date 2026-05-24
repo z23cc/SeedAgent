@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use agent_session::SessionStore;
+use agent_core::session::SessionStore;
 use anyhow::Result;
 use clap::Subcommand;
 

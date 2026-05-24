@@ -6,7 +6,7 @@ use std::env;
 use std::path::Path;
 
 use agent_llm::{ModelId, ProviderRouter};
-use agent_session::SessionStore;
+use agent_core::session::SessionStore;
 use anyhow::Result;
 
 use crate::commands::codex_session::CodexSession;
@@ -18,7 +18,7 @@ pub(crate) fn doctor(skills_dir: &Path, store: &SessionStore) -> Result<()> {
     println!("- cwd: {}", env::current_dir()?.display());
     println!("- sessions: {}", store.root().display());
     println!("- skills: {}", skills_dir.display());
-    println!("- tui: {}", agent_tui::status());
+    println!("- tui: {}", agent_core::tui::status());
     println!(
         "- repoprompt: {}",
         agent_repoprompt::default_cli_path().display()

@@ -7,6 +7,15 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Core: types shared by every crate. RF41-B1 absorbed agent-session and
+# agent-tui to drop the workspace from 14 to 12 crates — pulls in their
+# transitive deps below.
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+anyhow.workspace = true
+# RF41-B1 from agent-session:
+chrono.workspace = true
+uuid.workspace = true
+# RF41-B1 from agent-tui:
+reedline.workspace = true
