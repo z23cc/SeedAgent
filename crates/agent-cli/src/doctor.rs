@@ -10,6 +10,7 @@ use agent_session::SessionStore;
 use anyhow::Result;
 
 use crate::commands::codex_session::CodexSession;
+use crate::commands::run::ModeArg;
 
 pub(crate) fn doctor(skills_dir: &Path, store: &SessionStore) -> Result<()> {
     let registry = agent_tools::seed_registry();
@@ -36,6 +37,47 @@ pub(crate) fn doctor(skills_dir: &Path, store: &SessionStore) -> Result<()> {
     // (no REPL session), we just print env::current_dir() + any cached RP
     // bound state. For REPL `/doctor` callers see `cwd_health_check` below.
     cwd_health_check(&env::current_dir()?, None)?;
+    // RF28-1: run-mode health check. Same shape — for one-shot doctor there's
+    // no REPL session so we pass None for the REPL-pinned mode and report
+    // only the process-global guard's current value (defaults to
+    // Implementation if no run has fired yet in this process).
+    run_mode_health_check(None)?;
+    Ok(())
+}
+
+/// RF28-1: surface the active `RunMode` so users can confirm what toolset
+/// the next run will have access to. Two pieces of state:
+///   - `run_mode_guard::current()`: the *process-global* guard set by the
+///     most recent `run_goal`. For one-shot `seed doctor` this is the
+///     default (Implementation) since no run has executed yet.
+///   - `repl_pin`: the REPL's `args.mode` setting (`Auto`/`Read`/`Write`).
+///     `Auto` means "classify each goal"; `Read`/`Write` pin the mode for
+///     every subsequent goal until `/mode` changes it again.
+///
+/// Together they answer "what mode will my next prompt run under?" without
+/// the user having to read source code.
+pub(crate) fn run_mode_health_check(repl_pin: Option<ModeArg>) -> Result<()> {
+    println!("- run-mode:");
+    let live = agent_tools::run_mode_guard::current();
+    let live_label = match live {
+        agent_core::RunMode::ReadOnly => "read-only",
+        agent_core::RunMode::Implementation => "implementation",
+    };
+    println!("    guard:         {live_label}  (set by the most recent run_goal)");
+    match repl_pin {
+        Some(ModeArg::Auto) => println!(
+            "    repl pin:      auto       (each goal classified via keyword)"
+        ),
+        Some(ModeArg::Read) => println!(
+            "    repl pin:      read       (next goal forced read-only)"
+        ),
+        Some(ModeArg::Write) => println!(
+            "    repl pin:      write      (next goal forced implementation)"
+        ),
+        None => println!(
+            "    repl pin:      N/A        (one-shot, set per run via --mode)"
+        ),
+    }
     Ok(())
 }
 
@@ -156,6 +198,42 @@ mod tests {
         let _g = rp_sync_test_guard();
         agent_tools::repoprompt_sync::set_pending_override(vec![PathBuf::from("/tmp/skill-bind")]);
         cwd_health_check(&PathBuf::from("/tmp/seed-doctor-e"), None).unwrap();
+    }
+
+    // --- RF28-1 run_mode_health_check ------------------------------------
+
+    static MODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn mode_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn run_mode_health_check_one_shot_path() {
+        let _g = mode_test_guard();
+        // repl_pin = None matches `seed doctor` (no REPL).
+        run_mode_health_check(None).unwrap();
+    }
+
+    #[test]
+    fn run_mode_health_check_each_repl_pin() {
+        let _g = mode_test_guard();
+        for pin in [ModeArg::Auto, ModeArg::Read, ModeArg::Write] {
+            run_mode_health_check(Some(pin)).unwrap();
+        }
+    }
+
+    #[test]
+    fn run_mode_health_check_reflects_guard_state() {
+        let _g = mode_test_guard();
+        // Exercise both guard states to ensure we don't panic when
+        // formatting either label.
+        agent_tools::run_mode_guard::set(agent_core::RunMode::ReadOnly);
+        run_mode_health_check(None).unwrap();
+        agent_tools::run_mode_guard::set(agent_core::RunMode::Implementation);
+        run_mode_health_check(None).unwrap();
+        agent_tools::run_mode_guard::reset();
     }
 }
 

@@ -255,11 +255,12 @@ fn handle_interactive_command(
         }
         "/doctor" => {
             doctor::doctor(&cli.skills_dir, store)?;
-            // REPL-only addendum: re-run cwd-health-check with our live
-            // workspace + codex_session so the printed cwd reflects /cd
-            // mutations and the codex line shows the cached client's cwd
-            // instead of "N/A".
+            // REPL-only addendum: re-run health checks with our live state
+            // so the printed cwd reflects /cd mutations, the codex line
+            // shows the cached client's cwd instead of "N/A", and the
+            // run-mode line reflects /mode pinning.
             doctor::cwd_health_check(&workspace.cwd, Some(codex_session))?;
+            doctor::run_mode_health_check(Some(args.mode))?;
             Ok(false)
         }
         "/providers" => {
@@ -278,6 +279,10 @@ fn handle_interactive_command(
         }
         "/model" => {
             handle_model_command(args, rest)?;
+            Ok(false)
+        }
+        "/provider" => {
+            handle_provider_command(args, codex_session, rest);
             Ok(false)
         }
         "/effort" => {
@@ -437,6 +442,73 @@ fn handle_model_command(args: &mut InteractiveArgs, rest: &str) -> Result<()> {
     }
     println!("  next turn will use the new model");
     Ok(())
+}
+
+// --- /provider ---------------------------------------------------------------
+
+/// `/provider [<id>|list]` — view or switch the planner provider.
+///
+/// Empty arg prints the current setting. `list` shows the built-in
+/// providers (same as `seed providers`). Setting a new provider:
+///   - updates `args.provider`
+///   - tears down the cached Codex client when leaving codex (the next
+///     codex-bound goal would respawn anyway, but explicit shutdown
+///     prevents a dangling subprocess that no goal will reuse)
+///
+/// No validation here — provider id correctness is checked when the next
+/// goal fires (`PlannerProvider::from_id` decides how to route).
+fn handle_provider_command(
+    args: &mut InteractiveArgs,
+    codex_session: &mut crate::commands::codex_session::CodexSession,
+    rest: &str,
+) {
+    if rest.is_empty() {
+        println!("provider: {}", args.provider);
+        println!("  /provider <id>   switch (codex, openai, anthropic, opencode, repoprompt_oracle, …)");
+        println!("  /provider list   show built-in providers");
+        return;
+    }
+    if rest == "list" {
+        let providers = agent_llm::built_in_providers();
+        println!("built-in providers");
+        println!("  codex local-app-server (default; no API key)");
+        println!("  repoprompt_oracle      via RepoPrompt ask_oracle (no HTTP)");
+        for provider in &providers {
+            let models = provider
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>();
+            println!(
+                "  {:<32}  {}",
+                provider.id.as_str(),
+                if models.is_empty() {
+                    "(no built-in models)".to_string()
+                } else {
+                    models.join(", ")
+                }
+            );
+        }
+        return;
+    }
+    let prev = std::mem::replace(&mut args.provider, rest.to_string());
+    if prev == args.provider {
+        println!("provider: already {}", args.provider);
+        return;
+    }
+    // Leaving codex → drop the cached app-server subprocess. If we'd kept
+    // it, the next ensure() in a non-codex run would never reuse it (the
+    // route doesn't go through codex_session at all) so it'd just sit there
+    // idle until REPL exit. Explicit shutdown is cleaner.
+    let was_codex = prev == "codex";
+    let now_codex = args.provider == "codex";
+    if was_codex && !now_codex {
+        codex_session.shutdown();
+        println!("provider: {prev} → {} (dropped cached codex client)", args.provider);
+    } else {
+        println!("provider: {prev} → {}", args.provider);
+    }
+    println!("  next goal will use the new provider");
 }
 
 // --- /effort -----------------------------------------------------------------
@@ -1210,6 +1282,71 @@ mod tests {
             agent_tools::repoprompt_sync::peek_bound_window().is_some(),
             "no-op /cd must preserve the RP bound-window cache"
         );
+    }
+
+    // --- RF28-2 /provider ------------------------------------------------
+
+    #[test]
+    fn provider_command_empty_does_not_mutate() {
+        let mut a = args();
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        a.provider = "codex".to_string();
+        handle_provider_command(&mut a, &mut cs, "");
+        assert_eq!(a.provider, "codex");
+    }
+
+    #[test]
+    fn provider_command_list_does_not_mutate_or_panic() {
+        let mut a = args();
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        a.provider = "codex".to_string();
+        handle_provider_command(&mut a, &mut cs, "list");
+        assert_eq!(a.provider, "codex");
+    }
+
+    #[test]
+    fn provider_command_sets_new_provider() {
+        let mut a = args();
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        a.provider = "codex".to_string();
+        handle_provider_command(&mut a, &mut cs, "openai");
+        assert_eq!(a.provider, "openai");
+    }
+
+    #[test]
+    fn provider_command_same_provider_is_noop() {
+        let mut a = args();
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        a.provider = "openai".to_string();
+        handle_provider_command(&mut a, &mut cs, "openai");
+        assert_eq!(a.provider, "openai");
+    }
+
+    #[test]
+    fn provider_command_leaving_codex_shuts_down_session() {
+        let mut a = args();
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        // Prime the codex session (no spawn — just constructs inner client).
+        let _ = cs.ensure(agent_delegate::CodexAppServerConfig::default()).unwrap();
+        assert!(cs.is_live());
+        a.provider = "codex".to_string();
+        handle_provider_command(&mut a, &mut cs, "openai");
+        assert_eq!(a.provider, "openai");
+        assert!(
+            !cs.is_live(),
+            "leaving codex must drop the cached client to avoid orphaned subprocess"
+        );
+    }
+
+    #[test]
+    fn provider_command_entering_codex_from_other_does_not_shutdown_session() {
+        let mut a = args();
+        let mut cs = crate::commands::codex_session::CodexSession::default();
+        // No session live to start with — entering codex shouldn't create one.
+        a.provider = "openai".to_string();
+        handle_provider_command(&mut a, &mut cs, "codex");
+        assert_eq!(a.provider, "codex");
+        assert!(!cs.is_live(), "switching INTO codex should not eagerly spawn");
     }
 
     // --- RF27-3 /mode ----------------------------------------------------

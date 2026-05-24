@@ -23,6 +23,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
     ("/doctor", "print diagnostics"),
     ("/providers", "list provider routes"),
+    ("/provider", "view or switch the planner provider"),
     ("/skills", "list local skills"),
     ("/tools", "list registered planner tools"),
     ("/model", "view or switch model (try /model list)"),
