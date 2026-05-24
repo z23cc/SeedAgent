@@ -10,5 +10,6 @@ pub(crate) mod plan;
 pub(crate) mod replay;
 pub(crate) mod rp;
 pub(crate) mod run;
+pub(crate) mod run_planners;
 pub(crate) mod skill;
 pub(crate) mod tool;
