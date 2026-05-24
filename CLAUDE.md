@@ -96,12 +96,15 @@ SeedAgent is a self-bootstrapping agent kernel. The CLI `seed` drives a small pl
   flush, archive, learn consolidation. Splitting requires either
   threading 8+ refs across `Cell`/`RefCell` parameters or moving state
   into a `RunSession` struct. Estimated 1-2 hours.
-- **Crate collapse 14→7 (B1)**: `agent-session` (146 lines), `agent-tui`
-  (255 lines), and probably `agent-llm + agent-delegate + agent-repoprompt`
-  → `agent-providers` would compile ~30% faster and simplify the mental
-  model. Requires touching every `use agent_X::...` import (50+ sites)
-  + Cargo workspace + dep graph cycles check. Estimated 2-3 hours;
-  high-risk if rushed.
+- ~~**Crate collapse 14→7 (B1)**~~ → **RF41-B1 shipped the easy half**:
+  agent-tui + agent-session collapsed into `agent-core` (12 crates now).
+  agent-tui's submodules moved to `agent-core/src/tui/`; agent-session
+  became `agent-core/src/session.rs`. The provider-crate collapse
+  (agent-llm + agent-delegate + agent-repoprompt → agent-providers) was
+  evaluated and declined — the 3 crates have meaningfully different
+  external dep footprints and merging them would force
+  `agent_providers::codex::X` style verbose paths without real compile
+  savings.
 
 ### Recently shipped (formerly deferred)
 
