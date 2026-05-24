@@ -77,110 +77,83 @@ pub use subagent::{
     write_subagent_signals,
 };
 
-/// RF37: process-wide skill-driven tool narrow set. When `skill_fetch`
-/// loads a skill with non-empty `allowed_tools` frontmatter, we push
-/// that list here. `planner_tool_infos_for_mode` consults it and
-/// intersects with whatever the mode allows (read-only mode list /
-/// implementation full list). Empty = no skill restriction (default).
-///
-/// Lifecycle mirrors `repoprompt_sync`: process-global, reset at the
-/// top of `run_goal`. A fresh `/new` clears it via `run_goal`'s reset.
-/// Multiple skill_fetches in one run: last wins (replaces — we don't
-/// intersect across skills because intent is "narrow to THIS skill's
-/// tool set" not "narrow more each time").
+/// RF40-A2: skill-driven tool narrow set, now thread-local. The previous
+/// `OnceLock<Mutex<...>>` shape forced 3 separate test mutexes to
+/// serialize state-mutating tests, and would have stomped if anyone ever
+/// ran two `run_goal` calls in parallel. `thread_local!` gives us
+/// per-thread state — tests get independent state for free (each test
+/// runs on its own thread), and the architectural concurrent-run
+/// safety is achieved at zero API cost.
 pub mod skill_tools_guard {
+    use std::cell::RefCell;
     use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
 
-    static STATE: OnceLock<Mutex<Option<HashSet<String>>>> = OnceLock::new();
-
-    fn state() -> &'static Mutex<Option<HashSet<String>>> {
-        STATE.get_or_init(|| Mutex::new(None))
+    thread_local! {
+        static STATE: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
     }
 
     /// Replace the active narrow set. Empty list clears (no restriction).
     pub fn set(allowed: Vec<String>) {
-        if let Ok(mut g) = state().lock() {
-            *g = if allowed.is_empty() {
+        STATE.with(|cell| {
+            *cell.borrow_mut() = if allowed.is_empty() {
                 None
             } else {
                 Some(allowed.into_iter().collect())
             };
-        }
+        });
     }
 
     /// Clear restriction (back to no skill narrowing).
     pub fn reset() {
-        if let Ok(mut g) = state().lock() {
-            *g = None;
-        }
+        STATE.with(|cell| *cell.borrow_mut() = None);
     }
 
     /// Check whether a tool name is allowed under the current restriction.
     /// Returns `true` when no restriction is active (most of the time).
     pub fn permits(tool_name: &str) -> bool {
-        state()
-            .lock()
-            .map(|g| match g.as_ref() {
-                None => true,
-                Some(set) => set.contains(tool_name),
-            })
-            .unwrap_or(true)
+        STATE.with(|cell| match cell.borrow().as_ref() {
+            None => true,
+            Some(set) => set.contains(tool_name),
+        })
     }
 
     /// Inspect the current narrow set for tests / doctor display.
     pub fn current() -> Option<Vec<String>> {
-        state()
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|s| {
+        STATE.with(|cell| {
+            cell.borrow().as_ref().map(|s| {
                 let mut v: Vec<String> = s.iter().cloned().collect();
                 v.sort();
                 v
-            }))
+            })
+        })
     }
 }
 
-/// Process-wide active `RunMode`. Set at the top of `run_goal` after the
-/// classifier (or `--mode` override) resolves, consumed inside individual
-/// tools that need to enforce read-only semantics (RF27-2: ShellTool
-/// refuses write-shaped commands when the guard is `ReadOnly`).
-///
-/// Same pattern as `repoprompt_sync` below — `ToolContext` is built fresh
-/// per call so there's no natural place to hang per-run state; a static
-/// Mutex is simple and lets us keep the `Tool` trait signature unchanged.
-/// `run_mode_guard::reset()` defaults to `Implementation` because that's
-/// the historical pre-RF27 behavior — any path that forgets to set the
-/// guard keeps working as it did before.
+/// RF40-A2: active `RunMode` for the current thread. Same migration story
+/// as `skill_tools_guard` above — `thread_local!` removes the need for
+/// per-test serialization and makes concurrent `run_goal` safe by
+/// construction.
 pub mod run_mode_guard {
     use super::RunMode;
-    use std::sync::{Mutex, OnceLock};
+    use std::cell::Cell;
 
-    static STATE: OnceLock<Mutex<RunMode>> = OnceLock::new();
-
-    fn state() -> &'static Mutex<RunMode> {
-        STATE.get_or_init(|| Mutex::new(RunMode::Implementation))
+    thread_local! {
+        static STATE: Cell<RunMode> = const { Cell::new(RunMode::Implementation) };
     }
 
     /// Set the active mode. Called by `run_goal` once at the top of each run.
     pub fn set(mode: RunMode) {
-        if let Ok(mut g) = state().lock() {
-            *g = mode;
-        }
+        STATE.with(|cell| cell.set(mode));
     }
 
     /// Read the active mode. Defaults to `Implementation` if the guard has
-    /// never been set or the lock is poisoned — fail-open so we don't
-    /// silently block writes when something upstream went wrong.
+    /// never been set on this thread.
     pub fn current() -> RunMode {
-        state()
-            .lock()
-            .map(|g| *g)
-            .unwrap_or(RunMode::Implementation)
+        STATE.with(|cell| cell.get())
     }
 
-    /// Reset to the default. Tests use this between cases; runtime code
-    /// calls `set(...)` directly with the resolved mode.
+    /// Reset to the default. Tests can call this; runtime code calls
+    /// `set(...)` directly with the resolved mode.
     pub fn reset() {
         set(RunMode::Implementation);
     }
@@ -195,10 +168,8 @@ pub mod run_mode_guard {
 /// guarded by a Mutex; `repoprompt_sync::reset()` is called at the top of
 /// each `run_goal` to prevent leakage across runs.
 pub mod repoprompt_sync {
+    use std::cell::RefCell;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
-
-    static STATE: OnceLock<Mutex<SyncState>> = OnceLock::new();
 
     #[derive(Debug, Default)]
     struct SyncState {
@@ -228,19 +199,32 @@ pub mod repoprompt_sync {
         pub window_id: u32,
     }
 
-    fn state() -> &'static Mutex<SyncState> {
-        STATE.get_or_init(|| Mutex::new(SyncState::default()))
+    // RF40-A2: thread-local instead of OnceLock<Mutex>. Same behavior at
+    // runtime (REPL is single-threaded; each run resets at start), but
+    // tests get independent state without serialization mutexes and
+    // any future concurrent-run embed-as-library use is safe by
+    // construction.
+    thread_local! {
+        static STATE: RefCell<SyncState> = RefCell::new(SyncState::default());
+    }
+
+    fn with_state<R>(f: impl FnOnce(&mut SyncState) -> R) -> R {
+        STATE.with(|cell| f(&mut cell.borrow_mut()))
+    }
+
+    fn read_state<R>(f: impl FnOnce(&SyncState) -> R) -> R {
+        STATE.with(|cell| f(&cell.borrow()))
     }
 
     /// Clear all sync state. Call once at the start of a fresh run so stale
     /// pending overrides + window caches + sticky-cwd requests from a prior
     /// REPL turn / aborted run don't bleed in.
     pub fn reset() {
-        if let Ok(mut st) = state().lock() {
+        with_state(|st| {
             st.pending_override = None;
             st.bound = None;
             st.pending_sticky_cwd = None;
-        }
+        });
     }
 
     /// RF33-2: queue a sticky-cwd request. Called by `skill_fetch` when the
@@ -248,21 +232,19 @@ pub mod repoprompt_sync {
     /// The very next planner-loop iteration polls and applies it via
     /// `take_pending_sticky_cwd`.
     pub fn set_pending_sticky_cwd(path: PathBuf) {
-        if let Ok(mut st) = state().lock() {
-            st.pending_sticky_cwd = Some(path);
-        }
+        with_state(|st| st.pending_sticky_cwd = Some(path));
     }
 
     /// Consume the queued sticky-cwd request. Returns `None` if no skill
     /// requested one. Caller (`run_goal`) is responsible for applying it
     /// to `workspace.cwd` and (if live) `codex_session.client.set_cwd`.
     pub fn take_pending_sticky_cwd() -> Option<PathBuf> {
-        state().lock().ok().and_then(|mut st| st.pending_sticky_cwd.take())
+        with_state(|st| st.pending_sticky_cwd.take())
     }
 
     /// Inspect without consuming. For doctor / tests.
     pub fn peek_pending_sticky_cwd() -> Option<PathBuf> {
-        state().lock().ok().and_then(|st| st.pending_sticky_cwd.clone())
+        read_state(|st| st.pending_sticky_cwd.clone())
     }
 
     /// Queue a one-shot override. The next RepoPrompt call that would
@@ -270,58 +252,55 @@ pub mod repoprompt_sync {
     /// the override is consumed. Also clears the bound-window cache —
     /// we're about to switch dirs, so the cached window won't match.
     pub fn set_pending_override(working_dirs: Vec<PathBuf>) {
-        if let Ok(mut st) = state().lock() {
+        with_state(|st| {
             st.pending_override = Some(working_dirs);
             st.bound = None;
-        }
+        });
     }
 
     /// Atomically take and return the pending override, leaving the slot
     /// empty for the call after this one.
     pub fn take_pending_override() -> Option<Vec<PathBuf>> {
-        state().lock().ok().and_then(|mut st| st.pending_override.take())
+        with_state(|st| st.pending_override.take())
     }
 
     /// RF25-2: look up a previously-bound window_id matching `working_dirs`.
     /// Returns `None` if the cache is empty or the cached binding is for
     /// a different dir set.
     pub(super) fn cached_window_id_for(working_dirs: &[PathBuf]) -> Option<u32> {
-        state()
-            .lock()
-            .ok()
-            .and_then(|st| st.bound.as_ref().filter(|b| b.working_dirs == working_dirs).map(|b| b.window_id))
+        read_state(|st| {
+            st.bound
+                .as_ref()
+                .filter(|b| b.working_dirs == working_dirs)
+                .map(|b| b.window_id)
+        })
     }
 
     /// Record a successful bind so future calls with the same working_dirs
-    /// can skip the bind_context CLI roundtrip. `pub` (not pub(super)) so
-    /// other crates' integration tests can prime the cache to test
-    /// invalidation paths without spinning up a real RP CLI.
+    /// can skip the bind_context CLI roundtrip.
     pub fn record_bound_window(working_dirs: Vec<PathBuf>, window_id: u32) {
-        if let Ok(mut st) = state().lock() {
+        with_state(|st| {
             st.bound = Some(BoundWindow { working_dirs, window_id });
-        }
+        });
     }
 
     /// Drop the cached bound window without touching pending_override.
     /// Used when /cd changes the workspace cwd — the cached window is for
     /// the old cwd.
     pub fn clear_bound_window() {
-        if let Ok(mut st) = state().lock() {
-            st.bound = None;
-        }
+        with_state(|st| st.bound = None);
     }
 
-    /// Inspect without consuming. Public (not `#[cfg(test)]`) so other
-    /// crates' tests can read state; runtime callers shouldn't need this
-    /// since the cache is internal to the sync layer.
+    /// Inspect without consuming. Used by `/doctor` and by other crates'
+    /// tests that want to prime/peek state without spinning up a real RP CLI.
     pub fn peek_pending_override() -> Option<Vec<PathBuf>> {
-        state().lock().ok().and_then(|st| st.pending_override.clone())
+        read_state(|st| st.pending_override.clone())
     }
 
     /// As above, for the bound-window cache. Returns `(working_dirs, window_id)`
     /// or `None` if no bind has been recorded since the last invalidation.
     pub fn peek_bound_window() -> Option<(Vec<PathBuf>, u32)> {
-        state().lock().ok().and_then(|st| {
+        read_state(|st| {
             st.bound
                 .as_ref()
                 .map(|b| (b.working_dirs.clone(), b.window_id))

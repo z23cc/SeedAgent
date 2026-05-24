@@ -275,7 +275,11 @@ fn handle_interactive_command(
             Ok(false)
         }
         "/providers" => {
-            doctor::show_providers(&args.provider, args.model.as_deref(), false)?;
+            // RF40-B3: `/providers` is an alias for `/provider list` so users
+            // who learned the plural form before RF28 still hit the same
+            // output. The route-detail `show_providers` is still reachable
+            // via `seed providers` (the CLI subcommand) when needed.
+            handle_provider_command(args, codex_session, "list");
             Ok(false)
         }
         "/skills" => {

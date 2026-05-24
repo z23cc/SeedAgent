@@ -19,26 +19,57 @@ pub use style::{
 };
 
 const HISTORY_CAPACITY: usize = 10_000;
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/help", "show commands"),
-    ("/doctor", "print diagnostics"),
-    ("/providers", "list provider routes"),
-    ("/provider", "view or switch the planner provider"),
-    ("/skills", "list local skills"),
-    ("/tools", "list registered planner tools"),
-    ("/model", "view or switch model (try /model list)"),
-    ("/effort", "view or switch reasoning effort (low|medium|high|none)"),
-    ("/memory", "search local memory index (/memory <query>)"),
-    ("/plan", "show the active plan's next item + progress"),
-    ("/plans", "list known plans"),
-    ("/dump", "print path to the most recent session JSONL"),
-    ("/compact", "rebuild the memory index from current L2/L3/L4 state"),
-    ("/new", "start a fresh session for the next prompt"),
-    ("/retry", "re-run the previous goal in a new session"),
-    ("/cd", "change REPL workspace cwd (Codex + RepoPrompt follow)"),
-    ("/sync", "force realign Codex + RepoPrompt to workspace.cwd"),
-    ("/mode", "view or pin run mode (auto|read|write)"),
-    ("/exit", "leave interactive mode"),
+/// RF40-B3: slash-command categories drive `print_help`'s grouped output
+/// so 20 commands aren't presented as one undifferentiated alphabetical
+/// list. Each command tags its category; the help printer iterates by
+/// category and prints a header + the matching rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCategory {
+    /// Read-only status / inspection commands (`/help`, `/doctor`, `/tools`, …).
+    View,
+    /// Mutate REPL session config (`/mode`, `/model`, `/cd`, …).
+    Configure,
+    /// Active operations: rebuild, sync, retry, shell-out.
+    Operate,
+    /// Exit / leave the REPL.
+    Exit,
+}
+
+impl SlashCategory {
+    fn label(self) -> &'static str {
+        match self {
+            SlashCategory::View => "view",
+            SlashCategory::Configure => "configure",
+            SlashCategory::Operate => "operate",
+            SlashCategory::Exit => "exit",
+        }
+    }
+}
+
+const SLASH_COMMANDS: &[(&str, SlashCategory, &str)] = &[
+    // View / inspect
+    ("/help", SlashCategory::View, "show commands"),
+    ("/doctor", SlashCategory::View, "print diagnostics"),
+    ("/providers", SlashCategory::View, "alias for `/provider list`"),
+    ("/skills", SlashCategory::View, "list local skills"),
+    ("/tools", SlashCategory::View, "list registered planner tools"),
+    ("/memory", SlashCategory::View, "search local memory index (/memory <query>)"),
+    ("/plan", SlashCategory::View, "show the active plan's next item + progress"),
+    ("/plans", SlashCategory::View, "list known plans"),
+    ("/dump", SlashCategory::View, "print path to the most recent session JSONL"),
+    // Configure
+    ("/cd", SlashCategory::Configure, "change REPL workspace cwd"),
+    ("/mode", SlashCategory::Configure, "view or pin run mode (auto|read|write)"),
+    ("/provider", SlashCategory::Configure, "view or switch the planner provider (list/<id>)"),
+    ("/model", SlashCategory::Configure, "view or switch model (try /model list)"),
+    ("/effort", SlashCategory::Configure, "view or switch reasoning effort (low|medium|high|none)"),
+    // Operate
+    ("/new", SlashCategory::Operate, "start a fresh session for the next prompt"),
+    ("/retry", SlashCategory::Operate, "re-run the previous goal in a new session"),
+    ("/compact", SlashCategory::Operate, "rebuild the memory index from current L2/L3/L4 state"),
+    ("/sync", SlashCategory::Operate, "force realign Codex + RepoPrompt to workspace.cwd"),
+    // Exit
+    ("/exit", SlashCategory::Exit, "leave interactive mode"),
 ];
 
 /// Lines starting with `!` are shell-escapes (e.g. `!git status`), not slash
@@ -193,8 +224,8 @@ impl Completer for SlashCommandCompleter {
 
         SLASH_COMMANDS
             .iter()
-            .filter(|(command, _)| command.starts_with(line))
-            .map(|(command, description)| Suggestion {
+            .filter(|(command, _, _)| command.starts_with(line))
+            .map(|(command, _, description)| Suggestion {
                 value: (*command).to_string(),
                 description: Some((*description).to_string()),
                 style: None,
@@ -213,17 +244,25 @@ pub fn print_banner() {
 }
 
 pub fn print_help() {
-    println!("commands");
-    // Driven off the SLASH_COMMANDS table so adding a new entry above
-    // automatically shows up here too — prevents the "added /model in
-    // table but forgot to update help" drift that bit us before.
+    // RF40-B3: group by SlashCategory so users see related commands
+    // together instead of one alphabetical wall. Category labels are
+    // dim section headers; rows under each align to the longest
+    // command name in that category.
+    use SlashCategory::*;
     let max_cmd_len = SLASH_COMMANDS
         .iter()
-        .map(|(cmd, _)| cmd.len())
+        .map(|(cmd, _, _)| cmd.len())
         .max()
         .unwrap_or(0);
-    for (cmd, desc) in SLASH_COMMANDS {
-        println!("- {cmd:<width$}  {desc}", width = max_cmd_len);
+    for cat in &[View, Configure, Operate, Exit] {
+        let rows: Vec<_> = SLASH_COMMANDS.iter().filter(|(_, c, _)| c == cat).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        println!("{}:", cat.label());
+        for (cmd, _, desc) in rows {
+            println!("  {cmd:<width$}  {desc}", width = max_cmd_len);
+        }
     }
 }
 
@@ -233,28 +272,44 @@ pub fn print_error(error: impl std::fmt::Display) {
 
 #[cfg(test)]
 mod slash_command_tests {
-    use super::SLASH_COMMANDS;
+    use super::{SLASH_COMMANDS, SlashCategory};
     use std::collections::HashSet;
 
     #[test]
     fn slash_commands_have_unique_names() {
         let mut seen = HashSet::new();
-        for (cmd, _) in SLASH_COMMANDS {
+        for (cmd, _, _) in SLASH_COMMANDS {
             assert!(seen.insert(*cmd), "duplicate slash command in table: {cmd}");
         }
     }
 
     #[test]
     fn slash_commands_all_start_with_slash() {
-        for (cmd, _) in SLASH_COMMANDS {
+        for (cmd, _, _) in SLASH_COMMANDS {
             assert!(cmd.starts_with('/'), "slash command missing leading /: {cmd}");
         }
     }
 
     #[test]
     fn slash_commands_have_descriptions() {
-        for (cmd, desc) in SLASH_COMMANDS {
+        for (cmd, _, desc) in SLASH_COMMANDS {
             assert!(!desc.is_empty(), "missing description for {cmd}");
+        }
+    }
+
+    #[test]
+    fn every_category_has_at_least_one_command() {
+        for cat in &[
+            SlashCategory::View,
+            SlashCategory::Configure,
+            SlashCategory::Operate,
+            SlashCategory::Exit,
+        ] {
+            let count = SLASH_COMMANDS
+                .iter()
+                .filter(|(_, c, _)| c == cat)
+                .count();
+            assert!(count > 0, "category {:?} has no commands — empty section in /help is ugly", cat);
         }
     }
 }
