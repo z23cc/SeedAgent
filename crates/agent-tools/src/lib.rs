@@ -77,6 +77,70 @@ pub use subagent::{
     write_subagent_signals,
 };
 
+/// RF37: process-wide skill-driven tool narrow set. When `skill_fetch`
+/// loads a skill with non-empty `allowed_tools` frontmatter, we push
+/// that list here. `planner_tool_infos_for_mode` consults it and
+/// intersects with whatever the mode allows (read-only mode list /
+/// implementation full list). Empty = no skill restriction (default).
+///
+/// Lifecycle mirrors `repoprompt_sync`: process-global, reset at the
+/// top of `run_goal`. A fresh `/new` clears it via `run_goal`'s reset.
+/// Multiple skill_fetches in one run: last wins (replaces — we don't
+/// intersect across skills because intent is "narrow to THIS skill's
+/// tool set" not "narrow more each time").
+pub mod skill_tools_guard {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static STATE: OnceLock<Mutex<Option<HashSet<String>>>> = OnceLock::new();
+
+    fn state() -> &'static Mutex<Option<HashSet<String>>> {
+        STATE.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Replace the active narrow set. Empty list clears (no restriction).
+    pub fn set(allowed: Vec<String>) {
+        if let Ok(mut g) = state().lock() {
+            *g = if allowed.is_empty() {
+                None
+            } else {
+                Some(allowed.into_iter().collect())
+            };
+        }
+    }
+
+    /// Clear restriction (back to no skill narrowing).
+    pub fn reset() {
+        if let Ok(mut g) = state().lock() {
+            *g = None;
+        }
+    }
+
+    /// Check whether a tool name is allowed under the current restriction.
+    /// Returns `true` when no restriction is active (most of the time).
+    pub fn permits(tool_name: &str) -> bool {
+        state()
+            .lock()
+            .map(|g| match g.as_ref() {
+                None => true,
+                Some(set) => set.contains(tool_name),
+            })
+            .unwrap_or(true)
+    }
+
+    /// Inspect the current narrow set for tests / doctor display.
+    pub fn current() -> Option<Vec<String>> {
+        state()
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| {
+                let mut v: Vec<String> = s.iter().cloned().collect();
+                v.sort();
+                v
+            }))
+    }
+}
+
 /// Process-wide active `RunMode`. Set at the top of `run_goal` after the
 /// classifier (or `--mode` override) resolves, consumed inside individual
 /// tools that need to enforce read-only semantics (RF27-2: ShellTool
@@ -544,6 +608,17 @@ impl Tool for SkillFetchTool {
             .repoprompt
             .as_ref()
             .map(queue_skill_repoprompt_binding);
+        // RF37: if the skill declares `allowed-tools:`, narrow the
+        // planner's tool catalog for subsequent turns. Empty list = no
+        // restriction (the default). Last-skill-wins semantics — fetching
+        // a different skill replaces (doesn't intersect).
+        let narrowed_tools = if document.info.allowed_tools.is_empty() {
+            skill_tools_guard::reset();
+            None
+        } else {
+            skill_tools_guard::set(document.info.allowed_tools.clone());
+            Some(document.info.allowed_tools.clone())
+        };
         let mut content = json!({
             "status": "success",
             "skill": document.info,
@@ -551,6 +626,13 @@ impl Tool for SkillFetchTool {
         });
         if let Some(outcome) = auto_bind {
             content["repoprompt_autobind"] = outcome;
+        }
+        if let Some(tools) = narrowed_tools {
+            content["narrowed_tools"] = json!({
+                "active": true,
+                "applies_to": "subsequent planner turns until /new or skill_fetch of another skill",
+                "tools": tools,
+            });
         }
         Ok(ToolResult::ok(call, content))
     }
@@ -3787,6 +3869,61 @@ mod tests {
         let v = queue_skill_repoprompt_binding(&binding);
         assert_eq!(v["status"], "noop");
         assert!(repoprompt_sync::peek_pending_override().is_none());
+    }
+
+    // --- RF37 skill_tools_guard -----------------------------------------
+
+    static SKILL_TOOLS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn skill_tools_guard_setup() -> std::sync::MutexGuard<'static, ()> {
+        let g = SKILL_TOOLS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        skill_tools_guard::reset();
+        g
+    }
+
+    #[test]
+    fn skill_tools_guard_defaults_to_permit_all() {
+        let _g = skill_tools_guard_setup();
+        // No restriction set → every tool name permitted.
+        assert!(skill_tools_guard::permits("read_file"));
+        assert!(skill_tools_guard::permits("write_file"));
+        assert!(skill_tools_guard::permits("any_random_tool"));
+        assert!(skill_tools_guard::current().is_none());
+    }
+
+    #[test]
+    fn skill_tools_guard_set_narrows_catalog() {
+        let _g = skill_tools_guard_setup();
+        skill_tools_guard::set(vec!["read_file".to_string(), "run_shell".to_string()]);
+        assert!(skill_tools_guard::permits("read_file"));
+        assert!(skill_tools_guard::permits("run_shell"));
+        assert!(!skill_tools_guard::permits("write_file"));
+        assert!(!skill_tools_guard::permits("memory_search"));
+        let active = skill_tools_guard::current().unwrap();
+        assert_eq!(active, vec!["read_file".to_string(), "run_shell".to_string()]);
+        skill_tools_guard::reset();
+    }
+
+    #[test]
+    fn skill_tools_guard_empty_list_clears() {
+        let _g = skill_tools_guard_setup();
+        skill_tools_guard::set(vec!["x".to_string()]);
+        assert!(skill_tools_guard::current().is_some());
+        // Passing empty = clear.
+        skill_tools_guard::set(Vec::new());
+        assert!(skill_tools_guard::current().is_none());
+        assert!(skill_tools_guard::permits("anything"));
+    }
+
+    #[test]
+    fn skill_tools_guard_set_replaces_not_intersects() {
+        let _g = skill_tools_guard_setup();
+        skill_tools_guard::set(vec!["read_file".to_string()]);
+        skill_tools_guard::set(vec!["run_shell".to_string()]);
+        assert!(!skill_tools_guard::permits("read_file"));
+        assert!(skill_tools_guard::permits("run_shell"));
+        skill_tools_guard::reset();
     }
 
     // --- RF34-1 repair_tool_args ----------------------------------------

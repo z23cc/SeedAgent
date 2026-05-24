@@ -456,6 +456,14 @@ fn planner_tool_infos_for_mode(
     tools: Vec<ToolInfo>,
     mode: agent_core::RunMode,
 ) -> Vec<ToolInfo> {
+    // RF37: if a previously-fetched skill narrowed the catalog, intersect
+    // first. Empty narrow set (no skill restriction) = identity. We do
+    // this BEFORE the read-only filter so the read-only filter still
+    // catches mutating tools the skill mistakenly listed.
+    let tools = tools
+        .into_iter()
+        .filter(|t| agent_tools::skill_tools_guard::permits(&t.name))
+        .collect::<Vec<_>>();
     if !matches!(mode, agent_core::RunMode::ReadOnly) {
         return tools;
     }
@@ -705,6 +713,10 @@ pub(crate) fn run_goal(args: RunGoalArgs<'_>) -> Result<()> {
     // first rp tool call would mysteriously bind to the previous run's
     // skill dir.
     agent_tools::repoprompt_sync::reset();
+    // RF37: same logic for the skill-driven tool narrow set — a previous
+    // skill_fetch shouldn't restrict this run's tool catalog unless this
+    // run also fetches that skill.
+    agent_tools::skill_tools_guard::reset();
     let memory_paths = memory_paths(&cwd, &skills_dir, store.root());
     agent_memory::rebuild_index(&memory_paths)?;
     let base_memory_text = agent_memory::planner_memory_context(&memory_paths)?;
@@ -1749,6 +1761,51 @@ mod tests {
                 "repoprompt_exec",
             ]
         );
+    }
+
+    // --- RF37 skill_tools_guard intersection ---------------------------
+
+    #[test]
+    fn skill_narrow_intersects_with_mode_filter() {
+        // RF37: a fetched skill that allowed only [read_file, run_shell]
+        // should restrict the planner catalog. Then the read-only filter
+        // (which keeps run_shell + read_file but drops write_file etc.)
+        // applies on top. So we end up with [read_file, run_shell].
+        agent_tools::skill_tools_guard::reset();
+        agent_tools::skill_tools_guard::set(vec![
+            "read_file".to_string(),
+            "run_shell".to_string(),
+        ]);
+        let tools = vec![
+            ToolInfo { name: "read_file".to_string(), description: "r".to_string() },
+            ToolInfo { name: "run_shell".to_string(), description: "s".to_string() },
+            ToolInfo { name: "write_file".to_string(), description: "w".to_string() },
+            ToolInfo { name: "memory_search".to_string(), description: "m".to_string() },
+        ];
+        let names = planner_tool_infos_for_mode(tools, agent_core::RunMode::ReadOnly)
+            .into_iter()
+            .map(|t| t.name)
+            .collect::<Vec<_>>();
+        agent_tools::skill_tools_guard::reset();
+        // memory_search NOT in skill narrow → dropped.
+        // write_file in neither read-only allowlist nor skill narrow → dropped.
+        assert_eq!(names, vec!["read_file".to_string(), "run_shell".to_string()]);
+    }
+
+    #[test]
+    fn no_skill_narrow_keeps_existing_mode_behavior() {
+        agent_tools::skill_tools_guard::reset();
+        let tools = vec![
+            ToolInfo { name: "read_file".to_string(), description: "r".to_string() },
+            ToolInfo { name: "memory_search".to_string(), description: "m".to_string() },
+            ToolInfo { name: "write_file".to_string(), description: "w".to_string() },
+        ];
+        let names = planner_tool_infos_for_mode(tools, agent_core::RunMode::ReadOnly)
+            .into_iter()
+            .map(|t| t.name)
+            .collect::<Vec<_>>();
+        // Read-only filter only — read_file + memory_search keep, write_file drops.
+        assert_eq!(names, vec!["read_file".to_string(), "memory_search".to_string()]);
     }
 
     // ====================================================================

@@ -46,6 +46,23 @@ pub struct SkillInfo {
     pub blast_radius: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repoprompt: Option<RepoPromptBinding>,
+    /// RF37: per-skill tool catalog narrowing, borrowed from jcode skill
+    /// frontmatter's `allowed-tools:` field. When non-empty, fetching this
+    /// skill activates a process-level allowlist that the planner-loop
+    /// intersects with its existing tool catalog. Empty = no restriction
+    /// (current behavior). Use case: a skill like "debug-rust-test" can
+    /// declare it only needs `read_file/read_files/run_shell` so the
+    /// planner doesn't waste turns picking irrelevant tools.
+    ///
+    /// Aliased to `allowed-tools` in serde so the same SKILL.md format
+    /// jcode uses round-trips cleanly.
+    #[serde(
+        default,
+        rename = "allowed-tools",
+        alias = "allowed_tools",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allowed_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -718,6 +735,16 @@ fn skill_info_from_body(skills_dir: &Path, path: PathBuf, body: &str) -> SkillIn
     let blast_radius =
         front_matter.and_then(|front_matter| front_matter_value(front_matter, "blast_radius"));
     let repoprompt = front_matter.and_then(parse_repoprompt_binding);
+    // RF37: accept either jcode's `allowed-tools:` (kebab) or
+    // `allowed_tools:` (snake) for compatibility — both round-trip
+    // through serde via the alias.
+    let allowed_tools = front_matter
+        .map(|front_matter| {
+            let mut tools = front_matter_list(front_matter, "allowed-tools");
+            tools.extend(front_matter_list(front_matter, "allowed_tools"));
+            dedupe_sorted(tools)
+        })
+        .unwrap_or_default();
     let mut tags = BTreeSet::new();
     if let Some(front_matter) = front_matter {
         for tag in front_matter_list(front_matter, "tags") {
@@ -760,6 +787,7 @@ fn skill_info_from_body(skills_dir: &Path, path: PathBuf, body: &str) -> SkillIn
         autonomous_safe,
         blast_radius,
         repoprompt,
+        allowed_tools,
     }
 }
 
