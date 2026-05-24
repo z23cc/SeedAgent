@@ -1357,11 +1357,19 @@ mod tests {
     }
 
     fn temp_root() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Atomic counter prevents nanos-collision when two test threads
+        // sample SystemTime within the same ns tick.
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("seed-tools-test-{nanos}"))
+        std::env::temp_dir().join(format!(
+            "seed-tools-test-{}-{nanos}-{n}",
+            std::process::id()
+        ))
     }
 
     // --- /5 repoprompt_sync ----------------------------------------
